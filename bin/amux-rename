@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# amux-rename — rename an amux session everywhere at once, atomically-ish, with
+# NO context loss and NO fight with the amux-server watchdog.
+#
+# A "session" is more than a filename. amux-rename moves every piece together:
+#   ~/.amux/sessions/<old>.env        -> <new>.env        (+ rewrites CC_NAME= and header)
+#   ~/.amux/sessions/<old>.meta.json  -> <new>.meta.json  (+ cc_session_name, if present)
+#   tmux session   amux-<old>  -> amux-<new>   (the LIVE Claude process is preserved)
+#   tmux window    <old>       -> <new>        (the #W the statusline/iTerm tab shows)
+#   amux.db rows   session col in: issues, tasks, schedules, share_tokens  (best effort)
+#
+# Doing only `mv <old>.env <new>.env` by hand is what leaves a session's
+# .meta.json orphaned (its cc_conversation_id no longer resolves) — the exact
+# desync this tool exists to prevent.
+#
+# Usage:
+#   amux-rename <old> <new>       rename session <old> to <new>
+#   amux-rename -n <old> <new>    dry run: print the plan, change nothing
+#   amux-rename -h                this help
+#
+# <old> resolves like `amux <name>`: exact name, row number, or unique prefix
+# number from `amux ls`. <new> must be a fresh name (letters/digits . _ -),
+# not already taken.
+#
+# Safe with the server running: amux-server's watchdog only ever acts on a
+# session whose amux-<name> tmux session currently exists (every restart path is
+# gated behind `if tmux_name(name) not in running_sessions: continue`). So the
+# brief instant where tmux is renamed but the .env is not — or vice versa —
+# triggers nothing. tmux is renamed first; if that fails, nothing else is touched.
+set -euo pipefail
+
+CC_HOME="${AMUX_HOME:-${CC_HOME:-$HOME/.amux}}"
+CC_SESSIONS="$CC_HOME/sessions"
+DB="$CC_HOME/amux.db"
+
+# ── Colors (tty-gated, matches amux) ─────────────────────────────────────────
+if [[ -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'
+else
+  BOLD=''; DIM=''; RESET=''; RED=''; GREEN=''; YELLOW=''; CYAN=''
+fi
+
+die()  { echo "${RED}error:${RESET} $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+DRY=0
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)    usage 0 ;;
+    -n|--dry-run) DRY=1; shift ;;
+    --)           shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
+    -*)           die "unknown option: $1 (try -h)" ;;
+    *)            args+=("$1"); shift ;;
+  esac
+done
+[[ ${#args[@]} -eq 2 ]] || usage 1
+OLD_QUERY="${args[0]}"
+NEW="${args[1]}"
+
+command -v tmux >/dev/null 2>&1 || die "tmux is required"
+[[ -d "$CC_SESSIONS" ]] || die "no amux sessions dir at $CC_SESSIONS"
+
+tmux_name() { echo "amux-$1"; }
+
+# Resolve <old> the same way amux does: exact -> row number -> unique prefix.
+# Numeric input must select a displayed row before prefix matching; otherwise a
+# session such as "2fa" can steal the query "2" from row 2.
+resolve_session() {
+  local query="$1"
+  [[ -f "$CC_SESSIONS/$query.env" ]] && { echo "$query"; return; }
+  local f name
+  if [[ "$query" =~ ^[0-9]+$ ]]; then
+    local i=1
+    for f in "$CC_SESSIONS"/*.env; do
+      [[ -f "$f" ]] || continue
+      [[ "$i" -eq "$query" ]] && { basename "$f" .env; return; }
+      i=$((i + 1))
+    done
+  fi
+  local matches=()
+  for f in "$CC_SESSIONS"/*.env; do
+    [[ -f "$f" ]] || continue
+    name=$(basename "$f" .env)
+    [[ "$name" == "$query"* ]] && matches+=("$name")
+  done
+  if [[ ${#matches[@]} -eq 1 ]]; then echo "${matches[0]}"; return
+  elif [[ ${#matches[@]} -gt 1 ]]; then die "ambiguous: '$query' matches ${matches[*]}"; fi
+  die "session '$query' not found"
+}
+
+OLD="$(resolve_session "$OLD_QUERY")"
+
+# Validate the new name: usable as a filename AND a tmux session name.
+[[ "$NEW" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] \
+  || die "invalid new name '$NEW' — use letters, digits, '.', '_', '-' (must not start with . or -)"
+[[ "$NEW" == "$OLD" ]] && die "new name is the same as the old name"
+[[ -e "$CC_SESSIONS/$NEW.env" ]] && die "session '$NEW' already exists"
+
+OLD_ENV="$CC_SESSIONS/$OLD.env";   NEW_ENV="$CC_SESSIONS/$NEW.env"
+OLD_META="$CC_SESSIONS/$OLD.meta.json"; NEW_META="$CC_SESSIONS/$NEW.meta.json"
+OLD_T="$(tmux_name "$OLD")"; NEW_T="$(tmux_name "$NEW")"
+
+running=0
+tmux has-session -t "=$OLD_T" 2>/dev/null && running=1
+
+# ── Plan / dry run ───────────────────────────────────────────────────────────
+info "${BOLD}rename${RESET} ${YELLOW}$OLD${RESET} ${DIM}->${RESET} ${GREEN}$NEW${RESET}  ${DIM}($([[ $running -eq 1 ]] && echo running || echo stopped))${RESET}"
+info "  ${DIM}env  ${RESET} $OLD.env -> $NEW.env"
+[[ -f "$OLD_META" ]] && info "  ${DIM}meta ${RESET} $OLD.meta.json -> $NEW.meta.json" || info "  ${DIM}meta ${RESET} (none)"
+[[ $running -eq 1 ]] && info "  ${DIM}tmux ${RESET} $OLD_T -> $NEW_T  (window $OLD -> $NEW, live process kept)"
+if [[ -f "$DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+  info "  ${DIM}db   ${RESET} issues/tasks/schedules/share_tokens: session '$OLD' -> '$NEW'"
+fi
+if [[ $DRY -eq 1 ]]; then info "${DIM}(dry run — nothing changed)${RESET}"; exit 0; fi
+
+# ── 1. tmux first (the only step that can fail on a race); roll back if needed ─
+tmux_renamed=0
+if [[ $running -eq 1 ]]; then
+  tmux rename-session -t "=$OLD_T" "$NEW_T" || die "tmux rename-session failed — nothing changed"
+  tmux_renamed=1
+  tmux rename-window -t "=$NEW_T" "$NEW" 2>/dev/null || true
+  # re-assert the name locks so Claude's escape codes can't drift it (harmless if already set)
+  tmux set-window-option -t "=$NEW_T" automatic-rename off 2>/dev/null || true
+  # BARE target on purpose: `allow-rename` is a window option and the `=` target
+  # does not resolve for it, so `=$NEW_T` was a silent no-op. The session was
+  # just renamed to $NEW_T, so the bare exact name always resolves.
+  tmux set-option        -t "$NEW_T"  allow-rename off 2>/dev/null || true
+fi
+
+rollback_tmux() { [[ $tmux_renamed -eq 1 ]] && tmux rename-session -t "=$NEW_T" "$OLD_T" 2>/dev/null || true; }
+
+# ── 2. Files (pre-validated; near-certain to succeed) ────────────────────────
+mv "$OLD_ENV" "$NEW_ENV" || { rollback_tmux; die "failed to move $OLD.env (rolled back tmux)"; }
+[[ -f "$OLD_META" ]] && { mv "$OLD_META" "$NEW_META" || true; }
+
+# ── 3. Rewrite the name recorded *inside* the files ──────────────────────────
+tmp="$(mktemp "${TMPDIR:-/tmp}/amux-rename.XXXXXX")"
+sed -E -e "s/^# amux session: .*/# amux session: $NEW/" \
+       -e "s/^CC_NAME=.*/CC_NAME=\"$NEW\"/" "$NEW_ENV" > "$tmp" && mv "$tmp" "$NEW_ENV"
+if [[ -f "$NEW_META" ]] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$NEW_META" "$NEW" <<'PY' || true
+import json, sys
+p, new = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+if isinstance(d, dict) and d.get("cc_session_name") not in (None, new):
+    d["cc_session_name"] = new
+    json.dump(d, open(p, "w"))
+PY
+fi
+
+# ── 4. Dashboard rows (best effort; live-reference tables only, not history) ──
+if [[ -f "$DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+  for tbl in issues tasks schedules share_tokens; do
+    sqlite3 "$DB" "PRAGMA busy_timeout=3000; UPDATE $tbl SET session='$NEW' WHERE session='$OLD';" >/dev/null 2>&1 || true
+  done
+fi
+
+info "${GREEN}renamed${RESET} $OLD ${DIM}->${RESET} ${BOLD}$NEW${RESET}"
+[[ $running -eq 1 ]] && info "${DIM}attach with:${RESET} amux attach $NEW"

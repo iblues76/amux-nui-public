@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# amux-rm-stopped — remove every amux session that is STOPPED, so `amux ls -c`
+# only shows the ones actually running.
+#
+# "Stopped" = registered in ~/.amux/sessions/<name>.env but with NO live tmux
+# session `amux-<name>` (the same test amux itself uses). Those are the `○`
+# entries in `amux ls -c` / the ones with no `*` in `amux ls`.
+#
+# Removal is `amux rm <name>`, which only deletes the registration (.env).
+# The Claude/Codex conversation lives in the session's DIRECTORY, not its name,
+# so re-registering the same name+dir later auto-resumes it — this is not a
+# data-destroying operation, but it IS unrecoverable as a *list* (the flags,
+# model and provider in the .env are gone). Hence the confirm prompt by default.
+#
+# Usage:
+#   amux-rm-stopped                 preview the stopped list, then confirm
+#   amux-rm-stopped -n              dry run — print what would go, remove nothing
+#   amux-rm-stopped -y              no prompt, just remove them
+#   amux-rm-stopped -k a,b -k c     keep these names even if stopped
+#   amux-rm-stopped -h              this help
+#
+# A persistent keep-list also works: one session name per line in
+#   ~/.amux/rm-stopped.keep      (blank lines and #comments ignored)
+# so sessions you never want auto-culled survive every run.
+#
+# Exit: 0 = removed (or nothing to do), 1 = error, 2 = bad usage, 3 = aborted.
+set -uo pipefail
+
+if [ -z "${CC_HOME+set}" ]; then CC_HOME="$HOME/.amux"; fi
+CC_SESSIONS="$CC_HOME/sessions"
+KEEPFILE="$CC_HOME/rm-stopped.keep"
+
+R=; G=; Y=; D=; B=; N=
+if [ -t 1 ] && [ -n "${TERM+set}" ] && [ "$TERM" != dumb ]; then
+  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'
+  D=$'\033[2m';  B=$'\033[1m';  N=$'\033[0m'
+fi
+
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
+die()   { echo "${R}error:${N} $*" >&2; exit 1; }
+
+dry=0; yes=0; keep_csv=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) dry=1 ;;
+    -y|--yes)     yes=1 ;;
+    -k|--keep)    shift; [ $# -gt 0 ] || { echo "usage: -k <name[,name...]>" >&2; exit 2; }
+                  if [ -n "$keep_csv" ]; then keep_csv="$keep_csv,$1"; else keep_csv="$1"; fi ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+command -v amux >/dev/null 2>&1 || die "amux not found on PATH"
+command -v tmux >/dev/null 2>&1 || die "tmux not found on PATH"
+[ -d "$CC_SESSIONS" ] || die "no session dir at $CC_SESSIONS"
+
+# ── build the keep set (-k flag + keepfile) ─────────────────────────────────
+keep_set=" "
+add_keep() { case "$keep_set" in *" $1 "*) ;; *) keep_set="$keep_set$1 ";; esac; }
+if [ -n "$keep_csv" ]; then
+  IFS=, read -r -a _k <<<"$keep_csv"
+  for k in "${_k[@]}"; do k="${k// /}"; [ -n "$k" ] && add_keep "$k"; done
+fi
+if [ -f "$KEEPFILE" ]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"; line="${line// /}"
+    [ -n "$line" ] && add_keep "$line"
+  done < "$KEEPFILE"
+fi
+is_kept() { case "$keep_set" in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# ── partition registered sessions into running / stopped / kept ─────────────
+stopped=(); kept=(); running=0
+shopt -s nullglob
+for f in "$CC_SESSIONS"/*.env; do
+  name="$(basename "$f" .env)"
+  # iTerm2-provider sessions have NO tmux backing — the tmux test below would
+  # classify a LIVE one as stopped and -y would auto-delete it out from under
+  # the user (2026-08-12). They're never culled here; manage them by hand.
+  if grep -q '^CC_PROVIDER="\{0,1\}iterm2' "$f" 2>/dev/null \
+     || grep -q '^CC_ITERM2_SESSION_ID=' "$f" 2>/dev/null; then
+    kept+=("$name")
+    continue
+  fi
+  # exact-match target ('=' prefix) — a bare name prefix-matches in tmux, so
+  # "foo" would look alive whenever "foo-worker" is running
+  if tmux has-session -t "=amux-$name" 2>/dev/null; then
+    running=$((running + 1))
+  elif is_kept "$name"; then
+    kept+=("$name")
+  else
+    stopped+=("$name")
+  fi
+done
+shopt -u nullglob
+
+total=$((running + ${#stopped[@]} + ${#kept[@]}))
+[ "$total" -gt 0 ] || die "no registered sessions found in $CC_SESSIONS"
+
+if [ "${#stopped[@]}" -eq 0 ]; then
+  echo "${G}nothing to do${N} — $running running, 0 stopped, ${#kept[@]} kept"
+  exit 0
+fi
+
+echo "${B}${#stopped[@]} stopped session(s)${N} to remove ${D}($running running, left alone)${N}"
+printf '  %s\n' "${stopped[@]}"
+if [ "${#kept[@]}" -gt 0 ]; then
+  echo "${D}  keeping (keep-list): ${kept[*]}${N}"
+fi
+
+if [ "$dry" -eq 1 ]; then
+  echo "${Y}dry run${N} — nothing removed"
+  exit 0
+fi
+
+if [ "$yes" -ne 1 ]; then
+  [ -t 0 ] || die "not a tty and -y not given — refusing to remove ${#stopped[@]} sessions"
+  printf 'remove these %d session(s)? [y/N] ' "${#stopped[@]}"
+  read -r ans
+  case "$ans" in y|Y|yes|YES) ;; *) echo "aborted"; exit 3 ;; esac
+fi
+
+fail=0
+for name in "${stopped[@]}"; do
+  if amux rm "$name" >/dev/null 2>&1; then
+    echo "${R}removed${N} $name"
+  else
+    echo "${Y}FAILED${N}  $name" >&2
+    fail=$((fail + 1))
+  fi
+done
+
+echo "${G}done${N} — removed $(( ${#stopped[@]} - fail ))/${#stopped[@]}, $running still running"
+[ "$fail" -eq 0 ] || exit 1

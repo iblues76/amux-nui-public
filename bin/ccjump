@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+# ccjump — pick an active Claude/amux session (this box + your remote boxes) and JUMP to it.
+#   local session  -> `amux start` (attaches; starts it first if stopped); inside tmux:
+#                     start --no-attach, then tmux switch-client
+#   remote session -> `amux-up <box> <name>` (starts it if stopped, then attaches over SSH)
+# TUI: fzf with a live preview pane (recent output of the highlighted session). Local rows show
+# instantly; remotes stream in (fetched in parallel, each time-limited so a down box can't hang).
+# Fallbacks if no fzf: macOS `choose from list` (clickable) > numbered menu. bash-3.2 safe (like amux).
+#
+#   ccjump                  pick + jump across every remote box + this box, remote first (fzf TUI)
+#   ccjump -A               (same, explicit)
+#   ccjump -R               every remote box, this box left out
+#   ccjump local            this box only          (== amux pick)
+#   ccjump <box> [box...]   just those boxes; `local` may be one of them (== amux pick <box>)
+#   ccjump --machines       start on the machine list (pick a machine, then a session)
+#   ccjump --list [scope]   print discovered sessions (no picker/jump)
+# Keys inside the picker: F1 remote machines (again: + this one) · F2 this machine ·
+#   F3 machine list · F4 next machine · alt-b remote + this one
+#   (alt-a / alt-h / alt-m / alt-n where F-keys need fn) · ^r reload
+#   F5 attach lane auto/mosh/cc/plain (remembered) · F6 account · F7 model · F8 full access ·
+#   F9 stop/start · F10 remove (type the name) · F11 new session · F12 info
+#   (alt-l / alt-c / alt-o / alt-y / alt-s / alt-x / alt-e / alt-i). Changes ask first.
+# Rows show bare session names; the P:cc:/cx:/oc: account+provider tag rides along dimmed.
+# Each machine gets a header row (@box ━━ box · N sessions · R running); ↵ on it opens that
+# machine. Empty and offline boxes get no header — F3 lists them.
+# Internal: --feed (stream rows for fzf/reload), --preview <row> (preview pane body).
+# Binding (tmux 3.2+):  bind-key j display-popup -w 90% -h 70% -E ccjump
+case "${1:-}" in -h|--help)
+  awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
+esac
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+AMUX="${AMUX:-amux}"; AMUXBOX="${AMUXBOX:-amux-remote}"   # amux-remote <box> <cmd> (box-required)
+SELF="$0"; case "$SELF" in */*) : ;; *) SELF="$(command -v "$SELF" || echo "$HOME/.local/bin/ccjump")";; esac
+strip(){ sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g'; }
+
+tmo(){ # tmo SECONDS cmd...   (portable timeout; macOS has no `timeout`) — same shape as amux-all's run_to
+  # 2026-09-29: the old `"$@" & ( sleep N; kill ) &` form sat inside
+  # `tmo 8 amux-remote … | strip | …` pipelines, and the sleep inherited the pipe's
+  # write end, so the reader never saw EOF until the sleep ran out — every box
+  # "took" 8 s even when it answered in 0.3 s, and the picker opened in 9-14 s.
+  local s="$1"; shift; perl -e 'my $t=shift; alarm $t; exec @ARGV or exit 127' "$s" "$@"
+}
+row(){ # loc tagged-name run hint -> colored, aligned; loc(field1)+name(field3) stay PLAIN for parse-back
+  # `amux ls` prints names as P:cc:foo / cx:foo (account+provider tag); names never contain ':'
+  local loc="$1" name="${2##*:}" tag="" run="$3" hint="$4" mark
+  case "$2" in *:*) tag="${2%:*}" ;; esac
+  if [ -n "$run" ]; then mark=$'\033[32m●\033[0m'; else mark=$'\033[2m○\033[0m'; fi
+  printf '%-9s %b  %-24s \033[2m%-5s %s\033[0m\n' "$loc" "$mark" "$name" "$tag" "${hint:0:48}"
+}
+# scope: CCJ_SCOPE="all" (remote boxes, then this one), "remote" (remote boxes only) or a
+# space-separated box list ("local" = this box); exported for --feed reloads
+remote_boxes(){
+  local f b here; here="$(hostname -s 2>/dev/null || hostname)"
+  for f in "$HOME"/.amux/remotes/*.env; do
+    [ -e "$f" ] || continue; b="$(basename "$f" .env)"
+    # this box's own remote entry would duplicate the local rows
+    [ "$b" = "$here" ] || [ "${AMUX_HOST_PREFIX:-}$b" = "$here" ] || echo "$b"
+  done
+}
+# rows for one box (no header)
+box_rows(){
+  local box="$1" line run rest
+  if [ "$box" = local ]; then
+    "$AMUX" ls 2>/dev/null | strip | while IFS= read -r line; do
+      if [[ "$line" =~ ^[[:space:]]*[0-9]+(\*?)[[:space:]]+([^[:space:]]+)[[:space:]]*(.*)$ ]]; then
+        row local "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]:+r}" "${BASH_REMATCH[3]}"
+      fi
+    done
+    return
+  fi
+  tmo 8 "$AMUXBOX" "$box" ls --bare 2>/dev/null | strip | while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"; [ -n "$line" ] || continue
+    case "$line" in *" sessions"|*sessions|"No "*|"no "*|error*|ERROR*) continue ;; esac
+    run=""; if [ "${line:0:1}" = "*" ]; then run="r"; line="${line#\*}"; line="${line#"${line%%[![:space:]]*}"}"; fi
+    rest="${line#*[[:space:]]}"; [ "$rest" = "$line" ] && rest=""
+    row "$box" "${line%%[[:space:]]*}" "$run" "${rest#"${rest%%[![:space:]]*}"}"
+  done
+}
+# one box as a block: header row + its rows, printed in one go under a lock so parallel
+# boxes never interleave. The header's field1 is @box, so ↵ on it opens that machine.
+box_block(){
+  local box="$1" work="$2" f r t
+  f="$work/$box"; box_rows "$box" >"$f" 2>/dev/null
+  t=$(grep -c . "$f" | tr -d ' '); [ "$t" -gt 0 ] || return 0
+  r=$(grep -c '●' "$f" | tr -d ' ')
+  until mkdir "$work/.lock" 2>/dev/null; do sleep 0.05; done
+  printf '@%-8s \033[36m━━\033[0m \033[1;36m%s\033[0m \033[2m· %s session%s · %s running\033[0m\n' \
+    "$box" "$(mlabel "$box")" "$t" "$([ "$t" = 1 ] || echo s)" "$r"
+  cat "$f"
+  rmdir "$work/.lock"
+}
+feed(){
+  local box work; work="$(mktemp -d "${TMPDIR:-/tmp}/ccjump.XXXXXX")" || return
+  case "${CCJ_SCOPE:-all}" in
+    all|remote)   # remotes stream in as each answers; this box goes last (remote first),
+                  # built alongside them so -A costs max(remote, local), not the sum
+      [ "${CCJ_SCOPE:-all}" = all ] && { box_block local "$work" >"$work/.local.blk" 2>/dev/null & }
+      for box in $(remote_boxes); do box_block "$box" "$work" & done
+      wait
+      [ -s "$work/.local.blk" ] && cat "$work/.local.blk" ;;
+    *)            # explicit list: this box (instant) first, the rest as they answer
+      for box in $CCJ_SCOPE; do [ "$box" = local ] && box_block local "$work"; done
+      for box in $CCJ_SCOPE; do [ "$box" = local ] || box_block "$box" "$work" & done
+      wait ;;
+  esac
+  rm -rf "$work"
+}
+
+# scope args (anything that is not an internal --flag): -A/--all = every box, else box names
+scope_args(){
+  local a out=""
+  for a in "$@"; do
+    case "$a" in
+      -A|--all|all) out="all" ;;
+      -R|--remote|remote) out="remote" ;;
+      -l|--local)   out="$out local" ;;
+      -*) echo "ccjump: unknown option '$a' (see ccjump -h)" >&2; exit 2 ;;
+      local)        out="$out local" ;;
+      # canonicalize once (box1-01 -> box1) so the list, every preview and the
+      # attach all use the configured name instead of re-resolving an alias
+      *)  case "$out" in all|remote) continue ;; esac; out="$out $("$AMUXBOX" "$a" box 2>/dev/null || echo "$a")" ;;
+    esac
+  done
+  out="${out# }"; echo "${out:-all}"
+}
+
+# Keep colors, drop every other escape: a remote peek can replay the pane's raw log,
+# and replayed terminal QUERIES (OSC 11, DA1) make the terminal type its answers into
+# fzf's search box; replayed OSC 52 would overwrite the clipboard. (2026-09-28)
+clean(){ perl -0777 -pe 's/\e[\]P_^X].*?(?:\a|\e\\|\z)//gs; s/\e\[(\d*)C/" " x ($1||1)/ge; s/\e\[[0-9;:<=>?]*[ -\/]*[\@-ln-~]//g; s/\e(?!\[)[ -\/]*[0-~]//g; s/\e(?!\[)//g; s/[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]//g'; }
+
+# All boxes in switching order: this machine first, then each configured remote.
+all_boxes(){
+  local f b here; here="$(hostname -s 2>/dev/null || hostname)"
+  echo local
+  for f in "$HOME"/.amux/remotes/*.env; do
+    [ -e "$f" ] || continue; b="$(basename "$f" .env)"
+    [ "$b" = "$here" ] || [ "${AMUX_HOST_PREFIX:-}$b" = "$here" ] || echo "$b"
+  done
+}
+
+# Machine rows for the F3 list: "@box ▸ box  N sessions · R running", busiest first,
+# then empty, then offline. Selecting one reopens the picker on that machine.
+machines(){
+  local work b; work="$(mktemp -d "${TMPDIR:-/tmp}/ccjump.XXXXXX")" || return
+  for b in $(all_boxes); do
+    ( if [ "$b" = local ]; then "$AMUX" ls -c 2>/dev/null; else tmo 8 "$AMUXBOX" "$b" ls -c --bare 2>/dev/null; fi \
+        | strip | grep -v ' sessions · ' >"$work/$b" 2>/dev/null; echo $? >"$work/$b.rc" ) &
+  done
+  wait
+  for b in $(all_boxes); do
+    local r t
+    if [ ! -s "$work/$b" ] && [ "$(cat "$work/$b.rc" 2>/dev/null)" != 0 ]; then
+      printf '3 0 0 %s\n' "$b"; continue           # offline
+    fi
+    r=$(grep -o '●' "$work/$b" | wc -l | tr -d ' '); t=$(( r + $(grep -o '○' "$work/$b" | wc -l | tr -d ' ') ))
+    if [ "$t" -gt 0 ]; then printf '1 %s %s %s\n' "$r" "$t" "$b"; else printf '2 0 0 %s\n' "$b"; fi
+  done | sort -k1,1n -k2,2nr -k3,3nr -k4,4 | while read -r grp r t b; do
+    case "$grp" in
+      1) printf '%-11s \033[36m▸\033[0m  %-30s \033[2m%s session%s · %s running\033[0m\n' "@$b" "$(mlabel "$b")" "$t" "$([ "$t" = 1 ] || echo s)" "$r" ;;
+      2) printf '%-11s \033[2m▸  %-30s no sessions\033[0m\n' "@$b" "$(mlabel "$b")" ;;
+      3) printf '%-11s \033[2m▸  %-30s offline\033[0m\n' "@$b" "$(mlabel "$b")" ;;
+    esac
+  done
+  rm -rf "$work"
+}
+
+mlabel(){ if [ "$1" = local ]; then echo "$(hostname -s 2>/dev/null) (this machine)"; else echo "$1"; fi; }
+
+# The machine after the current scope (F4): walks the machine list's order — busy
+# machines only, busiest first — so it never lands on an empty or offline box.
+next_box(){
+  local cur="${CCJ_SCOPE:-all}" first="" prev="" b
+  for b in $(machines | strip | awk '/ sessions? · /{sub(/^@/,"",$1); print $1}'); do
+    [ -z "$first" ] && first="$b"
+    if [ "$prev" = "$cur" ]; then echo "$b"; return; fi
+    prev="$b"
+  done
+  echo "${first:-local}"
+}
+
+# ---- F5-F12: attach lane + per-session settings (2026-09-28) ----
+# The lane (how a REMOTE row attaches) is remembered in a file, so it survives
+# picker restarts: auto = amux-remote decides (SSH, iTerm2 -CC when detected),
+# mosh, cc (iTerm2 tabs), plain (plain tmux over SSH). Local rows ignore it.
+LANE_FILE="$HOME/.amux/ccjump-lane"
+lane(){
+  local l; l="$(cat "$LANE_FILE" 2>/dev/null)"
+  case "$l" in auto|mosh|cc|plain) echo "$l" ;;
+    *) case "${AMUX_MOSH:-0}" in 1|yes|true|on) echo mosh ;; *) echo auto ;; esac ;;
+  esac
+}
+lane_cycle(){
+  local n; case "$(lane)" in auto) n=mosh ;; mosh) n=cc ;; cc) n=plain ;; *) n=auto ;; esac
+  mkdir -p "$HOME/.amux" && echo "$n" >"$LANE_FILE"
+}
+lane_flag(){ case "$(lane)" in mosh) echo --mosh ;; cc) echo --cc ;; plain) echo --plain ;; esac; }
+# fzf clips (never wraps) a header line at the list pane's width, which hid the machine
+# keys on narrower windows (2026-09-29). So wrap it ourselves: items joined by " · ",
+# broken between items. Width = the list pane: the whole window when the preview drops
+# below (< 120 cols, see --preview-window), else the 45% left of the preview.
+# `follow` keeps the preview scrolled to the BOTTOM of the peek, like the terminal
+# itself: a small detached pane (80x23) puts the launch command at the top and the
+# live prompt off-screen, which read as "broken output" (2026-09-29).
+hwidth(){
+  local c="${FZF_COLUMNS:-}"
+  [ -n "$c" ] || c="$(tput cols 2>/dev/null </dev/tty || echo 100)"
+  case "$c" in ''|*[!0-9]*) c=100 ;; esac
+  if [ "$c" -ge 120 ]; then echo $(( c * 45 / 100 - 4 )); else echo $(( c - 4 )); fi
+}
+hwrap(){ # hwrap WIDTH item...
+  local w="$1" line="" it; shift
+  for it in "$@"; do
+    if [ -z "$line" ]; then line="$it"
+    elif [ $(( ${#line} + 3 + ${#it} )) -le "$w" ]; then line="$line · $it"
+    else printf '%s\n' "$line"; line="$it"; fi
+  done
+  printf '%s' "$line"
+}
+HKEYS_MACHINES=("↵ open (○ starts it)" "F1 remote (again: +this)" "F2 this machine" "F3 machine list"
+  "F4 next machine" "↵ on a ━━ row: that machine")
+HKEYS_TAIL=("^r reload" "esc quit")
+header(){
+  hwrap "$(hwidth)" "${HKEYS_MACHINES[@]}" "F5 lane:$(lane)" "F6 account" "F7 model" "F8 full access" \
+    "F9 stop/start" "F10 remove" "F11 new" "F12 info" "${HKEYS_TAIL[@]}" \
+    "no F-keys: alt+ a h m n b / l c o y s x e i"
+}
+
+# Every settings action goes through amux-remote <box>. A LOCAL row maps to this
+# machine's own remote entry (my-laptop -> laptop with AMUX_HOST_PREFIX=my-) when it has one.
+act_box(){
+  local loc="$1" h
+  if [ "$loc" = local ] || [ "$loc" = @local ]; then
+    h="$(hostname -s 2>/dev/null || hostname)"; h="${h#"${AMUX_HOST_PREFIX:-}"}"
+    [ -f "$HOME/.amux/remotes/$h.env" ] && { echo "$h"; return 0; }
+    return 1
+  fi
+  echo "${loc#@}"
+}
+say(){ printf '%b\n' "$*" >/dev/tty; }
+ask(){ printf '%b' "$1" >/dev/tty; REPLY=""; IFS= read -r REPLY </dev/tty || REPLY=""; }
+yes_no(){ ask "$1 [y/N] "; case "$REPLY" in y|Y|yes|YES) return 0 ;; esac; return 1; }
+pause(){ printf '\n\033[2m  press any key to go back…\033[0m' >/dev/tty; IFS= read -rsn1 _k </dev/tty || true; }
+# info fields, tab-separated: running provider account model fullaccess dir
+sinfo(){
+  "$AMUXBOX" "$1" info "$2" 2>/dev/null | python3 -c '
+import json,sys,shlex
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+if not isinstance(d, dict) or d.get("error"): sys.exit(1)
+fl = d.get("flags") or ""
+try: f = shlex.split(fl)
+except Exception: f = fl.split()
+m = f[f.index("--model") + 1] if "--model" in f[:-1] else "(default)"
+fa = any(x in f for x in ("--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox", "--yolo", "--auto"))
+print("\t".join(["yes" if d.get("running") else "no", d.get("provider") or "claude",
+  d.get("account") or "-", m, "on" if fa else "off", d.get("dir") or "?"]))'
+}
+
+act(){ # act <verb> <fzf row>
+  local verb="$1"; shift
+  local loc _m name _r box inf run prov acct model fa dir
+  read -r loc _m name _r <<<"$(printf '%s' "$*" | strip)"
+  clear >/dev/tty 2>/dev/null
+  if [ -z "${loc:-}" ]; then say "no row selected"; pause; return; fi
+  if ! box="$(act_box "$loc")"; then
+    say "this machine has no amux-remote entry (~/.amux/remotes/<name>.env), so the picker"
+    say "cannot change its sessions — use the amux CLI here instead"; pause; return
+  fi
+  if [ "$verb" = new ]; then act_new "$box"; return; fi
+  case "$loc" in @*) say "that is a machine row — pick a session (F11 new works here)"; pause; return ;; esac
+  if ! inf="$(sinfo "$box" "$name")"; then say "could not read $name on $box"; pause; return; fi
+  IFS=$'\t' read -r run prov acct model fa dir <<<"$inf"
+  say "\033[1m$name\033[0m on \033[36m$box\033[0m · running:$run · $prov · account:$acct · model:$model · full access:$fa"
+  say "\033[2m$dir\033[0m\n"
+  case "$verb" in
+    account)
+      case "$prov" in claude|iterm2) ;; *) say "$prov sessions have no Claude account"; pause; return ;; esac
+      ask "new account — P personal · T team · X team2 (empty = cancel): "
+      local new; case "$REPLY" in p|P) new=personal ;; t|T) new=team ;; x|X) new=team2 ;; "") return ;;
+        *) say "unknown account '$REPLY'"; pause; return ;; esac
+      [ "$new" = "$acct" ] && { say "already $acct"; pause; return; }
+      if [ "$run" = yes ]; then
+        yes_no "$name is running; the box only changes a stopped session. Stop it, switch to $new, start it again?" || return
+        "$AMUXBOX" "$box" stop "$name" && "$AMUXBOX" "$box" account "$name" "$new" \
+          && AMUX_NO_HINT=1 "$AMUXBOX" "$box" start "$name" --no-attach
+      else
+        "$AMUXBOX" "$box" account "$name" "$new"
+      fi ;;
+    model)
+      ask "new model — e.g. opus · sonnet · haiku · fable (empty = cancel): "
+      [ -n "$REPLY" ] || return
+      local m="$REPLY"
+      if [ "$run" = yes ]; then yes_no "this restarts $name (it resumes its conversation). Continue?" || return; fi
+      "$AMUXBOX" "$box" model "$name" "$m" ;;
+    fullaccess)
+      local want; if [ "$fa" = on ]; then want=off; else want=on; fi
+      local q="turn full access $want for $name?"
+      [ "$want" = on ] && q="turn full access ON (no permission prompts) for $name?"
+      [ "$run" = yes ] && q="$q It restarts the session."
+      yes_no "$q" || return
+      "$AMUXBOX" "$box" full-access "$name" "$want" ;;
+    stopstart)
+      if [ "$run" = yes ]; then
+        yes_no "stop $name on $box?" || return
+        "$AMUXBOX" "$box" stop "$name"
+      else
+        AMUX_NO_HINT=1 "$AMUXBOX" "$box" start "$name" --no-attach
+      fi ;;
+    remove)
+      say "\033[31mremove\033[0m deletes the session from amux on $box (stops it first; its config, meta and log"
+      say "go). The project folder $dir is NOT touched."
+      ask "type the session name to confirm (empty = cancel): "
+      [ "$REPLY" = "$name" ] || { [ -n "$REPLY" ] && say "name did not match — nothing removed"; [ -n "$REPLY" ] && pause; return; }
+      "$AMUXBOX" "$box" rm "$name" ;;
+    info)
+      say "keys: F5 lane (now $(lane)) · F6 account · F7 model · F8 full access · F9 stop/start"
+      say "      F10 remove · F11 new session on this machine · F12 this screen"
+      say "      alt twins: l c o y s x e i · F1-F4 / alt a h m n switch machines"
+      say "      F1 remote machines, F1 again (or alt-b) adds this one · ↵ on a ━━ header opens that machine" ;;
+  esac
+  pause
+}
+
+act_new(){ # new session on <box>, created stopped-then-started without attaching
+  local box="$1" n d p a m fa=""
+  say "new session on \033[36m$box\033[0m (empty name = cancel)\n"
+  ask "name: "; n="$REPLY"; [ -n "$n" ] || return
+  ask "dir on $box [${AMUX_NEW_DIR_BASE:-~/projects}/$n]: "; d="${REPLY:-${AMUX_NEW_DIR_BASE:-~/projects}/$n}"
+  ask "provider [claude] (claude codex opencode gemini agy): "; p="${REPLY:-claude}"
+  local args=(exec "$n" --provider "$p" --dir "$d" --no-attach)
+  if [ "$p" = claude ]; then
+    ask "account [P] (P T X): "; a="${REPLY:-P}"; args+=(--account "$a")
+  fi
+  ask "model (empty = box default): "; m="$REPLY"; [ -n "$m" ] && args+=(--model "$m")
+  yes_no "full access (no permission prompts)?" && args+=(--full-access)
+  say ""
+  "$AMUXBOX" "$box" "${args[@]}"
+  pause
+}
+
+case "${1:-}" in
+  --feed) feed; exit 0 ;;
+  --act) shift; act "$@"; exit 0 ;;
+  --lane-cycle) lane_cycle; exit 0 ;;
+  --header) header; exit 0 ;;
+  --list) shift; export CCJ_SCOPE="$(scope_args "$@")"; feed | strip; exit 0 ;;
+  --machines-feed) machines; exit 0 ;;
+  --next-box) next_box; exit 0 ;;   # internal/debug: what F4 would open
+  --f1) [ "${CCJ_SCOPE:-}" = remote ] && exec "$SELF" -A; exec "$SELF" -R ;;   # F1: remote, again: + this
+  --preview)
+    shift; line="$(printf '%s' "$*" | strip)"; read -r loc _m name _rest <<<"$line"
+    [ -n "${name:-}" ] || exit 0
+    case "$loc" in
+      @local) "$AMUX" ls -c 2>/dev/null | clean; exit 0 ;;
+      @*)     tmo 8 "$AMUXBOX" "${loc#@}" ls -c 2>/dev/null | clean || echo "(unreachable)"; exit 0 ;;
+    esac
+    if [ "$loc" = local ]; then "$AMUX" peek "$name" 2>/dev/null | clean || echo "(no preview)"
+    else tmo 4 "$AMUXBOX" "$loc" peek "$name" 2>/dev/null | clean || echo "(no preview)"; fi
+    exit 0 ;;
+esac
+
+# ---- pick ----
+# fzf's become() (F1-F4 rescopes) re-runs the picker INSIDE the parent's
+# `choice="$(… | fzf)"` capture, so this process's stdout is that pipe. The attach
+# after the pick then painted into the pipe: the terminal stayed blank while the far
+# box showed the session attached to a client nobody could see ("picked a session and it
+# hanged", seen twice on 2026-09-29). Put stdout back on the terminal.
+[ -t 1 ] || { ( : >/dev/tty ) 2>/dev/null && exec >/dev/tty; }
+MODE=sessions
+case "${1:-}" in
+  --machines) MODE=machines; export CCJ_SCOPE=machines ;;
+  --next)     export CCJ_SCOPE="$(next_box)" ;;
+  *)          export CCJ_SCOPE="$(scope_args "$@")" ;;
+esac
+if [ "$MODE" = machines ]; then SRC="$SELF --machines-feed"; PROMPT="machines ▸ "
+else SRC="$SELF --feed"
+  case "$CCJ_SCOPE" in all) PROMPT="remote + this ▸ " ;; remote) PROMPT="remote machines ▸ " ;; *) PROMPT="$CCJ_SCOPE ▸ " ;; esac
+fi
+HDR='↵ open (○ starts it)   ^r reload   esc cancel · click or type to filter'
+KEYS=()
+# Machine switching needs fzf's become action (0.38+); older fzf just loses the keys.
+_fzv="$(fzf --version 2>/dev/null | sed -E 's/^([0-9]+)\.([0-9]+).*/\1 \2/')"
+if [ -n "$_fzv" ] && set -- $_fzv && { [ "$1" -gt 0 ] || [ "$2" -ge 38 ]; }; then
+  KEYS=(--bind "f1:become($SELF --f1)" --bind "alt-a:become($SELF --f1)" --bind "alt-b:become($SELF -A)"
+        --bind "f2:become($SELF local)" --bind "alt-h:become($SELF local)"
+        --bind "f3:become($SELF --machines)" --bind "alt-m:become($SELF --machines)"
+        --bind "f4:become($SELF --next)" --bind "alt-n:become($SELF --next)")
+  HDR="$(hwrap "$(hwidth)" "${HKEYS_MACHINES[@]}" "${HKEYS_TAIL[@]}" "no F-keys: alt+ a h m n b")"
+  # F5-F12 need transform-header (fzf 0.45+)
+  if [ "$1" -gt 0 ] || [ "$2" -ge 45 ]; then
+    _a(){ KEYS+=(--bind "$1:execute($SELF --act $3 {})+reload($SRC)" --bind "$2:execute($SELF --act $3 {})+reload($SRC)"); }
+    KEYS+=(--bind "f5:execute-silent($SELF --lane-cycle)+transform-header($SELF --header)"
+           --bind "alt-l:execute-silent($SELF --lane-cycle)+transform-header($SELF --header)")
+    _a f6 alt-c account; _a f7 alt-o model; _a f8 alt-y fullaccess; _a f9 alt-s stopstart
+    _a f10 alt-x remove; _a f11 alt-e new; _a f12 alt-i info
+    # re-wrap the header when the window changes size (fzf 0.46+ has the resize event)
+    { [ "$1" -gt 0 ] || [ "$2" -ge 46 ]; } && KEYS+=(--bind "resize:transform-header($SELF --header)")
+    HDR="$(header)"
+  fi
+fi
+choice=""
+if command -v fzf >/dev/null 2>&1; then
+  choice="$($SRC | fzf --ansi --reverse --cycle --border --info=inline \
+      --prompt="$PROMPT" --header="$HDR" \
+      --preview "$SELF --preview {}" --preview-window='right,55%,border-left,wrap,follow,<120(down,45%,border-top,wrap,follow)' \
+      --bind "ctrl-r:reload($SRC)" "${KEYS[@]+"${KEYS[@]}"}")"
+elif command -v osascript >/dev/null 2>&1; then
+  _rows=(); while IFS= read -r _l; do [ -n "$_l" ] && _rows+=("$_l"); done < <($SRC | strip)
+  [ "${#_rows[@]}" -gt 0 ] || { echo "no sessions" >&2; exit 1; }
+  choice="$(osascript -e 'on run a' -e 'set c to choose from list a with prompt "Jump to a Claude session:" with title "ccjump"' -e 'if c is false then return ""' -e 'return item 1 of c' -e 'end run' "${_rows[@]}")"
+else
+  echo "Select a session:"; select choice in $($SRC | strip); do break; done
+fi
+[ -n "${choice:-}" ] || exit 0
+
+# ---- parse (LOC=field1, NAME=field3) + jump ----
+read -r loc _mark name _rest <<<"$(printf '%s' "$choice" | strip)"
+[ -n "${name:-}" ] || exit 0
+# only a real row (this box, a configured box, or an @machine header) is acted on:
+# anything else is stray text that reached the capture, e.g. a become()'d child's
+# "· starting …" lines before the /dev/tty fix above — never hand that to amux-up
+case "$loc" in
+  local|@*) ;;
+  *) [ -f "$HOME/.amux/remotes/$loc.env" ] || exit 0 ;;
+esac
+# a machine row (F3 list) reopens the picker scoped to that machine
+case "$loc" in @*) exec "$SELF" "${loc#@}" ;; esac
+# A stopped (○) row is started first, so every row is pickable (2026-09-28).
+if [ "$loc" = local ]; then
+  if [ -n "${TMUX:-}" ]; then
+    # inside tmux an attach would nest: make sure it runs, then switch this client to it
+    "$AMUX" start "$name" --no-attach || exit $?
+    # switching clients has no "after": probe once (amux attach / amux-remote probe themselves)
+    _tp="$HOME/.local/bin/amux-termprobe"; [ -x "$_tp" ] && "$_tp" switch "local:$name" || true
+    exec tmux switch-client -t "=amux-$name"
+  else exec "$AMUX" start "$name"; fi   # attaches if running, else starts + attaches
+else
+  _up="$HOME/.local/bin/amux-up"; [ -x "$_up" ] || _up=amux-up
+  exec "$_up" "$loc" "$name" $(lane_flag)   # start-if-needed, then attach (F5 lane)
+fi

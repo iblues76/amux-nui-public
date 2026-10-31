@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# amux-ls — list THIS machine's amux sessions, with a compact grid view.
+#
+# The bundled amux has `amux ls -c` built in; this command remains for machines
+# running another amux build, and as the API-based view. Upstream `amux ls`
+# prints one verbose row per session and has no compact mode.
+# Once you are running more than a handful of sessions that list is longer than a
+# screen, which is exactly when you most want to see everything at once.
+#
+# This reads the LOCAL amux server's REST API on 127.0.0.1 — the same interface
+# `amux-remote` uses for other machines — so the local and remote views come from
+# one renderer and cannot drift apart. It also means no patch to amux is needed
+# to get a compact list.
+#
+# Usage:
+#   amux-ls              compact grid (default): NN * name
+#   amux-ls -v           verbose rows: status, model, directory
+#   amux-ls --bare       no header (for embedding in other tools)
+#   amux-ls --archived   include archived sessions
+#   amux-ls --port N     local server port (default 8822, or $AMUX_LOCAL_PORT)
+#
+# Requires the local `amux serve` to be running. If it is not, this says so and
+# tells you how to start it, rather than printing a misleading empty list.
+set -uo pipefail
+
+_here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$_here/../lib/amux-common.sh" ]; then
+  . "$_here/../lib/amux-common.sh"
+else
+  _real=$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  case "$_real" in /*) ;; *) _real="$_here/$_real" ;; esac
+  _libdir=$(cd "$(dirname "$_real")/../lib" 2>/dev/null && pwd)
+  [ -n "${_libdir:-}" ] && [ -f "$_libdir/amux-common.sh" ] \
+    || { echo "amux-ls: cannot find lib/amux-common.sh" >&2; exit 1; }
+  . "$_libdir/amux-common.sh"
+fi
+
+VERB=0 BARE=0 PORT="${AMUX_LOCAL_PORT:-8822}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -v|--verbose)       VERB=1 ;;
+    -c|--compact)       VERB=0 ;;   # accepted for symmetry with `amux-remote ls -c`
+    --bare|--no-header) BARE=1 ;;
+    --archived)         export AMUX_SHOW_ARCHIVED=1 ;;
+    --port)             PORT="${2:-}"; shift ;;
+    -h|--help)          amux_self_help "$0"; exit 0 ;;
+    *)                  amux_die "unknown option: $1 (see -h)" ;;
+  esac
+  shift
+done
+
+# The local server authenticates the same as a remote one; its token is the
+# auth_token file in this machine's own amux home.
+TOKFILE="$(amux_home)/auth_token"
+if [ ! -s "$TOKFILE" ]; then
+  amux_die "no local amux token at $TOKFILE — is 'amux serve' set up on this machine?
+  start it:  amux serve $PORT
+  persist it: setup/serve-install"
+fi
+
+export AMUX_URL="https://127.0.0.1:$PORT"
+export AMUX_TOKEN; AMUX_TOKEN=$(tr -d '\r\n' < "$TOKFILE")
+
+json=$(amux_api GET /api/sessions 2>/dev/null)
+if [ -z "$json" ]; then
+  amux_die "the local amux server is not answering on $AMUX_URL
+  start it:   amux serve $PORT
+  check it:   curl -sk $AMUX_URL/api/sessions -o /dev/null -w '%{http_code}\\n'"
+fi
+
+# Render with the SAME program amux-remote uses, so `amux-ls` here and
+# `amux-remote <box> ls` there produce identical output for identical data.
+RENDER="$_here/../lib/amux-render.py"
+if [ ! -f "$RENDER" ]; then
+  _real=$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  case "$_real" in /*) ;; *) _real="$_here/$_real" ;; esac
+  RENDER="$(cd "$(dirname "$_real")/../lib" 2>/dev/null && pwd)/amux-render.py"
+fi
+[ -f "$RENDER" ] || amux_die "cannot find lib/amux-render.py"
+
+COMPACT=1; [ "$VERB" = 1 ] && COMPACT=0
+[ "$_amux_color" = 1 ] && export AMUX_FORCE_COLOR=1
+
+printf '%s' "$json" \
+  | AMUX_LS_LABEL="$(hostname -s 2>/dev/null || hostname)" \
+    AMUX_LS_URL="" \
+    AMUX_LS_KIND=local \
+    AMUX_LS_COMPACT="$COMPACT" \
+    AMUX_LS_BARE="$BARE" \
+    AMUX_LS_ASCII="$(amux_ascii_default)" \
+    python3 "$RENDER"

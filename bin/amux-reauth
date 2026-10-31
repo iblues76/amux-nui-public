@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# amux-reauth — force an amux Claude session to re-authenticate against the DURABLE
+# long-lived token, with NO browser /login. SSH-friendly (the whole point).
+#
+# Why this exists: a session can get stuck at
+#     "Please run /login · API Error: 401 OAuth access token has expired"
+# when its claude process is running on a STALE credential — the EXPIRING Keychain
+# login, or a process launched before the durable token was wired in. Over SSH you
+# cannot complete /login (no way to paste the browser callback URL back into the
+# tmux pane), and /login is the WRONG fix anyway: the durable subscription token in
+# ~/.config/claude-code/env is long-lived and OVERRIDES the Keychain. The real fix
+# is to RESTART the session so a fresh claude picks that token up. --continue + amux
+# auto-resume preserve the conversation.  See docs/auth.md.
+#
+# Usage:
+#   amux-reauth <name> [name...]   # re-auth specific session(s)
+#   amux-reauth --all              # re-auth every session parked at a REAL 401 /login
+#   amux-reauth --force-all        # re-auth every running session (blunt instrument)
+#   amux-reauth -d|--detached ...  # never attach afterwards (for scripts / the watchdog)
+#   amux-reauth -h|--help
+#
+# If the DURABLE token itself is dead (a real token expiry), this REFUSES to
+# restart anything (pointless) and tells you to re-provision:
+#     re-mint: run `claude setup-token`, save it to ~/.config/claude-code/env
+set -uo pipefail
+# PATH covers the common install dirs across macOS (Homebrew intel+ARM), Linux,
+# and MSYS2/Git Bash, so these work when launched from a GUI or a cron/launchd
+# context that does not source your shell rc.
+REAUTH_HOME="${AMUX_REAUTH_HOME:-$HOME}"                            # override only for testing
+export PATH="$REAUTH_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/mingw64/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+ENVFILE="${AMUX_REAUTH_ENVFILE:-$REAUTH_HOME/.config/claude-code/env}" # override only for testing
+CLAUDE_BIN="${AMUX_REAUTH_CLAUDE:-claude}"                        # override only for testing
+# Signatures of a REAL credential failure (NOT the benign "socket connection was
+# closed" one, which /login never fixes and which this tool must not act on).
+REALAUTH_PAT='OAuth access token has expired|Invalid authentication credentials|invalid_api_key|authentication_error|Please run /login'
+
+die() { echo "amux-reauth: $*" >&2; exit 1; }
+
+# --- can a RESTARTED session authenticate?  Probes the durable env token DIRECTLY
+#     against the API with curl. Deliberately NOT `claude -p`: the CLI silently falls
+#     back between credential stores, so it can report "auth OK" via a store your
+#     sessions don't use — that masked a broken box for a full day once.
+#     (Token stays OFF argv: curl header via process substitution.) ---
+#   Returns: 0 = token valid, 1 = token dead/missing, 4 = claude binary not runnable
+#   here (a box-setup issue, NOT a token expiry — must not be reported as "re-provision").
+auth_reachable() {
+  command -v "$CLAUDE_BIN" >/dev/null 2>&1 || return 4
+  local tok code
+  tok=$(grep -oE 'sk-ant-oat[A-Za-z0-9._-]+' "$ENVFILE" 2>/dev/null | head -1)
+  [ -n "$tok" ] || return 1
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://api.anthropic.com/v1/messages \
+    -H @<(printf 'Authorization: Bearer %s\n' "$tok") \
+    -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+    -H 'anthropic-beta: oauth-2025-04-20' \
+    -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' 2>/dev/null)
+  [ "$code" != "401" ] && [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+# --- the SHADOWING trap: a stored browser-login (claude auth login) takes precedence
+#     over the env token in interactive sessions; when it expires (~8h), EVERY session
+#     on the box parks at /login even though the env token is valid. Remove it (claude
+#     auth logout, backed up first) so sessions fall through to the durable token.
+#     Only called after auth_reachable proved the token valid. ---
+clear_shadowing_login() {
+  local have=0
+  [ -f "$REAUTH_HOME/.claude/.credentials.json" ] && have=1
+  command -v security >/dev/null 2>&1 && \
+    security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 && have=1
+  [ "$have" = 1 ] || return 0
+  cp -p "$REAUTH_HOME/.claude/.credentials.json" \
+        "$REAUTH_HOME/.claude/.credentials.json.bak-$(date +%s)" 2>/dev/null
+  echo "found a stored browser-login (it shadows the durable token in sessions) — removing it:"
+  "$CLAUDE_BIN" auth logout </dev/null 2>&1 | head -1 | sed 's/^/  /'
+}
+
+# --- confirm the (restarted) claude process for a session carries the durable token
+#     in its ENV — deterministic proof it can't hit the Keychain-expiry 401 ---
+proc_has_durable_token() { # $1 = session name
+  local name=$1 ccdir p cw
+  ccdir=$( . "${CC_HOME:-$REAUTH_HOME/.amux}/sessions/$name.env" >/dev/null 2>&1; printf %s "${CC_DIR:-}" )
+  [ -n "$ccdir" ] || return 1
+  for p in $(pgrep -f 'claude --model' 2>/dev/null); do
+    cw=$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+    [ "$cw" = "$ccdir" ] || continue
+    ps eww -p "$p" 2>/dev/null | tr ' ' '\n' | grep -q '^CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat' && return 0
+  done
+  return 1
+}
+
+reauth_one() { # $1 = name  $2 = attach(0/1)
+  local name=$1 attach=${2:-0} sess="amux-$1" i
+  echo "==> $name: re-authing against the durable token…"
+  amux stop "$name" >/dev/null 2>&1 || true
+  # '=' makes this exact: amux-api must not accidentally match amux-api-server.
+  for i in 1 2 3 4 5; do tmux has-session -t "=$sess" 2>/dev/null || break; sleep 1; done
+  # Start DETACHED. amux start ends by attaching; with stdin from /dev/null and no
+  # TTY that attach fails harmlessly ("open terminal failed: not a terminal") but the
+  # session is still created. We (optionally) attach explicitly below with a real TTY.
+  amux start "$name" --continue </dev/null >/dev/null 2>&1 || true
+  local ok=0
+  for i in $(seq 1 20); do
+    if proc_has_durable_token "$name"; then ok=1; break; fi
+    sleep 1
+  done
+  if [ "$ok" = 1 ]; then
+    echo "    ✓ $name is up on the durable token (no /login needed)."
+    if [ "$attach" = 1 ] && [ -t 1 ]; then exec amux attach "$name"; fi
+    return 0
+  fi
+  echo "    ✗ $name restarted but its claude process is NOT carrying the durable token." >&2
+  echo "      Check it: amux attach $name" >&2
+  return 1
+}
+
+# sessions currently parked at a REAL 401 (not the socket-close one)
+list_parked() {
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^amux-' | while read -r s; do
+    local tail8
+    # `=$s:` = exact-match session + pane scope: a bare name prefix-matches, and
+    # a bare `=name` (no colon) hard-fails for pane-scoped commands on tmux 3.4+.
+    tail8=$(tmux capture-pane -pt "=$s:" 2>/dev/null | grep -vE '^[[:space:]]*$' | tail -8)
+    if echo "$tail8" | tail -5 | grep -qiE "$REALAUTH_PAT" \
+       && ! echo "$tail8" | grep -qi 'socket connection was closed'; then
+      echo "${s#amux-}"
+    fi
+  done
+}
+
+DETACHED=0; MODE=names; NAMES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--detached) DETACHED=1 ;;
+    --all)         MODE=all ;;
+    --force-all)   MODE=forceall ;;
+    -h|--help)     awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
+    -*)            die "unknown flag: $1 (see -h)" ;;
+    *)             NAMES+=("$1") ;;
+  esac
+  shift
+done
+
+# Verify auth is reachable BEFORE touching any session — never restart into dead auth.
+auth_reachable; arc=$?
+if [ "$arc" = 4 ]; then
+  die "the 'claude' binary is not on PATH here — can't probe auth or run sessions on this box. (This is a box-setup issue, NOT a token expiry.)"
+elif [ "$arc" != 0 ]; then
+  echo "amux-reauth: the durable token is DEAD (or missing) — restarting sessions will NOT help." >&2
+  echo "  Re-provision, then re-run this:" >&2
+  echo "      claude setup-token   # then save the printed token to ~/.config/claude-code/env" >&2
+  exit 2
+fi
+echo "durable token verified (direct API probe) ✓"
+clear_shadowing_login
+
+case "$MODE" in
+  all)      NAMES=(); while IFS= read -r n; do [ -n "$n" ] && NAMES+=("$n"); done < <(list_parked)
+            [ ${#NAMES[@]} -gt 0 ] || { echo "no sessions parked at a real 401 — nothing to do."; exit 0; } ;;
+  forceall) NAMES=(); while IFS= read -r n; do [ -n "$n" ] && NAMES+=("$n"); done \
+              < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^amux-' | sed 's/^amux-//') ;;
+esac
+[ ${#NAMES[@]} -gt 0 ] || die "no session given. Usage: amux-reauth <name> | --all | --force-all  (-h for help)"
+
+attach=0; [ ${#NAMES[@]} -eq 1 ] && [ "$DETACHED" = 0 ] && attach=1
+rc=0
+for n in "${NAMES[@]}"; do reauth_one "$n" "$attach" || rc=1; done
+exit $rc

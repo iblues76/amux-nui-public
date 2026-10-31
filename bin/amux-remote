@@ -1,0 +1,1393 @@
+#!/usr/bin/env bash
+# amux-remote — drive another machine's amux server over its REST API.
+#
+# Derived from amux (https://github.com/mixpeek/amux)
+#   Copyright (c) 2025 Mixpeek, Inc. — MIT License + Commons Clause.
+# Modified by Francisco Ortega, 2026 (see the repository's LICENSE and README).
+#
+# The `amux` CLI is local-only: `amux ls` reads ~/.amux on the machine it runs
+# on. This wrapper talks to another box's amux dashboard (e.g. over Tailscale) so
+# you can list, peek, and message sessions running on that box.
+#
+# A BOX IS ALWAYS REQUIRED — the first argument names a configured box, whose
+# ~/.amux/remotes/<box>.env supplies the connection. There is no default remote.
+#   AMUX_URL       base URL of the box's server, e.g. https://192.0.2.10:8822
+#   AMUX_TOKEN     auth token from the box's ~/.amux/auth_token
+#   AMUX_SSH_HOST  SSH host(s) for `attach` (defaults to host extracted from AMUX_URL).
+#                  May be a space-separated LADDER of names for the SAME box,
+#                  preferred first — e.g. "box1-lan box1". The first rung that
+#                  answers wins, so a box stays attachable when its usual network
+#                  path is down. One name = used as-is, no probe.
+#   AMUX_SSH_PROBE_TIMEOUT  per-rung ConnectTimeout when probing a ladder (default 4s)
+#   AMUX_CURL_FAMILY  curl address family for API calls (default -4; empty = curl decides)
+#   AMUX_HOST_PREFIX  hostname prefix to ignore when matching THIS machine to its own
+#                  remote entry (amux-all, ccjump), e.g. "my-" for host my-laptop / box laptop
+#   AMUX_SSH_USER  SSH user for `attach` (defaults to current $USER)
+#   AMUX_CC        iTerm2 native attach (control mode): 1/0 to force, "auto" (default) = on in iTerm2
+#   AMUX_MOSH      1 = attach over mosh by default (same as --mosh; --cc overrides). Set it
+#                  in the environment (all boxes) or in the box's .env (that box only).
+#
+# Usage:
+#   amux-remote                         list configured boxes (~/.amux/remotes/*.env)
+#   amux-remote <box> ls [-c] [--bare]  list sessions (-c = compact grid; --bare = no header; --names = names only)
+#   amux-remote <box> pick [--sessionid N]  pick one of <box>'s sessions and attach (via ccjump);
+#                                       --sessionid N = row N of `ls -c`: attach, or start + attach
+#   amux-remote <box> box               print the configured box name this spelling resolves to
+#   amux-remote <box> attach <name> [--cc|--plain|--mosh]   SSH in and attach (native iTerm2 tabs in -CC mode;
+#                                       --mosh = plain tmux over mosh: instant local echo on
+#                                       laggy links, survives network changes/sleep)
+#   amux-remote <box> peek <name> [lines]    print a session's recent output (default 80)
+#   amux-remote <box> send <name> <text...>  send text/prompt to a session
+#   amux-remote <box> start <name> [flags...]   start a session (flags forwarded
+#                                       one-shot to the launch) and, when run
+#                                       interactively (stdout is a TTY), ATTACH —
+#                                       same SSH attach as amux-up, honors
+#                                       --cc/--plain/--mosh. --no-attach (or piping /
+#                                       scripting) skips the attach and prints
+#                                       the attach hint instead.
+#   amux-remote <box> stop <name>       stop a session (takes no flags)
+#   amux-remote <box> info <name>       session status/meta as JSON
+#   amux-remote <box> url               print the box's server URL
+#   amux-remote <box> curl <path> [args...]  raw authenticated curl against the API
+#
+#   --ssh   LAST RESORT: run the verb through the box's own `amux` over SSH
+#           instead of the REST API, for when the dashboard is down or its port
+#           is unreachable but the box answers on 22. Accepted on either side of
+#           the box name. Never automatic — amux-remote assumes the API is up.
+
+set -euo pipefail
+
+# Color only on a real terminal (mirrors the `ls` renderer below and `amux` itself):
+# piping `-h` or an error into a file/pager should not spray escape codes.
+# AMUX_FORCE_COLOR=1 forces it on under capture; NO_COLOR turns it off.
+if [[ -n "${AMUX_FORCE_COLOR:-}" && "${AMUX_FORCE_COLOR:-}" != "0" ]] \
+   || { [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && [[ "${TERM:-dumb}" != "dumb" ]]; }; then
+  BOLD=$'\033[1m' DIM=$'\033[2m' GREEN=$'\033[32m' CYAN=$'\033[36m' RED=$'\033[31m' RESET=$'\033[0m'
+else
+  BOLD='' DIM='' GREEN='' CYAN='' RED='' RESET=''
+fi
+
+# amux-remote REQUIRES a box. The first argument names a configured box whose
+# ~/.amux/remotes/<box>.env supplies AMUX_URL + AMUX_TOKEN (+ AMUX_SSH_HOST).
+# There is no default remote — every call targets a box explicitly. The box is
+# selected + sourced in the dispatch block at the bottom (once die()/usage() exist).
+AMUX_REMOTES_DIR="${CC_HOME:-$HOME/.amux}/remotes"
+BOX="" BOX_ENV=""   # set by the dispatch block once a box is chosen
+
+# space-padded list of configured box names — for --help and error messages.
+# MUST NOT fail: with `set -euo pipefail`, a bare `ls` on a missing remotes dir
+# would abort the script mid-usage() and print nothing at all on a fresh install.
+list_boxes() {
+  [ -d "$AMUX_REMOTES_DIR" ] || return 0
+  ls "$AMUX_REMOTES_DIR" 2>/dev/null | sed -n 's/\.env$//p' | tr '\n' ' ' || true
+}
+
+# The address an SSH name resolves to, WITHOUT connecting. Empty when the name
+# is not a real alias (ssh -G echoes the input back when nothing matches).
+_ssh_addr() {
+  local name="$1" addr
+  [[ -n "$name" ]] || return 0
+  addr=$(ssh -G "$name" 2>/dev/null | awk '/^hostname /{print $2; exit}')
+  [[ "$addr" == "$name" ]] && return 0   # no config match — not a known alias
+  printf '%s' "$addr"
+}
+
+# Which configured box IS this name? One machine answers to several names (LAN
+# alias, tailnet twin, longer spellings); the config filename is only one of
+# them. Resolve the typed name to an address and find the configured box that
+# already reaches that same address. Prints the box name, or nothing.
+#
+# Reads only the AMUX_SSH_HOST / AMUX_URL lines out of each config — these files
+# also hold AMUX_TOKEN, which must never be read or echoed here.
+_resolve_box_alias() {
+  # FAST PATH (no ssh -G): the SSH config already groups one machine's names on a
+  # single Host line ('Host box1 box1-01 my-box1'), and the f-/lan-/l- prefixed
+  # twins of a name are treated as the same machine (a common alias convention). A word on the typed name's
+  # Host line that is a configured box answers it in milliseconds.
+  local fast; fast=$(_resolve_box_by_hostline "$1")
+  if [[ -n "$fast" ]]; then printf '%s' "$fast"; return 0; fi
+
+  # SLOW PATH: compare resolved addresses (one ssh -G per candidate, ~1s total).
+  local want; want=$(_ssh_addr "$1")
+  [[ -n "$want" ]] || return 0
+
+  local f box hosts url_host cand
+  for f in "$AMUX_REMOTES_DIR"/*.env; do
+    [[ -e "$f" ]] || continue
+    box=$(basename "$f" .env)
+
+    hosts=$(sed -n 's/^[[:space:]]*AMUX_SSH_HOST=//p' "$f" | tail -1 | tr -d '"'"'"'')
+    url_host=$(sed -n 's#^[[:space:]]*AMUX_URL=##p' "$f" | tail -1 | tr -d '"'"'"'' \
+               | sed -E 's#^[a-zA-Z]+://([^:/?#]+).*#\1#')
+
+    # The box's own name is always a candidate spelling, as is every rung of its
+    # ladder and the host inside its URL.
+    for cand in $box $hosts $url_host; do
+      [[ -n "$cand" ]] || continue
+      if [[ "$cand" == "$1" ]] || [[ "$(_ssh_addr "$cand")" == "$want" ]]; then
+        printf '%s' "$box"
+        return 0
+      fi
+    done
+  done
+  return 0
+}
+
+# Which configured box shares an SSH Host line with this name? Reads only Host
+# lines (no credentials live there). Prints the box name, or nothing.
+_resolve_box_by_hostline() {
+  local typed="$1" line w c f
+  local -a files=()
+  for f in "$HOME/.ssh/config" "$HOME"/.ssh/config.d/*; do [[ -f "$f" ]] && files+=("$f"); done
+  [[ ${#files[@]} -gt 0 ]] || return 0
+  # the typed name and its f-/lan-/l- twins all mean the same machine
+  local -a names=("$typed")
+  for c in f- lan- l-; do [[ "$typed" == "$c"* ]] && names+=("${typed#"$c"}"); done
+  while IFS= read -r line; do
+    set -- $line; shift            # drop the 'Host' keyword
+    local hit=0
+    for w in "$@"; do for c in "${names[@]}"; do [[ "$w" == "$c" ]] && hit=1; done; done
+    [[ $hit -eq 1 ]] || continue
+    for w in "$@"; do
+      for c in "$w" "${w#f-}" "${w#lan-}" "${w#l-}"; do
+        [[ -f "$AMUX_REMOTES_DIR/$c.env" ]] && { printf '%s' "$c"; return 0; }
+      done
+    done
+  done < <(grep -h -iE '^[[:space:]]*Host[[:space:]]' "${files[@]}" 2>/dev/null)
+  return 0
+}
+
+die() { echo "${RED}error:${RESET} $*" >&2; exit 1; }
+
+# --ssh: run the verb through the box's own `amux` CLI over SSH instead of the
+# REST API. A LAST RESORT, never automatic — amux-remote assumes the dashboard
+# port is up, and choosing a different route is the operator's call. Useful when
+# the API is down or unreachable but the machine answers on 22. SSH is the auth,
+# so no token is transferred.
+_ssh_passthru() {
+  local host; host=$(_ssh_host)
+  local user="${AMUX_SSH_USER:-$USER}"
+  local force_color=""
+  [[ -t 1 ]] && force_color="AMUX_FORCE_COLOR=1 "
+
+  # A non-interactive `ssh host cmd` gets a minimal PATH that omits the very
+  # directories amux installs into — ~/.local/bin on macOS, /usr/local/bin on
+  # many Linux installs — so "command not found" here means "not on PATH", not "not
+  # installed". Name them explicitly rather than trust the remote login shell.
+  local remote_path='PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH" '
+
+  # Quote every argument: session names and prompt text reach a remotely-parsed
+  # command line.
+  local remote_cmd="${remote_path}${force_color}amux" a
+  for a in "$@"; do
+    remote_cmd+=" $(printf '%q' "$a")"
+  done
+
+  # `amux start`/`exec` finish by attaching to tmux, which needs a terminal on
+  # the far side — without one they start the session and then die on "open
+  # terminal failed: not a terminal", leaving it running but unattached. Give
+  # those a TTY when we have one; `ls`/`peek` must stay pipeable.
+  local tty_flag=()
+  case "${1:-}" in
+    start|exec) [[ -t 0 && -t 1 ]] && tty_flag=(-t) ;;
+  esac
+
+  ssh -o ConnectTimeout="${AMUX_SSH_PROBE_TIMEOUT:-8}" \
+      ${tty_flag[@]+"${tty_flag[@]}"} "${user}@${host}" "$remote_cmd"
+}
+
+# Route one verb over SSH, translating the flags that are ours rather than amux's.
+_run_over_ssh() {
+  local cmd="$1"; shift
+  echo "${DIM}${BOX}: --ssh — running over ssh $(_ssh_host_first)${RESET}" >&2
+
+  # `--bare` is an amux-remote flag; the remote would ignore it and print the
+  # banner --bare exists to suppress (amux-all and ccjump stack these).
+  if [[ "$cmd" == "ls" || "$cmd" == "list" ]]; then
+    local bare=0 args=() a
+    for a in "$@"; do
+      case "$a" in
+        --bare|--no-header) bare=1 ;;
+        *) args+=("$a") ;;
+      esac
+    done
+    if [[ $bare -eq 1 ]]; then
+      _ssh_passthru ls ${args[@]+"${args[@]}"} | sed '1{/·.*sessions/d;}; 1{/^[[:space:]]*$/d;}'
+      return "${PIPESTATUS[0]}"
+    fi
+    _ssh_passthru ls ${args[@]+"${args[@]}"}
+    return $?
+  fi
+  _ssh_passthru "$cmd" "$@"
+}
+
+require_config() {
+  [[ -n "${AMUX_URL:-}" ]]   || die "AMUX_URL is not set (missing from $BOX_ENV)"
+  [[ -n "${AMUX_TOKEN:-}" ]] || die "AMUX_TOKEN is not set (get it from box '$BOX's ~/.amux/auth_token)"
+  AMUX_URL="${AMUX_URL%/}"  # strip trailing slash
+}
+
+# Session names are spliced into URL paths and (for attach) a remote shell
+# command line — whitelist them hard. Blocks command injection like
+#   amux-remote example-host attach "x'; invalid input #"
+# and keeps URLs encoding-free. Mirrors the server's _VALID_SESSION_NAME_RE
+# (legacy dots tolerated for pre-existing sessions; leading '-' and '.' not).
+validate_remote_name() {
+  local n="$1"
+  case "$n" in
+    ""|-*|.*) die "invalid session name: '$n'" ;;
+    *[!A-Za-z0-9_.-]*) die "invalid session name '$n' (allowed: letters, digits, '_', '-', '.')" ;;
+  esac
+}
+
+# api <METHOD> <path> [curl args...]
+api() {
+  local method="$1" path="$2"; shift 2
+  # SECRET HYGIENE: the token goes to curl via a process-substitution header FILE,
+  # never on argv — `-H "Authorization: Bearer $TOK"` is visible to every local
+  # user in `ps` for the request's lifetime (shared machines have other logins).
+  #
+  # TIMEOUTS ARE NOT OPTIONAL: a box whose dashboard port is filtered drops the
+  # SYN, so a bare curl waits on the OS default (minutes) and looks like a hang
+  # rather than a closed port.
+  #
+  # -4 BY DEFAULT: AMUX_URL is usually a VPN/tailnet IPv4 address. On an
+  # IPv6-only uplink with NAT64 (a phone hotspot), macOS synthesizes an IPv6
+  # address for a bare IPv4 literal and curl sends the request over cellular
+  # instead of tailscale0 — it times out while ssh/nc to the same box work.
+  # AMUX_CURL_FAMILY overrides it: set it empty to let curl choose, or -6.
+  local out rc
+  out=$(curl -sk ${AMUX_CURL_FAMILY--4} -X "$method" \
+    --connect-timeout "${AMUX_API_CONNECT_TIMEOUT:-6}" \
+    --max-time "${AMUX_API_MAX_TIME:-45}" \
+    -H @<(printf 'Authorization: Bearer %s\n' "${AMUX_TOKEN}") \
+    "$@" \
+    "${AMUX_URL}${path}")
+  rc=$?
+
+  # Distinguish "never got there" from "got there, disliked the answer". Both
+  # used to surface as a parse failure blaming AMUX_URL/AMUX_TOKEN, which sends
+  # you auditing a token when the port simply never answered.
+  case "$rc" in
+    0) printf '%s' "$out" ;;
+    6)  die "$BOX: cannot resolve the API host in AMUX_URL=${AMUX_URL}" ;;
+    7)  die "$BOX: connection refused at ${AMUX_URL} — is amux serve running on that box?" ;;
+    28) die "$BOX: no answer from ${AMUX_URL} within ${AMUX_API_CONNECT_TIMEOUT:-6}s — the dashboard port is not reachable from here" ;;
+    35) die "$BOX: TLS handshake failed at ${AMUX_URL}" ;;
+    *)  die "$BOX: request to ${AMUX_URL}${path} failed (curl exit $rc)" ;;
+  esac
+}
+
+
+cmd_ls() {
+  require_config
+  # Flags: -c/--compact = grid (mirrors `amux ls -c`); --bare/--no-header =
+  # drop the identity banner (used when embedding, e.g. amux-all / ccjump).
+  # --names = bare session names, one per line (for TAB completion).
+  local compact=0 bare=0 names=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--compact)        compact=1 ;;
+      --bare|--no-header)  bare=1 ;;
+      --names)             names=1 ;;
+      -*)                  die "unknown ls option: $1 (try: -c/--compact, --bare, --names)" ;;
+      *)                   die "unexpected argument: $1 (usage: amux-remote $BOX ls [-c] [--bare])" ;;
+    esac
+    shift
+  done
+
+  # Which box are we listing? Prefer the explicit SSH host; else the host in
+  # AMUX_URL. Only the FIRST rung of an AMUX_SSH_HOST ladder is shown — listing
+  # is a REST call, so no SSH path is chosen here and probing would be a lie.
+  local label; label=$(_ssh_host_first)
+
+  # Capture BEFORE piping: api() reports transport failures by dying, and a die
+  # inside a pipeline only kills its own subshell — the renderer downstream still
+  # runs and reports a parse error, hiding the real cause.
+  local body; body=$(api GET /api/sessions)
+
+  if [[ $names -eq 1 ]]; then
+    printf '%s' "$body" | python3 -c 'import json, sys
+for s in (json.load(sys.stdin) or []):
+    if isinstance(s, dict) and s.get("name"): print(s["name"])'
+    return
+  fi
+
+  printf '%s' "$body" | \
+    AMUX_LS_LABEL="$label" AMUX_LS_URL="$AMUX_URL" AMUX_LS_COMPACT="$compact" AMUX_LS_BARE="$bare" \
+    python3 -c '
+import json, os, sys, shutil, re
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit("could not parse response (check AMUX_URL / AMUX_TOKEN)")
+if isinstance(data, dict) and data.get("error"):
+    sys.exit("server: " + str(data["error"]))
+data = data or []
+# Row order = local `amux ls`: alphabetical, case-insensitive like `sort -f`
+# (upper-fold, ties byte-wise), so row N matches across ls / ls -c / pick.
+data.sort(key=lambda s: ((s.get("name") or "").upper(), s.get("name") or ""))
+
+# Color only on a real terminal (mirrors amux), unless AMUX_FORCE_COLOR is set —
+# amux-all sets it so this stays colored even when it captures our output.
+_force = os.environ.get("AMUX_FORCE_COLOR","") not in ("", "0")
+_use_color = _force or (sys.stdout.isatty() and os.environ.get("TERM","dumb") != "dumb")
+if os.environ.get("NO_COLOR") and not _force:
+    _use_color = False
+if _use_color:
+    BOLD="\033[1m"; DIM="\033[2m"; GREEN="\033[32m"; CYAN="\033[36m"; R="\033[0m"
+    YELLOW="\033[33m"; BLUE="\033[34m"
+    BBLUE="\033[1;94m"; BYELLOW="\033[1;93m"; BMAGENTA="\033[1;95m"; BCYAN="\033[1;96m"
+else:
+    BOLD=DIM=GREEN=CYAN=R=YELLOW=BLUE=BBLUE=BYELLOW=BMAGENTA=BCYAN=""
+def D(s): return DIM + s + R
+
+label   = os.environ.get("AMUX_LS_LABEL","") or "remote"
+url     = os.environ.get("AMUX_LS_URL","")
+compact = os.environ.get("AMUX_LS_COMPACT","0") == "1"
+bare    = os.environ.get("AMUX_LS_BARE","0")  == "1"
+total   = len(data)
+running = sum(1 for s in data if s.get("running"))
+
+def short_model(s):
+    m = ""
+    mm = re.search(r"--model\s+(\S+)", s.get("flags","") or "")
+    if mm: m = mm.group(1)
+    if not m:
+        am = s.get("active_model","") or ""
+        for tag in ("opus","sonnet","haiku","fable"):
+            if tag in am: m = tag; break
+        else:
+            m = am
+    if m.startswith("claude-"): m = m[len("claude-"):]
+    return m
+
+def short_dir(s):
+    return re.sub(r"^/(Users|home)/[^/]+/", "~/", s.get("dir","") or "")
+
+if not bare:
+    print(f"{BOLD}{label}{R} {DIM}(remote){R} {DIM}·{R} {total} sessions {DIM}·{R} {GREEN}{running} ●{R} running")
+    if url:
+        extra = f"  {DIM}· ssh {label}{R}" if (label and not label[0].isdigit()) else ""
+        print(D(url) + extra)
+    print()
+
+if total == 0:
+    print(D("no sessions"))
+    sys.exit(0)
+
+# Claude account prefix (2026-09-05): "P:"/"T:"/"X:" on claude sessions (the server
+# reports account="" for other providers). Colored apart from the name so the
+# padding math stays on visible characters only.
+PROV_CODE = {"claude":"cc","iterm2":"it","codex":"cx","gemini":"gm","opencode":"oc","agy":"ag"}
+PREFIX_W = 5   # widest: "P:cc:"
+ACCT_LETTER = {"personal": "P", "team": "T", "team2": "X"}
+def acct_prefix(s):
+    # "P:cc:" / "T:it:" / "X:cc:" on claude sessions; "cx:" / "oc:" / "ag:" / "gm:" on the
+    # rest (one authentication each). Provider code added 2026-09-05.
+    a = s.get("account","") or ""
+    p = (s.get("provider") or "claude").strip().lower()
+    code = PROV_CODE.get(p, p[:2] or "??")
+    if a:
+        return ACCT_LETTER.get(a, "P") + ":" + code + ":"
+    return code + ":"
+def acct_col(p):
+    out = ""
+    # Bright + bold on purpose (2026-09-05): the dim variants were hard to read.
+    if p.startswith("T:"): out, p = f"{BYELLOW}T:{R}", p[2:]
+    elif p.startswith("X:"): out, p = f"{BMAGENTA}X:{R}", p[2:]
+    elif p.startswith("P:"): out, p = f"{BBLUE}P:{R}", p[2:]
+    if p:
+        col = PROV_COL.get(p, BOLD) if BOLD else BOLD   # BOLD is "" when colors are off
+        out += col + p + R
+    return out
+# One vibrant color per provider code (mirrors provider_code_col in bin/amux).
+PROV_COL = {"cc:": "\033[1;38;5;51m",  "it:": "\033[1;38;5;45m",  "cx:": "\033[1;38;5;201m",
+            "oc:": "\033[1;38;5;46m",  "ag:": "\033[1;38;5;208m", "gm:": "\033[1;38;5;141m"}
+
+if compact:
+    names = [s.get("name","") for s in data]
+    runs  = [bool(s.get("running")) for s in data]
+    pres  = [acct_prefix(s) for s in data]
+    maxw  = max(len(p) + len(n) for p, n in zip(pres, names))
+    numw  = max(2, len(str(total)))
+    cellw = numw + 1 + 1 + 1 + maxw + 2
+    try:
+        termw = int(os.environ.get("COLUMNS","") or 0)
+    except ValueError:
+        termw = 0
+    if termw <= 0:
+        termw = shutil.get_terminal_size((80,24)).columns
+    ncols = max(1, min(termw // cellw, total))
+    nrows = (total + ncols - 1) // ncols
+    for r in range(nrows):
+        line = ""
+        for c in range(ncols):
+            idx = c * nrows + r
+            if idx >= total: continue
+            if runs[idx]:
+                mark = f"{GREEN}●{R}"; nc = BOLD
+            else:
+                mark = f"{DIM}○{R}"; nc = DIM
+            pw = maxw - len(pres[idx])
+            line += f"{idx+1:>{numw}} {mark} {acct_col(pres[idx])}{nc}{names[idx]:<{pw}}{R}  "
+        print(line)
+else:
+    namew = min(max((len(s.get("name","")) for s in data), default=4), 22)
+    for s in data:
+        icon  = f"{GREEN}*{R}" if s.get("running") else " "
+        name  = s.get("name","")
+        model = short_model(s)
+        sdir  = short_dir(s)
+        pre   = acct_prefix(s)
+        col   = " " * max(0, PREFIX_W - len(pre)) + acct_col(pre)
+        print(f" {icon} {col}{BOLD}{name:<{namew}}{R} {CYAN}{model:<7}{R} {DIM}{sdir}{R}")
+'
+}
+
+cmd_peek() {
+  require_config
+  local raw=0
+  [[ "${1:-}" == "--raw" ]] && { raw=1; shift; }
+  local name="${1:-}"; local lines="${2:-80}"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX peek [--raw] <name> [lines]"
+  validate_remote_name "$name"
+  [[ "$lines" =~ ^[0-9]+$ ]] || die "lines must be a number, got: $lines"
+  local body; body=$(api GET "/api/sessions/${name}/peek?lines=${lines}")
+  # The server falls back to the RAW pane log when the live capture is short, and
+  # that log replays every escape the agent ever wrote — terminal QUERIES (claude's
+  # OSC 11 background probe, DA1 \e[c) that make the local terminal type its answer
+  # into whatever is reading (it filled amux pick's fzf search box, 2026-09-28), and
+  # OSC 52 clipboard writes. So by default keep only SGR colors and drop everything
+  # else: OSC/DCS/APC strings, non-SGR CSI, other escapes, stray C0 controls.
+  # --raw prints the server's bytes untouched.
+  printf '%s' "$body" | AMUX_PEEK_RAW=$raw python3 -c '
+import json, os, re, sys
+d = json.load(sys.stdin)
+if isinstance(d, dict) and d.get("error"):
+    sys.exit("server: " + str(d["error"]))
+out = d.get("output", "")
+if os.environ.get("AMUX_PEEK_RAW") != "1":
+    out = re.sub(r"\x1b[\]P_^X].*?(?:\x07|\x1b\\|$)", "", out, flags=re.S)   # OSC/DCS/APC/PM/SOS strings
+    out = re.sub(r"\x1b\[(\d*)C", lambda m: " " * min(int(m.group(1) or 1), 200), out)  # cursor-forward = spaces
+    out = re.sub(r"\x1b\[[0-9;:<=>?]*[ -/]*[@-ln-~]", "", out)   # every CSI except SGR (final m)
+    out = re.sub(r"\x1b(?!\[)[ -/]*[0-~]", "", out)               # other ESC sequences (charset, keypad, …)
+    out = re.sub(r"\x1b(?!\[)", "", out)                         # lone ESC
+    out = re.sub(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]", "", out)  # C0 except \t \n and ESC
+print(out)'
+}
+
+cmd_send() {
+  require_config
+  local name="${1:-}"; shift || true
+  local text="$*"
+  [[ -n "$name" && -n "$text" ]] || die "usage: amux-remote $BOX send <name> <text...>"
+  validate_remote_name "$name"
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$text")
+  local body; body=$(api POST "/api/sessions/${name}/send" -H 'Content-Type: application/json' -d "$payload")
+  printf '%s' "$body" \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(("\033[32m✓\033[0m sent" if d.get("ok") else "\033[31m✗\033[0m "+str(d.get("message","failed"))))'
+}
+
+# Is <name> running on this box, per the server's authoritative flag?
+# exit 0 = running · 1 = not running · 2 = could not tell
+_session_running() {
+  api GET /api/sessions 2>/dev/null | python3 -c '
+import json, sys
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(2)
+for s in (data or []):
+    if s.get("name") == sys.argv[1]:
+        sys.exit(0 if s.get("running") else 1)
+sys.exit(1)' "$1"
+}
+
+# Parse a server JSON response into "<0|1>\n<message>" (1 = ok).
+_resp_ok_msg() {
+  printf '%s' "$1" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+bad = (isinstance(d,dict) and d.get("error")) or (isinstance(d,dict) and not d.get("ok",True))
+print("0" if bad else "1")
+print(str((d.get("error") or d.get("message","failed")) if isinstance(d,dict) else "failed"))' 2>/dev/null
+}
+
+# start <name> [flags...] — flags are forwarded to the server as ONE-SHOT launch
+# flags (JSON body {"flags": "<shlex-joined>"}), e.g. --provider opencode. They
+# survive spaces/quotes: shlex.join here -> server validates -> _shell_quote_flags
+# re-quotes per token at spawn. NOTE: for claude sessions resume is AUTOMATIC
+# (the server auto-resumes the newest conversation on start), so --continue is
+# rarely needed — but it is forwarded and honored. `start` does NOT attach;
+# attach with: amux-up <box> <name>.
+cmd_start() {
+  require_config
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX start <name> [flags...]"
+  validate_remote_name "$name"
+  # Split amux-level options from one-shot launch flags. --no-attach and the
+  # attach-lane flags (--cc/--plain/--mosh) are OURS, never forwarded to the server.
+  local no_attach=0 attach_flags=() fwd=() _a
+  for _a in "$@"; do
+    case "$_a" in
+      --no-attach)  no_attach=1; continue ;;
+      --cc|--plain|--mosh) attach_flags+=("$_a"); continue ;;
+    esac
+    # exec/register-only options must not ride a start (2026-07-30: `start …
+    # --dir …` reached claude's argv → `error: unknown option '--dir'`).
+    case "${_a%%=*}" in
+      --pwd)
+        die "--pwd is local-only: your current directory exists on THIS machine, not on $BOX (use: amux-remote $BOX exec $name --dir <path>)" ;;
+      --dir)
+        die "--dir is an exec/register option; 'start' launches the session in its registered dir (change it with: amux-remote $BOX exec $name --dir <path>)" ;;
+      --worktree|--desc)
+        die "${_a%%=*} is an exec/register option, not a start flag (use: amux-remote $BOX exec $name ${_a%%=*} …)" ;;
+    esac
+    fwd+=("$_a")
+  done
+  set -- ${fwd[@]+"${fwd[@]}"}
+  local resp
+  if [[ $# -gt 0 ]]; then
+    local payload
+    payload=$(python3 -c 'import json, shlex, sys; print(json.dumps({"flags": shlex.join(sys.argv[1:])}))' "$@") \
+      || die "could not encode start flags"
+    resp=$(api POST "/api/sessions/${name}/start" -H 'Content-Type: application/json' -d "$payload")
+  else
+    resp=$(api POST "/api/sessions/${name}/start")
+  fi
+  local ok; ok=$(_resp_ok_msg "$resp")
+  local good="${ok%%$'\n'*}" msg="${ok#*$'\n'}"
+  if [[ "$good" != "1" ]]; then
+    echo "${RED}✗${RESET} ${msg:-failed}"; return 1
+  fi
+  echo "${GREEN}✓${RESET} ${msg:-started}"
+  # ATTACH WHEN INTERACTIVE (2026-07-30: one command, not two) — consistent with local `amux start`, which already attaches.
+  # Suppressed when: --no-attach, stdout is not a TTY (scripts/cron/pipes), or
+  # AMUX_NO_HINT is set (a wrapper like amux-up is about to attach itself).
+  if (( ! no_attach )) && [[ -t 1 ]] && [[ -z "${AMUX_NO_HINT:-}" ]]; then
+    cmd_attach "$name" ${attach_flags[@]+"${attach_flags[@]}"}   # execs ssh — does not return
+  fi
+  # No attach happened — say what the next step is, unless a wrapper
+  # (amux-up) set AMUX_NO_HINT=1 because it attaches right after.
+  [[ -n "${AMUX_NO_HINT:-}" ]] || echo "${DIM}  attach: amux-up $BOX $name${RESET}"
+}
+
+# amux-remote <box> rm <name> — remove a session on the remote box (server
+# stops it first if running, and deletes its .env/meta/memory/log). Added
+# 2026-08-12; previously amux-remote had no delete verb at all.
+#
+# AUTHORIZATION: the server's delete endpoint is deliberately gated — it exists
+# to stop a SESSION/AGENT from deleting sessions via the bare API. It opens for
+# either AMUX_ALLOW_AGENT_SESSION_DELETE=1 on the remote box, or a request
+# carrying X-Amux-UI-Token — the guard token the dashboard embeds because its
+# HTML is only served to an authenticated human. amux-remote is the same class
+# of actor as the dashboard (a human typing at their own terminal, holding the
+# box's AMUX_TOKEN), so it derives the SAME guard value the server computes:
+# sha256("amux-ui-guard:" + AUTH_TOKEN)[:40] — see _UI_TOKEN in amux-server.py.
+# The derived value is a one-way hash (not the token), python3 reads AMUX_TOKEN
+# from the environment (exported at config load, never argv), and the header
+# reaches curl via a process-substitution file descriptor, never stdout or ps.
+cmd_rm() {
+  require_config
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX rm <name>"
+  validate_remote_name "$name"
+  shift
+  [[ $# -eq 0 ]] || die "unexpected extra arguments after '$name': $* — 'amux-remote $BOX rm' takes no flags"
+  local resp ok
+  resp=$(api POST "/api/sessions/${name}/delete" \
+    -H @<(python3 -c 'import hashlib, os; print("X-Amux-UI-Token: " + hashlib.sha256(("amux-ui-guard:" + os.environ["AMUX_TOKEN"]).encode()).hexdigest()[:40])'))
+  ok=$(_resp_ok_msg "$resp")
+  local good="${ok%%$'\n'*}" msg="${ok#*$'\n'}"
+  if [[ "$good" != "1" ]]; then
+    msg="${msg:-failed}"
+    echo "${RED}✗${RESET} ${msg}"; return 1
+  fi
+  echo "${GREEN}✓${RESET} removed ${BOLD}${name}${RESET}"
+}
+
+cmd_simple_post() {  # stop/clear — take NO flags; error loudly on extras
+  require_config
+  local action="$1" name="${2:-}"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX ${action} <name>"
+  validate_remote_name "$name"
+  shift 2
+  [[ $# -eq 0 ]] || die "unexpected extra arguments after '$name': $* — 'amux-remote $BOX $action' takes no flags"
+  local resp ok
+  resp=$(api POST "/api/sessions/${name}/${action}")
+  ok=$(_resp_ok_msg "$resp")
+  local good="${ok%%$'\n'*}" msg="${ok#*$'\n'}"
+  if [[ "$good" != "1" ]]; then
+    echo "${RED}✗${RESET} ${msg:-failed}"; return 1
+  fi
+
+  # `stop` is a GRACEFUL stop server-side: it types /exit and the agent takes a few
+  # seconds to wind down. Acking the request as "stopped" was misleading, so confirm
+  # against the server before saying so. (Since 3aabd34 a clean /exit also closes the
+  # pane shell, so the tmux session goes with it — `start` brings it back and the
+  # provider resumes the conversation. A CRASHED agent still leaves the shell up.)
+  # AMUX_NO_WAIT=1 skips the wait for scripts that only want to fire the request.
+  if [[ "$action" == "stop" && -z "${AMUX_NO_WAIT:-}" ]]; then
+    local i rc
+    for i in 1 2 3 4 5 6 7 8; do
+      sleep 2
+      # `|| rc=$?` is REQUIRED: under `set -e` a bare call returning non-zero
+      # (which is exactly the "not running" answer we want) would abort the script.
+      rc=0; _session_running "$name" || rc=$?
+      case $rc in
+        1) echo "${GREEN}✓${RESET} stopped ${DIM}(agent exited cleanly; 'start' resumes the conversation)${RESET}"; return 0 ;;
+        2) echo "${GREEN}✓${RESET} stop requested ${DIM}(could not confirm — server unreachable)${RESET}"; return 0 ;;
+      esac
+    done
+    echo "${DIM}stop requested — still winding down after 16s; check with 'amux-remote $BOX ls'${RESET}"
+    return 0
+  fi
+  echo "${GREEN}✓${RESET} ${action}"
+}
+
+# ── exec: create + set model + start, in one call ────────────────────────────
+# The local `amux` CLI has `exec` (= register + start). The REST API has NO single
+# equivalent, which is why `amux-remote <box> exec` used to fail with "unknown
+# command". This composes the three calls the server does expose:
+#   POST  /api/sessions                create (name, dir, desc, worktree)
+#   PATCH /api/sessions/<name>/config  set the model — REQUIRED as a second step,
+#                                      because create hardcodes CC_FLAGS="" and so
+#                                      cannot carry a model at all
+#   POST  /api/sessions/<name>/start   start it
+# Each step is checked. If create succeeds but the model PATCH fails we say so
+# loudly and still start — better than silently running the wrong model.
+cmd_exec() {
+  require_config
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--autoprompt] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
+  validate_remote_name "$name"
+  local dir="" model="" desc="" provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0
+  local attach_flags=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir)      dir="${2:-}";   [[ -n "$dir"   ]] || die "--dir needs a value";   shift 2 ;;
+      # --pwd is the LOCAL amux's "use the dir I'm in" — meaningless on another box.
+      --pwd)      die "--pwd is local-only: your current directory ($PWD) is on this machine, not on $BOX — pass --dir <path> (a path on $BOX)" ;;
+      # Prompt suggestions ON for this session; stored in its flags.
+      --autoprompt) autoprompt=1; shift ;;
+      # Claude account (2026-09-05): personal|team|team2 (P/T/X). Claude/iterm2 only;
+      # the server accepts-and-ignores it for other providers.
+      --account)  account="${2:-}"
+                  case "$account" in
+                    p|P|personal)  account=personal ;;
+                    t|T|team)      account=team ;;
+                    x|X|team2|t2)  account=team2 ;;
+                    *) die "unknown account '${account:-}' (valid: personal team team2, or P / T / X)" ;;
+                  esac
+                  shift 2 ;;
+      --account=*) account="${1#--account=}"
+                  case "$account" in
+                    p|P|personal)  account=personal ;;
+                    t|T|team)      account=team ;;
+                    x|X|team2|t2)  account=team2 ;;
+                    *) die "unknown account '${account:-}' (valid: personal team team2, or P / T / X)" ;;
+                  esac
+                  shift ;;
+      --no-attach) no_attach=1; shift ;;
+      # Attach lane for the auto-attach after start — ours, handed to cmd_start.
+      --cc|--plain|--mosh) attach_flags+=("$1"); shift ;;
+      --model)    model="${2:-}"; [[ -n "$model" ]] || die "--model needs a value"; shift 2 ;;
+      --provider) provider="${2:-}"
+                  # "antigravity" is the product name; the lane (and binary) is `agy`
+                  [[ "$provider" == antigravity || "$provider" == antigravity-cli ]] && provider=agy
+                  case "$provider" in
+                    claude|codex|gemini|opencode|iterm2|agy) ;;
+                    *) die "unknown provider '${provider:-}' (valid: claude codex gemini opencode iterm2 agy)" ;;
+                  esac
+                  shift 2 ;;
+      --desc)     desc="${2:-}";  shift 2 ;;
+      --worktree) worktree=1; shift ;;
+      # Provider-neutral full access, persisted into the session's flags at
+      # creation (the server re-spells it per provider). --yolo = same thing.
+      --full-access|--yolo) full_access=1; shift ;;
+      -*)         die "unknown exec option: $1 (try --dir, --model, --provider, --account, --full-access, --autoprompt, --desc, --worktree, --no-attach, --cc, --plain, --mosh)" ;;
+      *)          die "unexpected argument: $1 (name comes first)" ;;
+    esac
+  done
+
+  # REQUIRED since v0.5.0 (2026-08-12): a new session must name its agent — no
+  # silent claude default. (The server enforces this too; failing here is just
+  # a better error. exec on an EXISTING session errors "already exists" anyway,
+  # so unlike local amux there is no stored-provider-preserving path to allow.)
+  [[ -n "$provider" ]] || die "--provider is required (no default): amux-remote $BOX exec $name --provider claude|codex|gemini|opencode|iterm2|agy [--dir <path>] ..."
+
+  # `~` is expanded by the LOCAL shell long before we see it, so an unquoted
+  # `--dir ~/x` sends the CALLER's home path. That is right Mac->Mac and WRONG
+  # Mac->Linux (/Users/<me> vs /home/<me>), where the server would silently
+  # mkdir the wrong tree. So rewrite the caller's OWN home prefix back to `~/`
+  # and say so out loud. The remote expands it with Path(...).expanduser(), so
+  # `~/x` always means "the remote user's home" — which is what typing `~` meant.
+  # Mac->Mac same user this is a no-op; any path outside the caller's home is
+  # passed through untouched. Quoting ('~/x') skips this entirely.
+  if [[ -n "$dir" && ( "$dir" == "$HOME" || "$dir" == "$HOME"/* ) ]]; then
+    local _lcl="$dir"
+    if [[ "$dir" == "$HOME" ]]; then dir="~"; else dir="~/${dir#"$HOME"/}"; fi
+    printf '%snote: --dir %s was expanded by your local shell; sending %s for %s to expand%s\n' "$DIM" "$_lcl" "$dir" "$BOX" "$RESET" >&2
+  fi
+
+  local payload resp created ok msg
+  payload=$(python3 -c '
+import json,sys
+name, d, desc, wt, prov, fa, acct, ap = sys.argv[1:9]
+body = {"name": name}
+if d:         body["dir"]      = d
+if desc:      body["desc"]     = desc
+if wt == "1": body["worktree"] = True
+if prov:      body["provider"] = prov
+if fa == "1": body["full_access"] = True
+if acct:      body["account"]  = acct
+if ap == "1": body["autoprompt"] = True
+print(json.dumps(body))' "$name" "$dir" "$desc" "$worktree" "$provider" "$full_access" "$account" "$autoprompt")
+
+  resp=$(api POST /api/sessions -H 'Content-Type: application/json' -d "$payload")
+  created=$(printf '%s' "$resp" | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception:
+    print("0"); print("could not parse server response"); raise SystemExit
+if not isinstance(d, dict):
+    print("0"); print("unexpected server response"); raise SystemExit
+print("1" if d.get("ok") else "0")
+print(str(d.get("error") or d.get("message") or "create failed"))' 2>/dev/null)
+  ok="${created%%$'\n'*}"; msg="${created#*$'\n'}"
+  if [[ "$ok" != "1" ]]; then
+    echo "${RED}✗${RESET} ${msg:-create failed}" >&2
+    case "$msg" in
+      *"already exists"*) echo "${DIM}  already registered — just start it: amux-remote $BOX start $name${RESET}" >&2 ;;
+    esac
+    return 1
+  fi
+  echo "${GREEN}✓${RESET} created ${BOLD}${name}${RESET}${dir:+ ${DIM}in ${dir}${RESET}}${provider:+ ${DIM}(provider: ${provider}${account:+, account: ${account}})${RESET}}"
+  if (( full_access )); then
+    echo "${GREEN}✓${RESET} full access ${DIM}(no sandbox, no approvals)${RESET}"
+  fi
+  if (( autoprompt )); then
+    echo "${GREEN}✓${RESET} prompt suggestions on ${DIM}(--autoprompt)${RESET}"
+  fi
+
+  if [[ -n "$model" ]]; then
+    local mp mresp
+    mp=$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1]}))' "$model")
+    mresp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$mp")
+    if printf '%s' "$mresp" | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit(1)
+raise SystemExit(0 if isinstance(d, dict) and not d.get("error") else 1)' 2>/dev/null; then
+      echo "${GREEN}✓${RESET} model ${CYAN}${model}${RESET}"
+    else
+      echo "${RED}✗${RESET} could not set model '${model}' — starting on the box default instead" >&2
+    fi
+  fi
+
+  if (( no_attach )); then
+    cmd_start "$name" --no-attach
+  else
+    cmd_start "$name" ${attach_flags[@]+"${attach_flags[@]}"}
+  fi
+}
+
+cmd_info() {
+  require_config
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX info <name>"
+  validate_remote_name "$name"
+  api GET "/api/sessions/${name}/info" | python3 -m json.tool 2>/dev/null || api GET "/api/sessions/${name}/info"
+}
+
+# amux-remote <box> provider <name> [<p>] — show or change a session's agent
+cmd_provider() {
+  require_config
+  local name="${1:-}" new="${2:-}"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX provider <name> [claude|codex|gemini|opencode|agy]"
+  validate_remote_name "$name"
+  # Flag spelling accepted too (2026-08-12): exec teaches `--provider <p>`, so
+  # typing it here must work instead of dying at name validation.
+  case "$new" in
+    --provider)   new="${3:-}"
+                  [[ -n "$new" ]] || die "--provider needs a value: amux-remote $BOX provider $name --provider claude|codex|gemini|opencode|agy" ;;
+    --provider=*) new="${new#--provider=}" ;;
+  esac
+  if [[ -z "$new" ]]; then
+    api GET "/api/sessions/${name}/info" | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit("could not parse server response")
+if isinstance(d, dict) and d.get("error"): sys.exit("server: " + str(d["error"]))
+print((d.get("provider") or d.get("config",{}).get("CC_PROVIDER") or "claude"))'
+    return
+  fi
+  [[ "$new" == antigravity || "$new" == antigravity-cli ]] && new=agy
+  case "$new" in
+    claude|codex|gemini|opencode|agy) ;;
+    *) die "unknown provider '$new' (valid: claude codex gemini opencode agy)" ;;
+  esac
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"provider": sys.argv[1]}))' "$new")
+  api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload" \
+    | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit("could not parse server response")
+if isinstance(d, dict) and d.get("error"): sys.exit("server: " + str(d["error"]))
+print("\033[32m✓\033[0m " + str(d.get("message", "provider updated")))'
+}
+
+# amux-remote <box> model <name> [<m>] — show or change a session's model
+# (2026-09-28, for the picker's F7). The box rewrites --model in CC_FLAGS and
+# restarts a running session so the new model takes effect.
+cmd_model() {
+  require_config
+  local name="${1:-}" new="${2:-}"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX model <name> [<model>]"
+  validate_remote_name "$name"
+  if [[ -z "$new" ]]; then
+    api GET "/api/sessions/${name}/info" | python3 -c '
+import json,sys,shlex
+try: d = json.load(sys.stdin)
+except Exception: sys.exit("could not parse server response")
+if isinstance(d, dict) and d.get("error"): sys.exit("server: " + str(d["error"]))
+f = shlex.split(d.get("flags") or "")
+print(f[f.index("--model") + 1] if "--model" in f[:-1] else "(box default)")'
+    return
+  fi
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1]}))' "$new")
+  api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload" \
+    | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit("could not parse server response")
+if isinstance(d, dict) and d.get("error"): sys.exit("server: " + str(d["error"]))
+print("\033[32m✓\033[0m " + str(d.get("message", "model updated")))'
+}
+
+# amux-remote <box> full-access <name> [on|off] — show or set full access
+# (no sandbox / no approvals). Persisted; the box restarts a running session.
+cmd_full_access() {
+  require_config
+  local name="${1:-}" new="${2:-}"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX full-access <name> [on|off]"
+  validate_remote_name "$name"
+  if [[ -z "$new" ]]; then
+    api GET "/api/sessions/${name}/info" | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit("could not parse server response")
+if isinstance(d, dict) and d.get("error"): sys.exit("server: " + str(d["error"]))
+f = " " + (d.get("flags") or "") + " "
+on = any(" %s " % x in f for x in ("--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox", "--yolo", "--auto"))
+print("on" if on else "off")'
+    return
+  fi
+  local want
+  case "$new" in
+    on|yes|true|1)  want=true ;;
+    off|no|false|0) want=false ;;
+    *) die "full-access takes on or off, not '$new'" ;;
+  esac
+  api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "{\"full_access\": $want}" \
+    | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit("could not parse server response")
+if isinstance(d, dict) and d.get("error"): sys.exit("server: " + str(d["error"]))
+print("\033[32m✓\033[0m " + str(d.get("message", "full access updated")))'
+}
+
+# amux-remote <box> account <name> [P|T|X] — show or change which Claude
+# subscription a claude/iterm2 session bills to (2026-09-05). Twin of the
+# local `amux account`; the box enforces the rules (claude/iterm2 only, session
+# stopped, team/team2 slot provisioned) and reports back.
+cmd_account() {
+  require_config
+  local name="${1:-}" new="${2:-}"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX account <name> [personal|team|team2|P|T|X]"
+  validate_remote_name "$name"
+  case "$new" in
+    --account)   new="${3:-}"
+                 [[ -n "$new" ]] || die "--account needs a value: amux-remote $BOX account $name --account personal|team|team2" ;;
+    --account=*) new="${new#--account=}" ;;
+  esac
+  if [[ -z "$new" ]]; then
+    api GET "/api/sessions/${name}/info" | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit("could not parse server response")
+if isinstance(d, dict) and d.get("error"): sys.exit("server: " + str(d["error"]))
+a = d.get("account") or ""
+if not a:
+    cfg = d.get("config", {}) or {}
+    prov = (d.get("provider") or cfg.get("CC_PROVIDER") or "claude")
+    if prov in ("claude", "iterm2"):
+        a = (cfg.get("CC_ACCOUNT") or "personal")
+print(a if a else "(no account: not a claude/iterm2 session)")'
+    return
+  fi
+  case "$new" in
+    p|P|personal)  new=personal ;;
+    t|T|team)      new=team ;;
+    x|X|team2|t2)  new=team2 ;;
+    *) die "unknown account '$new' (valid: personal team team2, or P / T / X)" ;;
+  esac
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"account": sys.argv[1]}))' "$new")
+  api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload" \
+    | python3 -c '
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit("could not parse server response")
+if isinstance(d, dict) and d.get("error"): sys.exit("server: " + str(d["error"]))
+print("\033[32m✓\033[0m " + str(d.get("message", "account updated")))'
+}
+
+cmd_curl() {
+  require_config
+  local path="${1:-}"; shift || true
+  [[ -n "$path" ]] || die "usage: amux-remote $BOX curl <path> [curl args...]"
+  [[ "$path" == /* ]] || path="/$path"
+  api GET "$path" "$@"
+}
+
+# First rung of the AMUX_SSH_HOST ladder — the name we *prefer*, used for
+# labels and hints without probing anything. Falls back to the host in AMUX_URL.
+_ssh_host_first() {
+  local first="${AMUX_SSH_HOST:-}"
+  first="${first%% *}"
+  if [[ -z "$first" ]]; then
+    first=$(printf '%s' "${AMUX_URL:-}" | sed -E 's#^[a-zA-Z]+://([^:/?#]+).*#\1#')
+  fi
+  printf '%s' "$first"
+}
+
+# Resolve the SSH host to actually connect to.
+#
+# AMUX_SSH_HOST may hold a LADDER of names for the SAME box, most-preferred
+# first (e.g. "box1-lan box1"): a LAN alias that only answers on that
+# network, then a fallback path that answers from anywhere. Same machine, a
+# different route to it — so we take the first rung that actually responds.
+#
+# A single name (the common case) is used as-is with NO probe, so nothing gets
+# slower for boxes that never needed a fallback.
+_ssh_host() {
+  local ladder="${AMUX_SSH_HOST:-}"
+  if [[ -z "$ladder" ]]; then
+    ladder=$(python3 -c "
+import sys, re
+u = '${AMUX_URL}'.strip()
+m = re.match(r'https?://([^:/?#]+)', u)
+print(m.group(1) if m else '')
+")
+  fi
+  [[ -n "$ladder" ]] || die "could not derive SSH host from AMUX_URL='${AMUX_URL:-}' — set AMUX_SSH_HOST in $BOX_ENV"
+
+  # shellcheck disable=SC2206
+  local rungs=($ladder)
+  if [[ ${#rungs[@]} -eq 1 ]]; then
+    echo "${rungs[0]}"
+    return
+  fi
+
+  local user="${AMUX_SSH_USER:-$USER}"
+  local timeout="${AMUX_SSH_PROBE_TIMEOUT:-4}"
+  local rung
+  for rung in "${rungs[@]}"; do
+    if ssh -o BatchMode=yes \
+           -o ConnectTimeout="$timeout" \
+           -o StrictHostKeyChecking=accept-new \
+           "${user}@${rung}" true >/dev/null 2>&1; then
+      # Say so only when we had to leave the preferred path, so the normal
+      # case stays quiet but a fallback is never silent.
+      [[ "$rung" != "${rungs[0]}" ]] && \
+        echo "${DIM}${rungs[0]} did not answer — using fallback ${rung}${RESET}" >&2
+      echo "$rung"
+      return
+    fi
+  done
+  die "no SSH path answered for '$BOX' (tried: ${rungs[*]}) — check $BOX_ENV, or raise AMUX_SSH_PROBE_TIMEOUT (now ${timeout}s)"
+}
+
+# True when we should attach with iTerm2 native tmux integration (control mode).
+# iTerm2 renders the remote tmux session's windows/panes as native local tabs —
+# trackpad scroll, local clipboard, Cmd+T/Cmd+D all work as if it were local.
+# Auto-on when the local terminal is iTerm2; AMUX_CC=1 forces, AMUX_CC=0 disables.
+_use_cc() {
+  case "${AMUX_CC:-auto}" in
+    1|yes|true|on)   return 0 ;;
+    0|no|false|off)  return 1 ;;
+    *) [[ "${TERM_PROGRAM:-}" == "iTerm.app" || "${LC_TERMINAL:-}" == "iTerm2" ]] ;;
+  esac
+}
+
+# mosh-server is a Homebrew binary on macOS, and a non-interactive SSH login's
+# PATH omits /opt/homebrew/bin — so every mosh call names the PATH explicitly.
+# The attached command inherits it, which is also how `tmux` is found there.
+MOSH_SERVER_CMD='PATH=/opt/homebrew/bin:/usr/local/bin:$PATH mosh-server'
+
+# Terminal-color probe (2026-09-28) — see amux-termprobe. Never fatal, TTY only.
+_termprobe() {
+  local p="$HOME/.local/bin/amux-termprobe"
+  [[ -x "$p" ]] || p="$(command -v amux-termprobe 2>/dev/null || true)"
+  [[ -n "$p" && -t 1 ]] || return 0
+  "$p" "$@" || true
+}
+
+# Origin record (2026-10-29) — read on the box with `amux origin`. A shell prefix the
+# box runs right before its tmux attach, writing ~/.amux/origins/<name>: this box's
+# name + user, the lane (ssh / ssh-cc / mosh) and the terminal. Plain POSIX with no
+# quotes, so it rides inside the mosh lane's sh -c "…" too, and needs nothing new
+# installed on the box. Every value is whitelisted: they are spliced unquoted.
+_origin_mark() { # $1 = session name (already validated), $2 = lane
+  local h u t at
+  h="${AMUX_SELF:-}"; [[ -n "$h" ]] || h=$(hostname -s 2>/dev/null || hostname)
+  u="${USER:-}"; t="${LC_TERMINAL:-}"; [[ -n "$t" ]] || t="${TERM_PROGRAM:-}"
+  h="${h//[^A-Za-z0-9._-]/_}"; u="${u//[^A-Za-z0-9._-]/_}"; t="${t//[^A-Za-z0-9._-]/_}"
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '( umask 077; mkdir -p ~/.amux/origins && { echo host=%s; echo user=%s; echo lane=%s; echo term=%s; echo at=%s; } >~/.amux/origins/%s; tmux set-environment -t =amux-%s AMUX_ORIGIN %s@%s ) 2>/dev/null; ' \
+    "$h" "$u" "$2" "$t" "$at" "$1" "$1" "$u" "$h"
+}
+
+cmd_attach() {
+  require_config
+  # Flags may appear before or after the name; they override AMUX_CC / AMUX_MOSH /
+  # auto-detect. --cc means "the iTerm2 SSH lane", so it also cancels mosh.
+  local name="" use_mosh=0
+  case "${AMUX_MOSH:-0}" in 1|yes|true|on) use_mosh=1 ;; esac
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cc)    AMUX_CC=1; use_mosh=0 ;;
+      --plain) AMUX_CC=0 ;;
+      --mosh)  use_mosh=1 ;;
+      --*)     die "unknown attach option: $1 (try --cc, --plain or --mosh)" ;;
+      *)       [[ -n "$name" ]] && die "unexpected argument: $1"; name="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX attach <name> [--cc|--plain|--mosh]"
+  # SECURITY: name is spliced into a remotely-parsed shell string below — the
+  # whitelist is what prevents `attach "x'; rm -rf ~ #"` from escaping the quotes.
+  validate_remote_name "$name"
+  local host; host=$(_ssh_host)
+  local user="${AMUX_SSH_USER:-$USER}"
+  local tname="amux-${name}"
+  local missing="(echo 'Session ${tname} not found. Running sessions:' && tmux ls 2>/dev/null; exit 1)"
+  if (( use_mosh )); then
+    # mosh renders a screen, it cannot carry tmux's -CC control stream, so the
+    # mosh lane is always plain tmux. Missing mosh on either end falls back to
+    # SSH, loudly — an attach should never fail just because the fast lane is absent.
+    if ! command -v mosh >/dev/null 2>&1; then
+      echo "${BOLD}mosh is not installed here — attaching over SSH instead${RESET}" >&2
+    elif ! ssh -o BatchMode=yes "${user}@${host}" "${MOSH_SERVER_CMD%% *}; command -v mosh-server" >/dev/null 2>&1; then
+      echo "${BOLD}mosh-server is not installed on ${host} — attaching over SSH instead${RESET}" >&2
+    else
+      echo "${DIM}→ mosh ${user}@${host} — tmux attach-session -t =${tname}${RESET} ${DIM}(plain, over mosh)${RESET}"
+      _termprobe before "${BOX}:${name}"
+      exec mosh --server="$MOSH_SERVER_CMD" "${user}@${host}" -- \
+        sh -c "$(_origin_mark "$name" mosh)tmux attach-session -t '=${tname}' || ${missing}"
+    fi
+    AMUX_CC=0   # the fallback keeps the plain look the caller asked for
+  fi
+  local tmux_cmd="tmux attach-session" note="" lane=ssh
+  if _use_cc; then
+    tmux_cmd="tmux -CC attach-session"; note=" ${DIM}(iTerm2 native)${RESET}"; lane=ssh-cc
+  fi
+  echo "${DIM}→ ssh ${user}@${host} — ${tmux_cmd} -t =${tname}${RESET}${note}"
+  # probe the tab's live colors on each side of the attach (~/.amux/logs/term-probe.log)
+  local rc=0
+  _termprobe before "${BOX}:${name}"
+  ssh "${user}@${host}" -t "$(_origin_mark "$name" "$lane")${tmux_cmd} -t '=${tname}' || ${missing}" || rc=$?
+  _termprobe after "${BOX}:${name}"
+  exit $rc
+}
+
+# Per-command help (2026-09-30): `amux-remote <box> <cmd> --help` (so also
+# `amux -H <box> <cmd> --help`) and `... help <cmd>` print that command's lines
+# from usage() — one help text. Never touches the network.
+subhelp() {
+  local c="$1" out
+  case "$c" in a) c=attach ;; list) c=ls ;; choose) c=pick ;; remove|del) c=rm ;;
+               meta) c=info ;; acct) c=account ;; resolve) c=box ;; esac
+  [[ "$c" =~ ^[a-z][a-z-]*$ ]] || return 1
+  out=$(usage | sed $'s/\x1b\\[[0-9;]*m//g' | awk -v c="$c" '
+    $0 ~ ("^  " c "( |$)")  { print; k = 1; next }
+    k && /^ {20,}[^ ]/     { print; next }
+                           { k = 0 }')
+  [[ -n "$out" ]] || return 1
+  local lead="amux-remote <box> $c"; [[ "$c" == add ]] && lead="amux-remote add"
+  echo "${BOLD}$lead${RESET}  ${DIM}(full list: amux-remote help)${RESET}"
+  printf '%s\n' "$out"
+}
+
+usage() {
+  local boxes; boxes="$(list_boxes)"
+  cat <<EOF
+${BOLD}amux-remote${RESET} — drive another machine's amux server over its REST API
+
+${BOLD}A box is always required${RESET} ${DIM}(there is no default remote)${RESET}
+  ${CYAN}amux-remote <box> <cmd> …${RESET}   ${DIM}drive that box; e.g. 'amux-remote example-host ls -c'${RESET}
+  ${CYAN}amux-remote${RESET}                 ${DIM}list configured boxes${RESET}
+
+${BOLD}Add a box${RESET} ${DIM}(the only way in: each box's URL + dashboard token)${RESET}
+  ${CYAN}add${RESET} <box> [--ssh <alias>] [--url <url>] [--force]
+                          ${DIM}read the box's user, VPN/tailnet address and dashboard token over${RESET}
+                          ${DIM}SSH, check the server answers with it, then write${RESET}
+                          ${DIM}~/.amux/remotes/<box>.env (mode 600). The token is never printed.${RESET}
+                          ${DIM}--ssh = SSH alias if not <box>; --url = skip address discovery;${RESET}
+                          ${DIM}--force = replace an existing file (old one kept as .bak)${RESET}
+                          ${DIM}e.g. amux-remote add myhost${RESET}
+
+${BOLD}Configured boxes${RESET} ${DIM}(~/.amux/remotes/<box>.env)${RESET}
+  ${GREEN}${boxes:-<none — add ~/.amux/remotes/<box>.env>}${RESET}
+
+${BOLD}Per-box config${RESET} ${DIM}(~/.amux/remotes/<box>.env, chmod 600)${RESET}
+  AMUX_URL       ${DIM}e.g. https://192.0.2.10:8822${RESET}
+  AMUX_TOKEN     ${DIM}from that box's ~/.amux/auth_token${RESET}
+  AMUX_SSH_HOST  ${DIM}SSH host for attach (default: host from AMUX_URL). Space-separated${RESET}
+                 ${DIM}ladder of names for the SAME box, preferred first, is allowed —${RESET}
+                 ${DIM}e.g. "lan-alias fallback-alias"; first rung that answers wins.${RESET}
+  AMUX_SSH_USER  ${DIM}SSH user for attach (default: \$USER)${RESET}
+  AMUX_CC        ${DIM}native iTerm2 attach: 1/0 to force, auto (default) = on in iTerm2${RESET}
+  AMUX_MOSH      ${DIM}1 = attach over mosh by default (like --mosh; --cc overrides)${RESET}
+
+${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
+  ${CYAN}ls${RESET} [-c] [--bare]         list sessions ${DIM}(-c = compact grid, like 'amux ls -c'; --bare = no header)${RESET}
+  ${CYAN}attach${RESET} <name> [--cc|--plain|--mosh]  SSH in + attach (native iTerm2 tabs in -CC mode)
+                          ${DIM}--mosh = plain tmux over mosh: keystrokes echo instantly on a${RESET}
+                          ${DIM}laggy link and the session survives Wi-Fi/hotspot switches and${RESET}
+                          ${DIM}sleep. Falls back to SSH if mosh is missing on either end.${RESET}
+  ${CYAN}peek${RESET} [--raw] <name> [lines]  print recent output (default 80; colors kept, every other
+                          ${DIM}escape stripped so replayed terminal queries/clipboard writes can't fire;${RESET}
+                          ${DIM}--raw = the server's bytes untouched)${RESET}
+  ${CYAN}send${RESET} <name> <text...>   send text/prompt to a session
+  ${CYAN}exec${RESET} <name> --provider <p> [--account P|T|X] [--dir <p>] [--model <m>] [--full-access] [--autoprompt] [--desc <t>] [--worktree] [--no-attach] [--cc|--plain|--mosh]
+                          ${DIM}create + start in one step (like local 'amux exec'); attaches${RESET}
+                          ${DIM}when interactive (--cc/--plain/--mosh pick the lane, as for attach). quote '~/…' so the REMOTE box expands it.${RESET}
+                          ${BOLD}--account personal|team|team2${RESET} ${DIM}(P/T/X) = which Claude subscription the${RESET}
+                          ${DIM}session bills to; claude/iterm2 only, default personal. 'ls'${RESET}
+                          ${DIM}prefixes rows P:cc:/T:cc: (claude), cx:/oc:/ag:/gm: (codex/${RESET}
+                          ${DIM}opencode/antigravity/gemini). One-shot on start: --account T${RESET}
+                          ${BOLD}--full-access${RESET} ${DIM}= no sandbox / no approvals, persisted in the${RESET}
+                          ${DIM}session's flags; the box re-spells it for the provider (codex${RESET}
+                          ${DIM}--dangerously-bypass-approvals-and-sandbox, gemini --yolo,${RESET}
+                          ${DIM}opencode --auto, claude/agy --dangerously-skip-permissions).${RESET}
+                          ${DIM}Without it codex runs sandboxed (amux-default profile if ~/.codex has one).${RESET}
+                          ${DIM}(--yolo is accepted as the compatibility spelling)${RESET}
+                          ${BOLD}--autoprompt${RESET} ${DIM}= Claude prompt suggestions ON for this session${RESET}
+                          ${DIM}(even if your settings turn them off); stored. One-shot on start: --autoprompt. ${RESET}${BOLD}--pwd${RESET}${DIM} is${RESET}
+                          ${DIM}local-only and refused here — your cwd is not on the box.${RESET}
+                          ${BOLD}--provider is REQUIRED${RESET} ${DIM}(claude|codex|gemini|opencode|agy — no default:${RESET}
+                          ${DIM}a silent claude fallback once put an opencode workspace on${RESET}
+                          ${DIM}the Claude subscription)${RESET}
+  ${CYAN}start${RESET} <name> [flags...] start an ALREADY-REGISTERED session; flags forwarded one-shot
+                          ${DIM}(e.g. --provider opencode, one-shot --model, --fresh,${RESET}
+                          ${DIM}--full-access for THIS launch only). When run${RESET}
+                          ${DIM}from a terminal it then ATTACHES (like local 'amux start');${RESET}
+                          ${DIM}--no-attach or piped output skips that. --cc/--plain/--mosh route to${RESET}
+                          ${DIM}the attach. every provider AUTO-RESUMES its newest conversation${RESET}
+                          ${DIM}for the dir; pass --fresh to cold-start a new one instead${RESET}
+  ${CYAN}stop${RESET} <name>             stop a session ${DIM}(takes no flags)${RESET}
+  ${CYAN}rm${RESET} <name>               remove a session ${DIM}(stops it first; deletes its config/meta/log${RESET}
+                          ${DIM}on the remote box — same as the dashboard's delete)${RESET}
+  ${CYAN}provider${RESET} <name> [<p>]   show or change the session's agent ${DIM}(claude|codex|gemini|opencode|agy;${RESET}
+                          ${DIM}flag spelling '--provider <p>' accepted too; change is persisted${RESET}
+                          ${DIM}and rewrites CC_FLAGS to the new provider's default model)${RESET}
+  ${CYAN}account${RESET} <name> [P|T|X]  show or change which Claude subscription the session bills to
+                          ${DIM}(personal|team|team2 or P|T|X; claude/iterm2 only; the session must be${RESET}
+                          ${DIM}stopped; persisted — next start uses it. One launch only instead:${RESET}
+                          ${DIM}start <name> --account T)${RESET}
+  ${CYAN}model${RESET} <name> [<m>]      show or change the session's model ${DIM}(persisted; restarts it if running)${RESET}
+  ${CYAN}full-access${RESET} <name> [on|off]  show or set full access ${DIM}(no sandbox / no approvals;${RESET}
+                          ${DIM}persisted; restarts it if running)${RESET}
+  ${CYAN}info${RESET} <name>             session status/meta as JSON
+  ${CYAN}url${RESET}                     print the box's server URL
+  ${CYAN}curl${RESET} <path> [args...]   raw authenticated GET against the API
+
+${BOLD}Last resort${RESET}
+  ${CYAN}--ssh${RESET}                   ${DIM}run the verb through the box's own 'amux' over SSH${RESET}
+                          ${DIM}instead of the API — for when the dashboard is down or${RESET}
+                          ${DIM}its port is unreachable but the box answers on 22.${RESET}
+                          ${DIM}Works on either side of the box name. Never automatic.${RESET}
+                          ${DIM}e.g. 'amux-remote --ssh <box> ls -c'${RESET}
+EOF
+}
+
+# ── add: create ~/.amux/remotes/<box>.env from the box itself (2026-09-30) ────
+# The remote file is the access boundary (URL + that box's dashboard token), so
+# this is the supported way to make one: everything is read over SSH, the token
+# goes ssh-stdout -> a mode-600 file and is never printed, put on argv, or typed.
+#   amux-remote add <box> [--ssh <alias>] [--url <url>] [--force]
+cmd_add() {
+  local box="" ssh_alias="" url="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ssh)   ssh_alias="${2:-}"; shift 2 || die "--ssh needs an SSH alias" ;;
+      --url)   url="${2:-}"; shift 2 || die "--url needs a URL" ;;
+      --force) force=1; shift ;;
+      -h|--help) subhelp add; return 0 ;;
+      -*)      die "add: unknown option $1" ;;
+      *)       [[ -z "$box" ]] || die "add takes one box name"; box="$1"; shift ;;
+    esac
+  done
+  [[ -n "$box" ]] || die "usage: amux-remote add <box> [--ssh <alias>] [--url <url>] [--force]"
+  [[ "$box" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid box name '$box'"
+  [[ -n "$ssh_alias" ]] || ssh_alias="$box"
+  [[ "$ssh_alias" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || die "invalid SSH alias '$ssh_alias'"
+  local dest="$AMUX_REMOTES_DIR/$box.env"
+  if [[ -e "$dest" && $force -ne 1 ]]; then
+    die "'$box' is already configured ($dest) — pass --force to replace it (the old file is kept as a .bak)"
+  fi
+
+  echo "probing $box over ssh ($ssh_alias)…"
+  # Non-secret facts only. The token file is tested, never read, here.
+  local probe
+  probe=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$ssh_alias" '
+    ts=""; for c in tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+      command -v "$c" >/dev/null 2>&1 && { ts="$c"; break; }; done
+    echo "USER=$(id -un)"
+    [ -s "$HOME/.amux/auth_token" ] && echo "TOKEN=yes" || echo "TOKEN=no"
+    if [ -n "$ts" ]; then
+      echo "IP=$("$ts" ip -4 2>/dev/null | head -1)"
+      echo "FQDN=$("$ts" status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)[\"Self\"][\"DNSName\"].rstrip(\".\"))" 2>/dev/null)"
+    fi') || die "cannot ssh to '$ssh_alias' (BatchMode) — fix SSH first, or pass --ssh <alias>"
+  local r_user r_tok r_ip r_fqdn
+  r_user=$(sed -n 's/^USER=//p' <<<"$probe")
+  r_tok=$(sed -n 's/^TOKEN=//p' <<<"$probe")
+  r_ip=$(sed -n 's/^IP=//p' <<<"$probe")
+  r_fqdn=$(sed -n 's/^FQDN=//p' <<<"$probe")
+  [[ "$r_tok" == yes ]] || die "'$box' has no ~/.amux/auth_token — amux's server has never run there (install amux on it first)"
+
+  # Candidate URLs: --url, else MagicDNS name (matches the LE cert), then tailnet IP.
+  local -a cands=()
+  if [[ -n "$url" ]]; then cands=("${url%/}")
+  else
+    [[ -n "$r_fqdn" ]] && cands+=("https://$r_fqdn:8822")
+    [[ -n "$r_ip" ]]   && cands+=("https://$r_ip:8822")
+  fi
+  [[ ${#cands[@]} -gt 0 ]] || die "could not work out $box's tailnet address — pass --url https://<host>:8822"
+
+  mkdir -p "$AMUX_REMOTES_DIR"; chmod 700 "$AMUX_REMOTES_DIR" 2>/dev/null || true
+  local tmp; tmp=$(umask 077; mktemp "$AMUX_REMOTES_DIR/.add-$box.XXXXXX") || die "cannot create a temp file in $AMUX_REMOTES_DIR"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+  # The token: remote cat -> ssh stdout -> this file. Never on a terminal or argv.
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$ssh_alias" \
+      'printf "AMUX_TOKEN="; tr -d "\r\n" < "$HOME/.amux/auth_token"; echo' > "$tmp" \
+    || die "could not read $box's token over ssh"
+  grep -q '^AMUX_TOKEN=[A-Za-z0-9_=-]\{16,\}$' "$tmp" || die "$box's token did not look like an amux token — nothing written"
+  printf 'AMUX_SSH_HOST=%s\nAMUX_SSH_USER=%s\n' "$ssh_alias" "$r_user" >> "$tmp"
+
+  local c ok=""
+  for c in "${cands[@]}"; do
+    printf '  trying %s … ' "$c"
+    { printf 'AMUX_URL=%s\n' "$c"; grep -v '^AMUX_URL=' "$tmp"; } > "$tmp.u" && mv "$tmp.u" "$tmp"
+    chmod 600 "$tmp"
+    # Authenticated GET through the same api() every command uses (token via a
+    # header file, never argv). 200 = right address AND right token.
+    if [[ "$( ( set -a; source "$tmp"; set +a; BOX="$box" AMUX_API_CONNECT_TIMEOUT=5 AMUX_API_MAX_TIME=15
+                api GET /api/sessions -o /dev/null -w '%{http_code}' ) 2>/dev/null )" == 200 ]]; then
+      echo ok; ok="$c"; break
+    fi
+    echo "no answer"
+  done
+  [[ -n "$ok" ]] || die "$box's server did not answer on ${cands[*]} — is amux-serve running there? Nothing written."
+
+  if [[ -e "$dest" ]]; then cp -p "$dest" "$dest.bak-add-$(date +%Y%m%d-%H%M%S)"; fi
+  mv "$tmp" "$dest" && chmod 600 "$dest"
+  echo "added $box → $ok  ($dest, mode 600)"
+  echo "try:  amux-remote $box ls -c"
+}
+
+# ── Select the box (always required), then dispatch its command ──────────────
+# --ssh is accepted on either side of the box name: it reads naturally as a
+# global ('amux-remote --ssh <box> ls') and as a per-box afterthought
+# ('amux-remote <box> --ssh ls'), and both spellings get typed.
+FORCE_SSH=0
+[[ "${1:-}" == "--ssh" ]] && { FORCE_SSH=1; shift; }
+
+BOX="${1:-}"; shift || true
+case "$BOX" in
+  ""|help|-h|--help) usage; exit 0 ;;
+  add)               cmd_add "$@"; exit $? ;;   # needs no config yet — it makes one
+esac
+
+[[ "${1:-}" == "--ssh" ]] && { FORCE_SSH=1; shift; }
+BOX_ENV="$AMUX_REMOTES_DIR/$BOX.env"
+if [[ ! -f "$BOX_ENV" ]]; then
+  # A leading subcommand (the common slip now that a box is mandatory) lands here.
+  case " ls list attach a peek send exec start stop info meta curl url provider model full-access " in
+    *" $BOX "*) die "a box is required first: try 'amux-remote <box> $BOX …' — boxes: $(list_boxes)" ;;
+  esac
+  # One machine has several SSH names — a LAN alias, a tailnet twin, a couple of
+  # longer spellings — and they are all the SAME box. Rather than demand the one
+  # spelling that happens to be the config filename, resolve what was typed and
+  # match it against the addresses the configured boxes already point at.
+  _alias_box=$(_resolve_box_alias "$BOX" || true)
+  if [[ -n "$_alias_box" ]]; then
+    # Honour the route that was actually asked for: '<box> f-<box>' is a ladder
+    # of paths to one machine, so naming a rung explicitly PINS that rung
+    # instead of re-probing from the top.
+    AMUX_SSH_HOST_PIN="$BOX"
+    BOX="$_alias_box"
+    BOX_ENV="$AMUX_REMOTES_DIR/$BOX.env"
+  else
+    die "unknown box '$BOX'. configured: $(list_boxes)— add ~/.amux/remotes/$BOX.env"
+  fi
+fi
+# shellcheck disable=SC1090
+set -a; source "$BOX_ENV"; set +a
+
+# A name typed as an alias of this box overrides the configured ladder: the
+# point of typing 'f-<box>' is to say WHICH path to take.
+if [[ -n "${AMUX_SSH_HOST_PIN:-}" ]]; then
+  AMUX_SSH_HOST="$AMUX_SSH_HOST_PIN"
+  export AMUX_SSH_HOST
+fi
+
+cmd="${1:-}"; shift || true
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && [[ "$cmd" != pick && "$cmd" != choose ]]; then
+  subhelp "$cmd" && exit 0
+fi
+if [[ "$cmd" == help && -n "${1:-}" ]]; then subhelp "$1" && exit 0; fi
+
+# --ssh bypasses the API entirely. `attach` already rides SSH; `url` and `curl`
+# are statements ABOUT the API, so neither has an SSH form. `help` never
+# touches the network.
+if [[ $FORCE_SSH -eq 1 ]]; then
+  case "$cmd" in
+    attach|a)          : ;;   # already SSH — fall through to cmd_attach
+    url|curl)          die "--ssh does not apply to '$cmd' (it addresses the REST API directly)" ;;
+    ""|help|-h|--help) usage; exit 0 ;;
+    *)                 require_config; _run_over_ssh "$cmd" "$@"; exit $? ;;
+  esac
+fi
+
+case "$cmd" in
+  ls|list)       cmd_ls "$@" ;;
+  pick|choose)   _ccj="$HOME/.local/bin/ccjump"; [ -x "$_ccj" ] || _ccj="$(command -v ccjump || true)"
+                 [ -n "$_ccj" ] || die "pick needs ccjump on this box"
+                 # with args (e.g. --sessionid 19) hand off to amux's pick, which owns that logic
+                 if [[ $# -gt 0 ]] && command -v amux >/dev/null 2>&1; then exec amux pick "$BOX" "$@"; fi
+                 exec "$_ccj" "$BOX" ;;
+  attach|a)      cmd_attach "$@" ;;
+  peek)          cmd_peek "$@" ;;
+  send)          cmd_send "$@" ;;
+  exec)          cmd_exec "$@" ;;
+  start)         cmd_start "$@" ;;
+  stop)          cmd_simple_post stop "$@" ;;
+  rm|remove|del) cmd_rm "$@" ;;
+  info|meta)     cmd_info "$@" ;;
+  provider)      cmd_provider "$@" ;;
+  account|acct)  cmd_account "$@" ;;
+  model)         cmd_model "$@" ;;
+  full-access)   cmd_full_access "$@" ;;
+  curl)          cmd_curl "$@" ;;
+  box|resolve)   echo "$BOX" ;;   # the configured name this spelling resolved to (myhost-01 -> myhost)
+  url)           require_config; echo "$AMUX_URL" ;;
+  ""|help|-h|--help) usage ;;
+  *)             die "unknown command: $cmd (try: amux-remote help)" ;;
+esac

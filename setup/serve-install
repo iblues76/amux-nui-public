@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# serve-install — keep `amux serve` running on this machine so OTHER machines can reach it.
+#
+# You only need this on a machine you want to DRIVE FROM SOMEWHERE ELSE. If you
+# use one computer, skip it — plain `amux` already works locally.
+#
+# What it does:
+#   1. Works out which address other machines should reach this box on
+#   2. Starts `amux serve` bound to loopback + that address (never 0.0.0.0)
+#   3. Makes it survive logout and reboot — launchd on macOS, systemd --user on
+#      Linux/WSL, and a shell-profile fallback where neither exists
+#   4. Prints the exact `amux-config add` line to run on your OTHER machine
+#
+# Usage:
+#   setup/serve-install                    detect the address, ask before acting
+#   setup/serve-install --address <addr>   bind a specific address
+#   setup/serve-install --port <n>         port (default 8822)
+#   setup/serve-install --loopback-only    bind only 127.0.0.1 (use with an SSH tunnel)
+#   setup/serve-install --status           show what is currently set up
+#   setup/serve-install --uninstall        stop it and remove the autostart entry
+#
+# SECURITY: the server is bound to specific addresses, never 0.0.0.0, and its
+# token grants full control of every session on this machine. Expose it on a
+# private network (VPN/tailnet), a trusted LAN, or through an SSH tunnel — never
+# straight onto the public internet.
+set -uo pipefail
+
+_here=$(cd "$(dirname "$0")" && pwd)
+. "$_here/../lib/amux-common.sh"
+
+case "${1:-}" in -h|--help) amux_self_help "$0"; exit 0 ;; esac
+
+PORT=8822 ADDRESS="" LOOPBACK_ONLY=0 ACTION=install
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --address)        ADDRESS="${2:-}"; shift ;;
+    --port)           PORT="${2:-}"; shift ;;
+    --loopback-only)  LOOPBACK_ONLY=1 ;;
+    --status)         ACTION=status ;;
+    --uninstall)      ACTION=uninstall ;;
+    *)                amux_die "unknown option: $1 (see -h)" ;;
+  esac
+  shift
+done
+
+PLATFORM=$(amux_platform)
+LABEL_MAC="com.amux-nuilab.serve"
+PLIST="$HOME/Library/LaunchAgents/$LABEL_MAC.plist"
+UNIT="$HOME/.config/systemd/user/amux-serve.service"
+
+# ── which address should other machines use? ─────────────────────────────────
+# Tailscale first when present (a stable private address that works anywhere),
+# then the primary LAN address. Never 0.0.0.0 — binding every interface on a
+# laptop means exposing it on whatever coffee-shop network it joins next.
+detect_address() {
+  if amux_have tailscale; then
+    local ts; ts=$(tailscale ip -4 2>/dev/null | head -1)
+    [ -n "$ts" ] && { printf '%s\n' "$ts"; return; }
+  fi
+  case "$PLATFORM" in
+    macos)
+      local i ip
+      for i in $(route -n get default 2>/dev/null | awk '/interface:/{print $2}') en0 en1; do
+        ip=$(ipconfig getifaddr "$i" 2>/dev/null) && [ -n "$ip" ] && { printf '%s\n' "$ip"; return; }
+      done ;;
+    linux|wsl)
+      local ip
+      ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+      [ -n "$ip" ] && { printf '%s\n' "$ip"; return; }
+      ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+      [ -n "$ip" ] && { printf '%s\n' "$ip"; return; } ;;
+  esac
+  return 1
+}
+
+# Find the server process.
+#
+# `amux serve` execs into python running amux-server.py, so the command line you
+# see in `ps` is the PYTHON one — pgrep for "amux serve" matches only during the
+# brief moment before the exec, i.e. essentially never. Matching amux-server is
+# what actually finds it. (A pkill on the wrong pattern silently kills nothing,
+# which then looks like "the restart didn't take".)
+serve_pids() {
+  { pgrep -f 'amux-server' 2>/dev/null; pgrep -f 'amux serve' 2>/dev/null; } \
+    | sort -u | tr '\n' ' '
+}
+serve_stop() {
+  pkill -f 'amux-server' 2>/dev/null || true
+  pkill -f 'amux serve'  2>/dev/null || true
+}
+
+cmd_status() {
+  printf '%samux serve on this machine%s\n' "$BOLD" "$RESET"
+  # The HTTP probe is the authority: a live 200 means it is serving, whatever
+  # the process table happens to be called.
+  local tokf="$(amux_home)/auth_token" code=000
+  if [ -s "$tokf" ]; then
+    code=$(AMUX_URL="https://127.0.0.1:$PORT" AMUX_TOKEN="$(tr -d '\r\n' < "$tokf")" \
+           AMUX_TIMEOUT=5 amux_api_code /api/sessions)
+  fi
+  local pids; pids=$(serve_pids)
+  if [ "$code" = 200 ]; then
+    amux_ok "serving on 127.0.0.1:$PORT (HTTP 200)${pids:+ · pid $pids}"
+  elif [ -n "$pids" ]; then
+    amux_hmm "process running (pid $pids) but not answering on $PORT (HTTP $code)"
+  else
+    amux_bad "not running"
+  fi
+  case "$PLATFORM" in
+    macos) [ -f "$PLIST" ] && amux_ok "autostart: $PLIST" || amux_hmm "no autostart entry" ;;
+    *)     [ -f "$UNIT" ]  && amux_ok "autostart: $UNIT"  || amux_hmm "no autostart entry" ;;
+  esac
+  [ -s "$tokf" ] && amux_ok "token present ($tokf)" \
+                 || amux_bad "no token yet — start the server once so it mints one"
+}
+
+cmd_uninstall() {
+  case "$PLATFORM" in
+    macos)
+      launchctl bootout "gui/$(id -u)/$LABEL_MAC" 2>/dev/null || true
+      rm -f "$PLIST" && amux_ok "removed $PLIST" ;;
+    *)
+      systemctl --user disable --now amux-serve 2>/dev/null || true
+      rm -f "$UNIT" && amux_ok "removed $UNIT"
+      systemctl --user daemon-reload 2>/dev/null || true ;;
+  esac
+  serve_stop
+  amux_ok "stopped"
+}
+
+case "$ACTION" in
+  status)    cmd_status; exit 0 ;;
+  uninstall) cmd_uninstall; exit 0 ;;
+esac
+
+# ── install ──────────────────────────────────────────────────────────────────
+amux_have amux || amux_die "amux is not installed — run setup/bootstrap first"
+
+if [ "$LOOPBACK_ONLY" = 1 ]; then
+  BIND="127.0.0.1"
+  REACH="127.0.0.1"
+  amux_info "binding loopback only — reach it through an SSH tunnel:"
+  amux_info "  ssh -N -L $PORT:127.0.0.1:$PORT <this-machine>"
+else
+  if [ -z "$ADDRESS" ]; then
+    ADDRESS=$(detect_address) || {
+      amux_warn "could not detect an address for this machine."
+      amux_warn "pass one:  setup/serve-install --address <addr>"
+      amux_warn "or bind loopback + use an SSH tunnel:  setup/serve-install --loopback-only"
+      exit 1
+    }
+  fi
+  BIND="127.0.0.1,$ADDRESS"
+  REACH="$ADDRESS"
+fi
+
+printf '%sInstalling amux serve%s\n' "$BOLD" "$RESET"
+printf '  port    %s\n' "$PORT"
+printf '  bind    %s\n' "$BIND"
+printf '\n'
+
+serve_stop
+sleep 1
+
+case "$PLATFORM" in
+  macos)
+    mkdir -p "$HOME/Library/LaunchAgents"
+    # RunAtLoad + KeepAlive: start at login, restart if it dies. A GUI-domain
+    # agent (not a daemon) so it runs as you, with access to your keychain.
+    cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL_MAC</string>
+  <key>ProgramArguments</key><array>
+    <string>$(command -v amux)</string>
+    <string>serve</string>
+    <string>$PORT</string>
+    <string>--bind</string>
+    <string>$BIND</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$HOME</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/.amux/serve.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.amux/serve.log</string>
+</dict></plist>
+PLIST
+    launchctl bootout "gui/$(id -u)/$LABEL_MAC" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" && amux_ok "launchd agent installed"
+    ;;
+
+  linux|wsl)
+    if amux_have systemctl && systemctl --user show-environment >/dev/null 2>&1; then
+      mkdir -p "$(dirname "$UNIT")"
+      cat > "$UNIT" <<UNITEOF
+[Unit]
+Description=amux dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$(command -v amux) serve $PORT --bind $BIND
+# always, not on-failure: the server exits CLEANLY to reload itself when
+# install.sh replaces amux-server.py, and on-failure would leave it down.
+Restart=always
+RestartSec=2
+# process, not control-group: tmux and every agent session live in this unit's
+# cgroup, and a restart must never take them down with the dashboard.
+KillMode=process
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target
+UNITEOF
+      systemctl --user daemon-reload
+      systemctl --user enable --now amux-serve && amux_ok "systemd --user unit installed"
+      # Without lingering, the unit stops when your last login session ends —
+      # which is exactly when you want to reach the box remotely.
+      loginctl enable-linger "$(whoami)" 2>/dev/null \
+        || sudo loginctl enable-linger "$(whoami)" 2>/dev/null \
+        || amux_hmm "could not enable lingering — the server may stop when you log out"
+    else
+      # WSL1, WSL2 without systemd, and minimal containers land here.
+      amux_hmm "no user systemd — falling back to a shell-profile autostart"
+      RC="$HOME/.profile"; [ -f "$HOME/.bashrc" ] && RC="$HOME/.bashrc"
+      MARK="# amux-nuilab: start the dashboard if it is not already running"
+      if ! grep -qF "$MARK" "$RC" 2>/dev/null; then
+        {
+          printf '\n%s\n' "$MARK"
+          printf 'pgrep -f "amux serve" >/dev/null 2>&1 || (nohup amux serve %s --bind %s >>"$HOME/.amux/serve.log" 2>&1 &)\n' "$PORT" "$BIND"
+        } >> "$RC"
+        amux_ok "added an autostart line to $RC"
+      else
+        amux_ok "autostart line already in $RC"
+      fi
+      nohup amux serve "$PORT" --bind "$BIND" >>"$HOME/.amux/serve.log" 2>&1 &
+      if [ "$PLATFORM" = wsl ]; then
+        printf '\n'
+        amux_hmm "WSL note: the distro must be RUNNING for other machines to reach it."
+        printf '      A WSL distro shuts down when its last shell exits. Keep a terminal\n'
+        printf '      open, or see docs/windows.md for keeping it alive.\n'
+      fi
+    fi ;;
+
+  msys|cygwin)
+    amux_hmm "Windows outside WSL has no user service manager this script can use."
+    printf '      Start it manually in a Git Bash window:  amux serve %s --bind %s\n' "$PORT" "$BIND"
+    printf '      To autostart, add that to Task Scheduler. See docs/windows.md.\n'
+    nohup amux serve "$PORT" --bind "$BIND" >>"$HOME/.amux/serve.log" 2>&1 &
+    ;;
+esac
+
+# ── verify ───────────────────────────────────────────────────────────────────
+printf '\n'
+amux_info "waiting for the server to come up…"
+ok=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 1
+  [ -s "$(amux_home)/auth_token" ] || continue
+  code=$(AMUX_URL="https://127.0.0.1:$PORT" \
+         AMUX_TOKEN="$(tr -d '\r\n' < "$(amux_home)/auth_token")" \
+         AMUX_TIMEOUT=3 amux_api_code /api/sessions)
+  [ "$code" = 200 ] && { ok=1; break; }
+done
+
+if [ "$ok" = 1 ]; then
+  amux_ok "server answering on https://127.0.0.1:$PORT"
+else
+  amux_bad "server did not answer in time — check $HOME/.amux/serve.log"
+  exit 1
+fi
+
+# ── firewall ─────────────────────────────────────────────────────────────────
+# A server answering on loopback proves nothing about whether ANOTHER machine can
+# reach it: on Fedora and Ubuntu the host firewall will happily drop the inbound
+# connection while every local check passes. That failure looks exactly like a
+# wrong address, and it is the difference between "works on the box I set up by
+# hand once" and "works on a fresh machine".
+#
+# The rule is scoped to the interface carrying the chosen address, never opened
+# globally — a laptop must not start accepting 8822 on every network it joins.
+open_firewall() {
+  [ "$LOOPBACK_ONLY" = 1 ] && return 0
+  local iface
+  iface=$(ip -4 -o addr show 2>/dev/null | awk -v a="$REACH" '$4 ~ "^"a"/" {print $2; exit}')
+  [ -n "$iface" ] || return 0
+
+  if amux_have firewall-cmd && sudo -n firewall-cmd --state >/dev/null 2>&1; then
+    local zone
+    zone=$(sudo -n firewall-cmd --get-zone-of-interface="$iface" 2>/dev/null)
+    [ -n "$zone" ] && [ "$zone" != "no zone" ] || zone=public
+    if sudo -n firewall-cmd --zone="$zone" --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "$PORT/tcp"; then
+      amux_ok "firewalld: $PORT/tcp already open on $iface (zone $zone)"
+      return 0
+    fi
+    amux_info "firewalld is active and $PORT/tcp is closed on $iface (zone $zone)."
+    printf '    Open it so other machines can reach this one? [Y/n] '
+    local a; read -r a
+    case "$a" in n|N|no|NO) amux_hmm "left closed — remote machines will not reach this one"; return 0 ;; esac
+    if sudo -n firewall-cmd --permanent --zone="$zone" --add-port="$PORT/tcp" >/dev/null 2>&1 \
+       && sudo -n firewall-cmd --reload >/dev/null 2>&1; then
+      amux_ok "firewalld: opened $PORT/tcp in zone $zone (interface $iface only)"
+    else
+      amux_hmm "could not change firewalld automatically. Run:"
+      printf '      sudo firewall-cmd --permanent --zone=%s --add-port=%s/tcp && sudo firewall-cmd --reload\n' "$zone" "$PORT"
+    fi
+
+  elif amux_have ufw && sudo -n ufw status 2>/dev/null | head -1 | grep -qi active; then
+    if sudo -n ufw status 2>/dev/null | grep -q "$PORT.*$iface"; then
+      amux_ok "ufw: $PORT/tcp already allowed on $iface"
+      return 0
+    fi
+    amux_info "ufw is active and $PORT/tcp is not allowed on $iface."
+    printf '    Open it so other machines can reach this one? [Y/n] '
+    local a; read -r a
+    case "$a" in n|N|no|NO) amux_hmm "left closed — remote machines will not reach this one"; return 0 ;; esac
+    if sudo -n ufw allow in on "$iface" to any port "$PORT" proto tcp >/dev/null 2>&1; then
+      amux_ok "ufw: allowed $PORT/tcp in on $iface"
+    else
+      amux_hmm "could not change ufw automatically. Run:"
+      printf '      sudo ufw allow in on %s to any port %s proto tcp\n' "$iface" "$PORT"
+    fi
+  fi
+}
+open_firewall
+
+# ── tell the user exactly what to run on their OTHER machine ─────────────────
+cat <<EOF
+
+${BOLD}Now, on the machine you want to drive this one FROM:${RESET}
+
+  amux-config add $(hostname -s 2>/dev/null || hostname) --host $REACH --port $PORT
+
+That reads this machine's token over SSH and stores it mode-600. If SSH is not
+available between them, copy the token across some other way and use:
+
+  amux-config add <name> --host $REACH --port $PORT --token-stdin < token.txt
+
+${DIM}The token lives at $(amux_home)/auth_token on this machine.
+Anyone holding it controls every session here — treat it like a password.${RESET}
+EOF

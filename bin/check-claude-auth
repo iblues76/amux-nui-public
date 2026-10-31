@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# check-claude-auth — will Claude Code sessions on this machine actually authenticate?
+#
+# Probes the durable token in ~/.config/claude-code/env DIRECTLY against the API with
+# curl. Deliberately NOT `claude -p`: the CLI silently falls back between credential
+# stores, so it can say "auth OK" via a credential your sessions don't use.
+#
+# Also detects the SHADOWING trap: a stored browser-login (`claude auth login`) takes
+# precedence over the env token in interactive sessions; when it expires (~8 hours),
+# every session on the machine parks at "Please run /login" even though the durable
+# token is perfectly valid. Fix: `claude auth logout` (or run `amux-reauth <session>`,
+# which does it for you), then restart the stale sessions.
+#
+# Usage: check-claude-auth [personal|team|team2]   (or P|T|X; default personal)
+#        checks that account's slot file — see docs/accounts.md
+#
+# Exit codes: 0 = all good · 1 = token missing/dead/network · 2 = shadowing login found
+case "${1:-}" in -h|--help)
+  awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
+esac
+set -uo pipefail
+# PATH covers the common install dirs across macOS (Homebrew intel+ARM), Linux,
+# and MSYS2/Git Bash, so these work when launched from a GUI or a cron/launchd
+# context that does not source your shell rc.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/mingw64/bin:/usr/bin:/bin:$PATH"
+_slot="$HOME/.config/claude-code/env"
+case "${1:-personal}" in
+  p|P|personal) ;;
+  t|T|team)     _slot="$_slot.team" ;;
+  x|X|team2|t2) _slot="$_slot.team2" ;;
+  *) echo "usage: check-claude-auth [personal|team|team2]" >&2; exit 2 ;;
+esac
+ENVFILE="${CHECK_CLAUDE_AUTH_ENVFILE:-$_slot}"
+
+echo "Checking Claude auth on $(hostname -s 2>/dev/null || hostname)..."
+TOK=$(grep -oE 'sk-ant-oat[A-Za-z0-9._-]+' "$ENVFILE" 2>/dev/null | head -1)
+if [ -z "$TOK" ]; then
+  echo "  [X] no durable token in $ENVFILE"
+  echo "      mint one:  claude setup-token   -> save the sk-ant-oat... line there (mode 600)"
+  exit 1
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://api.anthropic.com/v1/messages \
+  -H @<(printf 'Authorization: Bearer %s\n' "$TOK") \
+  -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -H 'anthropic-beta: oauth-2025-04-20' \
+  -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' 2>/dev/null)
+if [ "$CODE" = "401" ]; then
+  echo "  [X] durable token is DEAD (HTTP 401) — re-mint with:  claude setup-token"
+  exit 1
+elif [ -z "$CODE" ] || [ "$CODE" = "000" ]; then
+  echo "  [?] could not reach the API (network) — try again when the link is up"
+  exit 1
+fi
+echo "  [OK] durable token authenticates (HTTP $CODE, probed directly)"
+
+HAVE=0
+[ -f "$HOME/.claude/.credentials.json" ] && HAVE=1
+command -v security >/dev/null 2>&1 && \
+  security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 && HAVE=1
+if [ "$HAVE" = 1 ]; then
+  echo "  [!] a stored browser-login exists — it SHADOWS the durable token in interactive"
+  echo "      sessions, and when it expires every session parks at /login."
+  echo "      Fix now:  claude auth logout    (then restart stale sessions)"
+  exit 2
+fi
+echo "  [OK] no stored login — sessions use the durable token directly"
+echo "  All good: fresh or restarted sessions will authenticate."

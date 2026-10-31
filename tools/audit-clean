@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# audit-clean — refuse to publish anything that leaks a secret or a real machine.
+#
+# This repo is PUBLIC. It grew out of a private setup, so the risk is not
+# hypothetical: an example command with a real hostname, a tailnet IP in a
+# comment, or a pasted token would all be permanent once pushed.
+#
+# Scans the working tree AND the committed history for:
+#   * credentials      Anthropic tokens, generic API keys, private keys, AMUX_TOKEN values
+#   * private networks tailnet CGNAT (100.64.0.0/10), RFC1918 addresses
+#   * real machines    tailnet DNS names, and YOUR OWN machine/domain names from a
+#                      private deny-list kept OUTSIDE the repo (see below)
+#   * personal data    email addresses, home-directory paths
+#
+# Documentation addresses (192.0.2.x, 198.51.100.x, 203.0.113.x — RFC 5737),
+# 127.0.0.1 and 0.0.0.0 are allowed, since examples need SOMETHING to show.
+#
+# Your real machine names, domains and usernames are exactly what must never be
+# written into this public file, so they live in a private deny-list instead:
+#   ~/.config/amux/audit-deny.txt     (override: AUDIT_DENY_FILE=<path>)
+# one extended regex per line, blank lines and #comments ignored, e.g.
+#   \bmy-desktop(-[0-9]+)?\b
+#   example-corp\.com
+# Without that file the generic checks still run, and the audit says so.
+#
+# Usage:
+#   tools/audit-clean            scan the working tree
+#   tools/audit-clean --history  also scan every committed blob (slower)
+#
+# Exit codes: 0 = clean · 1 = findings (do not publish)
+set -uo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+
+SCAN_HISTORY=0
+case "${1:-}" in
+  --history) SCAN_HISTORY=1 ;;
+  -h|--help) awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
+esac
+
+RED=''; GREEN=''; YELLOW=''; BOLD=''; RESET=''
+if [ -t 1 ]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+fi
+
+FINDINGS=0
+
+# report <severity> <label> <matches>
+report() {
+  local sev="$1" label="$2" hits="$3"
+  [ -z "$hits" ] && return 0
+  if [ "$sev" = high ]; then
+    printf '%s✗ %s%s\n' "$RED" "$label" "$RESET"
+    FINDINGS=$((FINDINGS + 1))
+  else
+    printf '%s! %s%s\n' "$YELLOW" "$label" "$RESET"
+    FINDINGS=$((FINDINGS + 1))
+  fi
+  printf '%s\n' "$hits" | sed 's/^/    /'
+}
+
+# Files to scan: tracked files if this is a git repo, else everything sensible.
+# tmp/ is excluded — it holds upstream copies and test scratch, never published.
+files() {
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    # --cached AND --others: before the first commit `git ls-files` alone returns
+    # NOTHING, so the audit would scan zero files and cheerfully report "clean" —
+    # the most dangerous possible failure for a pre-publish check. --others picks
+    # up files staged for a first commit; --exclude-standard still honors
+    # .gitignore, so tmp/ stays out.
+    git ls-files --cached --others --exclude-standard
+  else
+    find . -type f -not -path './.git/*' -not -path './tmp/*' | sed 's#^\./##'
+  fi
+}
+
+# Allowlist: strings that are SUPPOSED to appear.
+#
+# Only the repository's own clone URL. Kept deliberately narrow — allowlisting the
+# whole domain would silently permit every other host on it, which is exactly
+# what this audit exists to catch.
+#   git.nuilab.org  — the repository's own clone URL
+#   100.64.0.0/10   — the CIDR notation for the tailnet range, in the text that
+#                     documents the check itself. A network base address written
+#                     as CIDR is never a host, so it cannot be a leak.
+#   nui-public      — this repository's OWN name (amux-nui-public), which the
+#                     nui-* machine-name check matches on. The repo name is not a
+#                     host; kept as an exact string so a real `nui-<box>` still trips.
+#   /home/linuxbrew, /home/u, /Users/you — a generic install dir and test fixtures
+#   email@example.com, git@github.com    — upstream amux's own placeholder/URL text
+ALLOW='^(git\.nuilab\.org|100\.64\.0\.0(/10)?|nui-public|/home/linuxbrew|/home/u|/Users/you|email@example\.com|git@github\.com)$'
+
+scan() { # $1 = extended regex, $2 = label, $3 = severity
+  local hits
+  hits=$(files | grep -v '^tmp/' | while read -r f; do
+    [ -f "$f" ] || continue
+    grep -nHoE "$1" "$f" 2>/dev/null
+  done \
+    | grep -vE '^tools/audit-clean:' \
+    | awk -F: -v allow="$ALLOW" '{ m=$0; sub(/^[^:]*:[0-9]*:/,"",m); if (m !~ allow) print }' \
+    | head -20)
+  report "$3" "$2" "$hits"
+}
+
+printf '%sAuditing %s for anything that should not be public%s\n\n' \
+  "$BOLD" "$(pwd)" "$RESET"
+
+# ── credentials ──────────────────────────────────────────────────────────────
+scan 'sk-ant-[A-Za-z0-9_-]{30,}'                   'Anthropic key/token'          high
+scan 'sk-[A-Za-z0-9]{20,}'                         'API key (sk- prefix)'         high
+scan 'BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY'  'private key'                  high
+scan 'AMUX_TOKEN=[A-Za-z0-9+/=_-]{8,}'             'AMUX_TOKEN with a real value' high
+scan 'ghp_[A-Za-z0-9]{20,}'                        'GitHub token'                 high
+scan '(password|passwd|secret)[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']{6,}' 'hardcoded password' high
+
+# ── private network addresses ────────────────────────────────────────────────
+# Tailnet CGNAT range — the classic leak in an example command.
+# The range's own base address written as CIDR is documentation, not a host, so
+# it must not trip the check that documents it. Require a host octet.
+scan '100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(/[0-9]+)?' \
+     'tailnet address (CGNAT range)' high
+# RFC1918. Warn rather than fail: 192.168.x is a plausible generic LAN example.
+scan '(^|[^0-9.])10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' 'private 10.x address'   warn
+scan '172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}' 'private 172.16/12 address' warn
+
+# ── real machines and domains ────────────────────────────────────────────────
+scan '[A-Za-z0-9-]+\.ts\.net'                      'tailnet DNS name'             high
+# Private deny-list: the maintainer's own machine names, domains, usernames.
+DENY_FILE="${AUDIT_DENY_FILE:-$HOME/.config/amux/audit-deny.txt}"
+if [ -f "$DENY_FILE" ]; then
+  ndeny=0
+  while IFS= read -r re || [ -n "$re" ]; do
+    case "$re" in ''|'#'*) continue ;; esac
+    ndeny=$((ndeny + 1))
+    scan "$re" "private deny-list match (pattern #$ndeny in $DENY_FILE)" high
+  done < "$DENY_FILE"
+  printf '(checked %d private deny-list patterns)\n' "$ndeny"
+else
+  printf '%s! no private deny-list at %s — your own machine names were NOT checked%s\n' \
+    "$YELLOW" "$DENY_FILE" "$RESET"
+fi
+
+# ── personal data ────────────────────────────────────────────────────────────
+scan '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(edu|com|org|net)' 'email address'        warn
+scan '/(Users|home)/[A-Za-z0-9_.-]+'               'home-directory path'          high
+
+# ── file modes ───────────────────────────────────────────────────────────────
+# A committed config file that is not 600 is a different kind of leak.
+bad_env=$(files | grep -E '\.env$' | while read -r f; do
+  [ -f "$f" ] && printf '%s\n' "$f"
+done)
+report high 'committed .env file (should never be in the repo)' "$bad_env"
+
+# ── history ──────────────────────────────────────────────────────────────────
+# A scrubbed working tree means nothing if the secret is still in an old commit.
+if [ "$SCAN_HISTORY" = 1 ] && git rev-parse --git-dir >/dev/null 2>&1; then
+  printf '\n%sScanning committed history…%s\n' "$BOLD" "$RESET"
+  hist=$(git rev-list --all --objects 2>/dev/null | awk '{print $1}' | sort -u | \
+    while read -r obj; do
+      git cat-file -t "$obj" 2>/dev/null | grep -q '^blob$' || continue
+      git cat-file -p "$obj" 2>/dev/null | \
+        grep -oE 'sk-ant-[A-Za-z0-9_-]{30,}|100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(/[0-9]+)?|[A-Za-z0-9-]+\.ts\.net' \
+        | grep -vE "$ALLOW" \
+        | sed "s#^#$obj: #"
+    done | sort -u | head -20)
+  report high 'secret or private address in git history' "$hist"
+  [ -z "$hist" ] && printf '%s✓ history clean%s\n' "$GREEN" "$RESET"
+fi
+
+# ── verdict ──────────────────────────────────────────────────────────────────
+printf '\n'
+if [ "$FINDINGS" = 0 ]; then
+  printf '%s✓ Clean — nothing found that should not be public.%s\n' "$GREEN" "$RESET"
+  exit 0
+fi
+printf '%s%d finding(s). Do not publish until these are resolved.%s\n' "$RED" "$FINDINGS" "$RESET"
+printf 'Anything already committed needs history rewriting, not just an edit.\n'
+exit 1

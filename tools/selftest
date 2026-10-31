@@ -1,0 +1,595 @@
+#!/usr/bin/env bash
+# selftest — prove this checkout works, without touching anything real.
+#
+# Everything runs against a THROWAWAY amux home and a throwaway bin directory, so
+# it is safe to run on a machine that already has amux configured: it never reads,
+# writes, or deletes your real ~/.amux, never contacts a real machine, and never
+# starts or stops a session.
+#
+# What it proves:
+#   1. every script parses (bash -n / py_compile)
+#   2. every lib function a script calls is actually defined
+#   3. install.sh installs, and the symlinked commands still find lib/
+#   4. amux-config's whole lifecycle: add, show, test, rename, remove
+#   5. security properties hold — secret-safe HTTP, validated names, exact tmux targets
+#      and mode-600 config; remote exec/provider and numeric rename resolution work
+#   6. the renderer produces the same output for local and remote given the same data
+#   7. the bundled amux: version, help, server syntax, register/ls/account/rm on a
+#      dummy session (never launched), completion generation
+#   8. the audit catches a planted secret
+#
+# Usage:
+#   tools/selftest              run everything
+#   tools/selftest -v           show each command's output
+#
+# Exit codes: 0 = all passed · 1 = something failed
+set -uo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+REPO=$(pwd)
+
+case "${1:-}" in
+  -h|--help) awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
+esac
+VERBOSE=0; [ "${1:-}" = "-v" ] && VERBOSE=1
+
+RED=''; GREEN=''; DIM=''; BOLD=''; RESET=''
+if [ -t 1 ]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; DIM=$'\033[2m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+fi
+
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS+1)); printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  %s✗%s %s\n' "$RED" "$RESET" "$1"; [ -n "${2:-}" ] && printf '      %s\n' "$2"; }
+sect() { printf '\n%s%s%s\n' "$BOLD" "$1" "$RESET"; }
+
+# Isolated sandbox. Everything the test writes lives here and is removed at exit.
+SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/amux-selftest.XXXXXX")
+cleanup() { rm -rf "$SANDBOX"; }
+trap cleanup EXIT
+# HOME itself moves into the sandbox, so nothing below can read or write your real
+# ~/.amux, ~/.config or shell rc files — even a command that ignores CC_HOME.
+# TMUX_TMPDIR does the same for tmux: any tmux call talks to a server that does
+# not exist, never to the one running your sessions.
+REAL_HOME="$HOME"
+export HOME="$SANDBOX/home"
+export CC_HOME="$HOME/.amux"
+export BINDIR="$SANDBOX/bin"
+export TMUX_TMPDIR="$SANDBOX/tmux"
+export AMUX_NO_COMPLETION=1
+unset TMUX CLAUDE_CODE_OAUTH_TOKEN CLAUDE_ACCOUNT
+mkdir -p "$CC_HOME" "$BINDIR" "$TMUX_TMPDIR"
+
+run() { if [ "$VERBOSE" = 1 ]; then "$@"; else "$@" >/dev/null 2>&1; fi; }
+
+# Capture a command's output, then match against the captured STRING.
+#
+# Never `cmd | grep -q pat` in this file: grep -q exits at the first match, which
+# SIGPIPEs the producer, and with `set -o pipefail` the pipeline then reports
+# failure even though the match SUCCEEDED. That turns a passing check into a
+# flaky failure whose flakiness depends on how much output the producer had
+# already written — which is exactly how this suite first "failed" six real,
+# working behaviors.
+out_of()  { "$@" 2>&1; }
+has()     { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+matches() { printf '%s' "$2" | grep -qE "$1"; }
+
+# ── 1. syntax ────────────────────────────────────────────────────────────────
+sect "1. Everything parses"
+n=0; bad_files=""
+for f in bin/* setup/* lib/*.sh tools/audit-clean tools/selftest install.sh; do
+  [ -f "$f" ] || continue
+  head -1 "$f" | grep -q 'python' && continue
+  if bash -n "$f" 2>/dev/null; then n=$((n+1)); else bad_files="$bad_files $f"; fi
+done
+[ -z "$bad_files" ] && ok "$n shell scripts parse" || bad "shell syntax errors:$bad_files"
+
+pyok=1
+for f in lib/*.py bin/amux-server.py bin/amux-termprobe; do
+  [ -f "$f" ] || continue
+  python3 -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "$f" 2>/dev/null \
+    || { bad "python syntax error in $f"; pyok=0; }
+done
+[ "$pyok" = 1 ] && ok "python files parse"
+
+# ── 2. no undefined lib functions ────────────────────────────────────────────
+sect "2. Every lib function used is defined"
+defined=$(grep -ohE '^amux_[a-z_]+\(\)' lib/amux-common.sh | tr -d '()' | sort -u)
+missing=""
+# Only the shell scripts that source the lib (bin/amux-server.py carries
+# unrelated amux_* names in its embedded web app).
+for u in $(grep -l 'amux-common.sh' bin/* setup/* 2>/dev/null | xargs grep -hoE '\bamux_[a-z_]+\b' 2>/dev/null | sort -u); do
+  printf '%s\n' "$defined" | grep -qx "$u" || missing="$missing $u"
+done
+[ -z "$missing" ] && ok "no undefined helpers" || bad "undefined lib functions:$missing"
+
+# ── 3. install + symlink resolution ──────────────────────────────────────────
+sect "3. install.sh works and symlinks resolve lib/"
+if run ./install.sh; then
+  ok "install.sh completed"
+else
+  bad "install.sh failed"
+fi
+count=$(ls "$BINDIR" 2>/dev/null | wc -l | tr -d ' ')
+[ "$count" -ge 15 ] && ok "$count commands installed" || bad "only $count commands installed"
+
+# The real risk with symlinks: a command that cannot find lib/ from its link.
+export PATH="$BINDIR:$PATH"
+if out=$(amux-config list 2>&1); then
+  ok "symlinked command resolves lib/ (amux-config runs)"
+else
+  bad "symlinked command cannot find lib/" "$out"
+fi
+
+# Network-facing commands are mocked for the rest of the suite. The first pair
+# simply fails fast for unreachable-path tests; section 5 replaces them with
+# deterministic API/SSH fakes. No selftest operation contacts a real machine.
+MOCK_HOME="$SANDBOX/mockhome"
+MOCKBIN="$MOCK_HOME/.local/bin"
+mkdir -p "$MOCKBIN"
+cat > "$MOCKBIN/curl" <<'SH'
+#!/usr/bin/env bash
+printf '000'
+exit 7
+SH
+cat > "$MOCKBIN/ssh" <<'SH'
+#!/usr/bin/env bash
+exit 255
+SH
+chmod +x "$MOCKBIN/curl" "$MOCKBIN/ssh"
+export PATH="$MOCKBIN:$PATH"
+
+# ── 4. amux-config lifecycle ─────────────────────────────────────────────────
+sect "4. amux-config lifecycle"
+FAKE_TOKEN="selftest-not-a-real-credential-0123456789"
+
+printf '%s' "$FAKE_TOKEN" | run amux-config add testbox --host 192.0.2.77 --token-stdin
+o=$(out_of amux-config list)
+if has testbox "$o"; then
+  ok "add + list"
+else
+  bad "add did not produce a listed box"
+fi
+
+envfile="$CC_HOME/remotes/testbox.env"
+mode=$(ls -l "$envfile" 2>/dev/null | cut -c1-10)
+[ "$mode" = "-rw-------" ] && ok "config file is mode 600" || bad "config file mode is $mode, expected -rw-------"
+
+o=$(out_of amux-config show testbox)
+if has 192.0.2.77 "$o"; then
+  ok "show displays the URL"
+else
+  bad "show did not display the URL"
+fi
+
+# An unreachable box must read as UNREACHABLE, not as an unrecognized status.
+o=$(out_of amux-config test testbox)
+if matches "[Uu][Nn][Rr][Ee][Aa][Cc][Hh][Aa][Bb][Ll][Ee]" "$o"; then
+  ok "unreachable box reported correctly"
+else
+  bad "unreachable box not reported as unreachable"
+fi
+
+run amux-config rename testbox renamedbox
+o=$(out_of amux-config list)
+if has renamedbox "$o"; then
+  ok "rename"
+else
+  bad "rename failed"
+fi
+
+printf 'y\n' | run amux-config remove renamedbox
+o=$(out_of amux-config list)
+if ! has renamedbox "$o"; then
+  ok "remove"
+else
+  bad "remove failed"
+fi
+
+# ── 4b. amux-up word order ───────────────────────────────────────────────────
+# amux-up names the machine FIRST, mirroring `amux-remote <machine> <cmd>`. Both
+# that and the older colon form must reach the remote lane, and a FLAG after the
+# session name must never be mistaken for a machine name.
+sect "4b. amux-up argument forms"
+printf '%s' "$FAKE_TOKEN" | run amux-config add upbox --host 192.0.2.99 --token-stdin
+# Bound each call: the remote lane ends in a real ssh to an unreachable
+# documentation address, and we are only testing how arguments were parsed.
+bounded() { perl -e 'alarm 6; exec @ARGV' "$@" 2>&1; }
+
+o=$(bounded amux-up upbox somesession)
+if has "on box 'upbox'" "$o"; then
+  ok "amux-up <machine> <name> reaches the remote lane"
+else
+  bad "amux-up <machine> <name> did not reach the remote lane" "$o"
+fi
+
+o=$(bounded amux-up upbox:somesession)
+if has "on box 'upbox'" "$o"; then
+  ok "legacy amux-up <machine>:<name> still works"
+else
+  bad "legacy colon form broke" "$o"
+fi
+
+o=$(bounded amux-up notasession --continue)
+if has "no box was named" "$o"; then
+  ok "a flag after the name is not mistaken for a machine"
+else
+  bad "a flag was misread as a machine name" "$o"
+fi
+printf 'y\n' | run amux-config remove upbox
+
+# ── 5. security properties ───────────────────────────────────────────────────
+sect "5. Security properties"
+
+# --token must be refused outright: argv is world-readable via ps.
+o=$(out_of amux-config add x --host h --token "$FAKE_TOKEN")
+if has "not supported on purpose" "$o"; then
+  ok "--token is refused (keeps credentials off argv)"
+else
+  bad "--token was NOT refused"
+fi
+
+# No command may print a credential in full.
+printf '%s' "$FAKE_TOKEN" | run amux-config add leaktest --host 192.0.2.78 --token-stdin
+leaked=0
+for cmd in "amux-config show leaktest" "amux-config list" "amux-config status"; do
+  o=$($cmd 2>&1); if has "$FAKE_TOKEN" "$o"; then leaked=1; fi
+done
+[ "$leaked" = 0 ] && ok "no command prints a credential in full" || bad "a command printed the credential in full"
+
+o=$(out_of amux-config show leaktest)
+if matches "\\(41 chars\\)" "$o"; then
+  ok "credential summarized as prefix + length"
+else
+  bad "credential summary missing or wrong"
+fi
+printf 'y\n' | run amux-config remove leaktest
+
+# ── 5b. remote security + companion regressions ──────────────────────────────
+sect "5b. Remote hardening and companion regressions"
+
+# A deterministic curl stand-in records only non-secret argv, verifies that the
+# authorization header arrived on stdin, and returns small API-shaped responses.
+# If a token ever moves back onto argv, it records a marker instead of the value.
+CURL_LOG="$SANDBOX/curl.argv"
+SSH_LOG="$SANDBOX/ssh.argv"
+TMUX_LOG="$SANDBOX/tmux.argv"
+export AMUX_TEST_CURL_LOG="$CURL_LOG"
+export AMUX_TEST_SSH_LOG="$SSH_LOG"
+export AMUX_TEST_TMUX_LOG="$TMUX_LOG"
+export AMUX_TEST_TOKEN="$FAKE_TOKEN"
+
+cat > "$MOCKBIN/curl" <<'SH'
+#!/usr/bin/env bash
+set -u
+method=GET
+url=""
+previous=""
+header_stdin=0
+header_file=""
+for arg in "$@"; do
+  case "$arg" in
+    *"${AMUX_TEST_TOKEN:?}"*)
+      printf 'TOKEN_ON_ARGV\n' >> "$AMUX_TEST_CURL_LOG"
+      exit 97 ;;
+  esac
+  printf '%s\n' "$arg" >> "$AMUX_TEST_CURL_LOG"
+  [ "$previous" = -X ] && method="$arg"
+  [ "$arg" = @- ] && header_stdin=1
+  case "$arg" in @/dev/fd/*|@/proc/*) header_file="${arg#@}" ;; esac
+  case "$arg" in http://*|https://*) url="$arg" ;; esac
+  previous="$arg"
+done
+if [ "$header_stdin" = 1 ] || [ -n "$header_file" ]; then
+  if [ -n "$header_file" ]; then IFS= read -r header < "$header_file" || true
+  else IFS= read -r header || true; fi
+  case "$header" in
+    *"$AMUX_TEST_TOKEN"*) ;;
+    *"${AMUX_TEST_REAUTH_TOKEN:-unset-reauth-token}"*) ;;   # amux-reauth's own API probe
+    *) printf 'HEADER_MISSING\n' >> "$AMUX_TEST_CURL_LOG"; exit 98 ;;
+  esac
+fi
+case "$url" in
+  https://api.anthropic.com/*) printf '200' ;;
+  */api/sessions/*/peek*)      printf '{"output":"peek-ok"}' ;;
+  */api/sessions/*/send*)      printf '{"ok":true}' ;;
+  */api/sessions/*/info*)      printf '{"provider":"codex"}' ;;
+  */api/sessions/*/config)     printf '{"ok":true,"message":"configuration updated"}' ;;
+  */api/sessions/*/start)      printf '{"ok":true,"message":"started"}' ;;
+  */api/sessions)
+    if [ "$method" = POST ]; then printf '{"ok":true,"message":"created"}'
+    else printf '[]'
+    fi ;;
+  *) printf '{}' ;;
+esac
+SH
+cat > "$MOCKBIN/ssh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "${AMUX_TEST_SSH_LOG:?}"
+exit 0
+SH
+cat > "$MOCKBIN/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >> "${AMUX_TEST_TMUX_LOG:?}"
+case "${1:-}" in has-session) exit 1 ;; esac
+exit 0
+SH
+cat > "$MOCKBIN/amux" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+cat > "$MOCKBIN/claude" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+cat > "$MOCKBIN/security" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+cat > "$MOCKBIN/pgrep" <<'SH'
+#!/usr/bin/env bash
+printf '4242\n'
+SH
+cat > "$MOCKBIN/lsof" <<'SH'
+#!/usr/bin/env bash
+printf 'n%s\n' "${AMUX_TEST_CC_DIR:?}"
+SH
+cat > "$MOCKBIN/ps" <<'SH'
+#!/usr/bin/env bash
+printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${AMUX_TEST_REAUTH_TOKEN:?}"
+SH
+chmod +x "$MOCKBIN"/*
+
+printf '%s' "$FAKE_TOKEN" \
+  | run amux-config add remotebox --host 192.0.2.79 --ssh-host example-host --token-stdin
+
+: > "$CURL_LOG"
+o=$(out_of amux-remote remotebox peek safe.name 7)
+curl_args=$(out_of sed -n '1,200p' "$CURL_LOG")
+if has "peek-ok" "$o" && has "/api/sessions/safe.name/peek?lines=7" "$curl_args" \
+   && ! has "TOKEN_ON_ARGV" "$curl_args"; then
+  ok "remote REST path is encoded and the token stays off curl argv"
+else
+  bad "remote peek security regression" "$curl_args"
+fi
+
+: > "$CURL_LOG"
+o=$(out_of amux-remote remotebox peek 'bad/name' 7)
+curl_args=$(out_of sed -n '1,20p' "$CURL_LOG")
+if has "invalid session name" "$o" && [ -z "$curl_args" ]; then
+  ok "invalid session paths are rejected before curl"
+else
+  bad "invalid REST session name reached curl"
+fi
+
+rm -f "$SSH_LOG"
+o=$(out_of amux-remote remotebox attach "bad'name" --plain)
+if has "invalid session name" "$o" && [ ! -e "$SSH_LOG" ]; then
+  ok "attach rejects shell metacharacters before ssh"
+else
+  bad "attach name validation failed"
+fi
+
+run amux-remote remotebox attach safe.name --plain
+ssh_args=$(out_of sed -n '1,20p' "$SSH_LOG")
+if has "-t '=amux-safe.name'" "$ssh_args"; then
+  ok "attach uses an exact tmux target"
+else
+  bad "attach did not use an exact tmux target" "$ssh_args"
+fi
+
+o=$(out_of amux-remote remotebox exec new-session --dir '~/project' --model model-test --provider codex)
+curl_args=$(out_of sed -n '1,200p' "$CURL_LOG")
+if has "created new-session" "$o" && has '"provider": "codex"' "$curl_args" \
+   && has '"model": "model-test"' "$curl_args" \
+   && has "/api/sessions/new-session/start" "$curl_args"; then
+  ok "remote exec creates, configures provider/model, and starts"
+else
+  bad "remote exec/provider flow failed" "$curl_args"
+fi
+
+o=$(out_of amux-remote remotebox provider safe.name)
+if has "codex" "$o"; then
+  ok "remote provider query works"
+else
+  bad "remote provider query failed" "$o"
+fi
+
+# start must forward extra args as one-shot flags in the JSON body — including
+# values with spaces — and print the attach next-step hint (start != attach).
+: > "$CURL_LOG"
+o=$(out_of amux-remote remotebox start safe.name --append-system-prompt 'say hi')
+curl_args=$(out_of sed -n '1,200p' "$CURL_LOG")
+if has "/api/sessions/safe.name/start" "$curl_args" \
+   && has "--append-system-prompt 'say hi'" "$curl_args" \
+   && has "attach: amux-up remotebox safe.name" "$o"; then
+  ok "remote start forwards one-shot flags (spaces survive) and hints the attach"
+else
+  bad "remote start flag forwarding failed" "$curl_args"
+fi
+
+# Zero-flag start must stay byte-identical: no JSON body at all.
+: > "$CURL_LOG"
+o=$(out_of amux-remote remotebox start safe.name)
+curl_args=$(out_of sed -n '1,200p' "$CURL_LOG")
+if has "/api/sessions/safe.name/start" "$curl_args" && ! has '"flags"' "$curl_args"; then
+  ok "zero-flag start sends no body"
+else
+  bad "zero-flag start grew a body" "$curl_args"
+fi
+
+# The hint is suppressed for wrappers that attach right after (amux-up).
+o=$(out_of env AMUX_NO_HINT=1 amux-remote remotebox start safe.name)
+if ! has "attach: amux-up" "$o"; then
+  ok "AMUX_NO_HINT suppresses the attach hint"
+else
+  bad "attach hint printed despite AMUX_NO_HINT" "$o"
+fi
+
+# stop takes no flags — unexpected extras must die loudly BEFORE any request,
+# not be silently ignored.
+: > "$CURL_LOG"
+o=$(out_of amux-remote remotebox stop safe.name extra-arg)
+curl_args=$(out_of sed -n '1,20p' "$CURL_LOG")
+if has "unexpected extra arguments" "$o" && [ -z "$curl_args" ]; then
+  ok "stop rejects unexpected extra args before any request"
+else
+  bad "stop swallowed extra args" "$o"
+fi
+
+# amux-up two-word form: the machine interpretation wins, launch flags ride the
+# start request (not the attach), and --plain routes to attach only.
+rm -f "$SSH_LOG"; : > "$CURL_LOG"
+o=$(out_of amux-up remotebox safe.name --continue --plain)
+curl_args=$(out_of sed -n '1,200p' "$CURL_LOG")
+ssh_args=$(out_of sed -n '1,20p' "$SSH_LOG")
+if has '"flags": "--continue"' "$curl_args" \
+   && has "-t '=amux-safe.name'" "$ssh_args" \
+   && ! has "attach: amux-up" "$o" \
+   && ! has "continue" "$ssh_args"; then
+  ok "amux-up <machine> <name> starts with flags then attaches (flags routed)"
+else
+  bad "amux-up flag routing failed" "curl: $curl_args | ssh: $ssh_args"
+fi
+
+# Globs put 2fa first and alpha second. Query "2" must resolve row 2 (alpha),
+# not the unique prefix 2fa.
+mkdir -p "$CC_HOME/sessions"
+: > "$CC_HOME/sessions/2fa.env"
+: > "$CC_HOME/sessions/alpha.env"
+: > "$CC_HOME/sessions/beta.env"
+o=$(out_of amux-rename -n 2 renamed)
+if has "alpha" "$o" && ! has "2fa" "$o"; then
+  ok "numeric rename lookup wins over prefix matching"
+else
+  bad "numeric rename lookup selected the wrong session" "$o"
+fi
+
+# Exercise reauth without touching a real credential store or process table.
+REAUTH_ENV="$SANDBOX/reauth.env"
+AMUX_TEST_CC_DIR="$SANDBOX/project"
+AMUX_TEST_REAUTH_TOKEN="sk-ant-oat$(printf '%s' 'selftest-only-value')"
+export AMUX_TEST_CC_DIR AMUX_TEST_REAUTH_TOKEN
+printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$AMUX_TEST_REAUTH_TOKEN" > "$REAUTH_ENV"
+printf 'CC_DIR="%s"\n' "$AMUX_TEST_CC_DIR" > "$CC_HOME/sessions/api.env"
+: > "$TMUX_LOG"
+o=$(AMUX_REAUTH_HOME="$MOCK_HOME" AMUX_REAUTH_ENVFILE="$REAUTH_ENV" AMUX_REAUTH_CLAUDE=claude \
+  amux-reauth -d api 2>&1)
+tmux_args=$(out_of sed -n '1,80p' "$TMUX_LOG")
+if has "=amux-api" "$tmux_args" && has "durable token verified" "$o"; then
+  ok "reauth waits on an exact tmux target"
+else
+  bad "reauth exact-target regression" "out: $o | tmux: $tmux_args"
+fi
+
+printf 'y\n' | run amux-config remove remotebox
+
+# ── 6. renderer parity ───────────────────────────────────────────────────────
+sect "6. Local and remote views come from one renderer"
+FIX='[{"name":"alpha","running":true,"active_model":"claude-opus-5","dir":"/home/u/a","archived":false},
+     {"name":"beta","running":false,"active_model":"claude-sonnet-5","dir":"/home/u/b","archived":false}]'
+loc=$(printf '%s' "$FIX" | AMUX_LS_LABEL=host AMUX_LS_KIND=local  AMUX_LS_COMPACT=1 AMUX_LS_BARE=1 python3 lib/amux-render.py 2>&1)
+rem=$(printf '%s' "$FIX" | AMUX_LS_LABEL=host AMUX_LS_KIND=remote AMUX_LS_COMPACT=1 AMUX_LS_BARE=1 python3 lib/amux-render.py 2>&1)
+if [ "$loc" = "$rem" ] && [ -n "$loc" ]; then
+  ok "identical data renders identically local vs remote"
+else
+  bad "local and remote renders differ" "local=[$loc] remote=[$rem]"
+fi
+
+o=$(printf '%s' "$FIX" | AMUX_LS_BARE=1 AMUX_LS_COMPACT=1 AMUX_LS_ASCII=1 python3 lib/amux-render.py 2>&1)
+if has "*" "$o"; then
+  ok "ASCII mode renders ASCII marks (Windows consoles)"
+else
+  bad "ASCII mode did not produce ASCII marks"
+fi
+
+# Archived sessions hidden by default, shown on request.
+ARCH='[{"name":"old","running":false,"archived":true},{"name":"new","running":false,"archived":false}]'
+vis=$(printf '%s' "$ARCH" | AMUX_LS_BARE=1 AMUX_LS_COMPACT=1 python3 lib/amux-render.py 2>/dev/null)
+if has new "$vis" && ! has old "$vis"; then
+  ok "archived sessions hidden by default"
+else
+  bad "archived filtering wrong"
+fi
+
+# ── 7. the bundled amux ──────────────────────────────────────────────────────
+# Uses the INSTALLED copy in $BINDIR (so install.sh is part of what is tested),
+# with HOME and TMUX_TMPDIR in the sandbox. Nothing is ever started: register
+# writes config only, and the tmux on PATH is the logging mock from 5b.
+sect "7. Bundled amux (dummy session, never launched)"
+want=$(sed -n 's/^CC_VERSION="\(.*\)"$/\1/p' bin/amux | head -1)
+o=$(out_of "$BINDIR/amux" --version)
+if has "amux v$want" "$o"; then ok "installed amux reports v$want"; else bad "amux --version" "$o"; fi
+
+o=$(out_of "$BINDIR/amux" --help)
+if has "Accounts" "$o" || has "--account" "$o"; then ok "amux --help renders"; else bad "amux --help" "$(printf '%s' "$o" | head -5)"; fi
+
+if cmp -s bin/amux-server.py "$BINDIR/amux-server.py"; then
+  ok "amux-server.py installed as a copy beside amux"
+else
+  bad "amux-server.py missing or different in $BINDIR"
+fi
+o=$(out_of python3 "$BINDIR/amux-server.py" --help)
+if has "--bind" "$o"; then ok "amux-server.py --help runs"; else bad "amux-server.py --help" "$(printf '%s' "$o" | tail -3)"; fi
+
+mkdir -p "$SANDBOX/proj"
+o=$(out_of "$BINDIR/amux" register demo --provider claude --dir "$SANDBOX/proj")
+if [ -f "$CC_HOME/sessions/demo.env" ]; then ok "register writes a session config"; else bad "register failed" "$o"; fi
+o=$(out_of "$BINDIR/amux" ls)
+if has "demo" "$o"; then ok "amux ls lists the dummy session"; else bad "amux ls" "$o"; fi
+if has "P:cc:" "$o"; then ok "ls prefixes account + provider (P:cc:)"; else bad "ls prefix missing" "$o"; fi
+
+o=$(out_of "$BINDIR/amux" account demo team)
+if has "not set up" "$o" && ! grep -q 'CC_ACCOUNT=.*team' "$CC_HOME/sessions/demo.env"; then
+  ok "a missing team slot is refused, not silently ignored"
+else
+  bad "account change without a slot was not refused" "$o"
+fi
+mkdir -p "$HOME/.config/claude-code"
+( umask 077; printf 'export CLAUDE_ACCOUNT=team\n' > "$HOME/.config/claude-code/env.team" )
+o=$(out_of "$BINDIR/amux" account demo T)
+if grep -q 'team' "$CC_HOME/sessions/demo.env"; then ok "account change stored once the slot exists (T = team)"; else bad "account change" "$o"; fi
+o=$(out_of "$BINDIR/amux" ls)
+if has "T:cc:" "$o"; then ok "ls shows the new account (T:cc:)"; else bad "ls after account change" "$o"; fi
+
+# lib/ccacct.sh: switching sources the slot and never prints its contents.
+o=$(bash -c '. lib/ccacct.sh; ccacct team; printf "acct=%s\n" "$CLAUDE_ACCOUNT"' 2>&1)
+if has "acct=team" "$o"; then ok "ccacct switches the terminal to a slot"; else bad "ccacct" "$o"; fi
+o=$(bash -c '. lib/ccacct.sh; ccacct team2' 2>&1)
+if has "no team2 slot" "$o"; then ok "ccacct refuses a missing slot"; else bad "ccacct missing slot" "$o"; fi
+
+o=$(out_of "$BINDIR/amux" completion zsh)
+if has "compdef" "$o"; then ok "zsh completion generates"; else bad "zsh completion" "$(printf '%s' "$o" | head -3)"; fi
+
+printf 'y\n' | run "$BINDIR/amux" rm demo
+[ ! -f "$CC_HOME/sessions/demo.env" ] && ok "rm removes the dummy session" || bad "rm left the session behind"
+
+# ── 8. the audit actually catches things ─────────────────────────────────────
+sect "8. Audit catches planted secrets"
+planted="$REPO/.selftest-planted.md"
+# Build the bait at RUNTIME from parts, so these literals never appear in this
+# file. Writing them out plainly would make the audit flag its own test suite —
+# and the tempting fix, exempting tools/selftest by path, would carve a permanent
+# blind spot into the check. A test for a scanner must not weaken the scanner.
+_o1=100; _o2=$((64 + 44)); _o3=219; _o4=90
+printf 'host %s.%s.%s.%s\n' "$_o1" "$_o2" "$_o3" "$_o4" > "$planted"
+printf 'my-%s-01\n' "desk${_o4:0:0}top" >> "$planted"
+printf '%s\n' 'my-desktop-[0-9]+' > "$SANDBOX/deny.txt"
+o=$(AUDIT_DENY_FILE="$SANDBOX/deny.txt" ./tools/audit-clean 2>&1)
+if has "finding" "$o"; then
+  ok "audit catches a planted address and machine name"
+  has "private deny-list match" "$o" && ok "private deny-list pattern fires" || bad "private deny-list did not fire" "$o"
+else
+  bad "audit MISSED a planted secret"
+fi
+rm -f "$planted"
+if ./tools/audit-clean >/dev/null 2>&1; then
+  ok "audit passes on the clean tree"
+else
+  bad "audit fails on the clean tree"
+fi
+
+# ── verdict ──────────────────────────────────────────────────────────────────
+printf '\n%s%d passed, %d failed%s\n' "$BOLD" "$PASS" "$FAIL" "$RESET"
+printf '%s(sandbox %s removed; your real ~/.amux was never touched)%s\n' "$DIM" "$SANDBOX" "$RESET"
+[ "$FAIL" = 0 ] || exit 1

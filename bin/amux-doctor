@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# amux-doctor — tell you honestly what this machine can and cannot do with amux.
+#
+# The question is never "is tmux installed". It is "do the specific things amux
+# needs actually work here" — which on Windows is a real question, because MSYS2's
+# tmux and Scoop's psmux are different implementations, not the Linux one. So this
+# RUNS the calls amux depends on against a throwaway session and reports what
+# happened, instead of inferring capability from a version string.
+#
+# It checks five things:
+#   1. Core tools      bash, tmux (and the exact tmux calls amux makes), python3, curl
+#   2. amux itself     the CLI, the server, whether this box serves
+#   3. Claude Code     installed, and HOW it authenticates (this decides Chrome support)
+#   4. Remote boxes    every configured box answers and its token is accepted
+#   5. PATH            the install dir is actually on your PATH
+#
+# Usage:
+#   amux-doctor              full report
+#   amux-doctor --quiet      only problems
+#   amux-doctor --local      skip the remote-box checks (offline / no network)
+#
+# Exit codes:  0 = everything works · 1 = something is broken · 2 = works with caveats
+set -uo pipefail
+
+_here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$_here/../lib/amux-common.sh" ]; then
+  . "$_here/../lib/amux-common.sh"
+else
+  _real=$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  case "$_real" in /*) ;; *) _real="$_here/$_real" ;; esac
+  _libdir=$(cd "$(dirname "$_real")/../lib" 2>/dev/null && pwd)
+  [ -n "${_libdir:-}" ] && [ -f "$_libdir/amux-common.sh" ] \
+    || { echo "amux-doctor: cannot find lib/amux-common.sh" >&2; exit 1; }
+  . "$_libdir/amux-common.sh"
+fi
+
+QUIET=0 SKIP_REMOTE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q|--quiet)  QUIET=1 ;;
+    --local)     SKIP_REMOTE=1 ;;
+    -h|--help)   amux_self_help "$0"; exit 0 ;;
+    *)           amux_die "unknown option: $1 (see -h)" ;;
+  esac
+  shift
+done
+
+FAILED=0 CAVEATS=0
+section() { [ "$QUIET" = 1 ] && return 0; printf '\n%s%s%s\n' "$BOLD" "$1" "$RESET"; }
+good()    { [ "$QUIET" = 1 ] && return 0; amux_ok "$1"; }
+bad()     { FAILED=1; amux_bad "$1"; }
+caveat()  { CAVEATS=1; amux_hmm "$1"; }
+note()    { [ "$QUIET" = 1 ] && return 0; printf '      %s%s%s\n' "$DIM" "$1" "$RESET"; }
+
+PLATFORM=$(amux_platform)
+
+# ── 1. platform ──────────────────────────────────────────────────────────────
+section "Machine"
+[ "$QUIET" = 1 ] || {
+  printf '  %-14s %s\n' "platform" "$(amux_platform_label)"
+  printf '  %-14s %s\n' "package mgr" "$(amux_pkgmgr)"
+  printf '  %-14s %s\n' "downloader" "$(amux_downloader)"
+  printf '  %-14s %s\n' "shell" "${BASH_VERSION:-unknown}"
+}
+
+# ── 2. core tools ────────────────────────────────────────────────────────────
+section "Core tools"
+
+if amux_have python3 || amux_have python; then
+  good "python3 ($($(amux_python) --version 2>&1))"
+else
+  bad "python3 missing — amux's server and these tools need it"
+  note "install: $(amux_pkg_install_cmd python3)"
+fi
+
+if amux_have curl; then good "curl"
+elif amux_have wget; then caveat "curl missing (wget present — most things work)"
+else bad "no curl or wget — cannot talk to any amux server"
+fi
+
+# tmux: the real test. On Windows this is where a tier is decided.
+if amux_have tmux; then
+  good "tmux present ($(tmux -V 2>/dev/null || echo 'version unknown'))"
+  probe=$(amux_probe_tmux 2>/dev/null)
+  probe_rc=$?
+  failures=$(printf '%s\n' "$probe" | awk '/^FAIL/ {print $2}' | tr '\n' ' ')
+  if [ "$probe_rc" = 0 ]; then
+    good "tmux supports every call amux makes"
+    note "verified: new-session has-session list-sessions send-keys capture-pane set-environment"
+  else
+    bad "tmux is missing calls amux needs: $failures"
+    case "$PLATFORM" in
+      msys|cygwin)
+        note "On Windows, amux needs MSYS2's real tmux (pacman -S tmux)."
+        note "Reimplementations such as psmux may not support capture-pane." ;;
+      *) note "This tmux build is unusual — try your package manager's tmux." ;;
+    esac
+    note "You can still DRIVE other machines from here (amux-remote, amux-all, ccjump)."
+  fi
+else
+  case "$PLATFORM" in
+    msys|cygwin)
+      caveat "tmux not installed — this machine cannot run sessions LOCALLY"
+      note "That is normal for Git Bash. You can still drive other machines:"
+      note "  amux-config add <box> --host <address>"
+      note "To run sessions here too, install MSYS2 and: pacman -S tmux" ;;
+    *)
+      bad "tmux not installed — amux cannot run sessions here"
+      note "install: $(amux_pkg_install_cmd tmux)" ;;
+  esac
+fi
+
+# ── 3. amux itself ───────────────────────────────────────────────────────────
+section "amux"
+
+if amux_have amux; then
+  good "amux CLI on PATH ($(command -v amux))"
+else
+  bad "amux not on PATH"
+  note "install it: setup/bootstrap"
+fi
+
+# This repo bundles a modified amux. A different amux earlier on PATH (an
+# upstream install, a Homebrew copy) would silently run instead — and its
+# amux-remote lacks the features the companions here rely on. Ask the binaries
+# what they are rather than guessing from file type.
+if amux_have amux; then
+  _bundled=$(sed -n 's/^CC_VERSION="\(.*\)"$/\1/p' "$AMUX_LIB_DIR/../bin/amux" 2>/dev/null | head -1)
+  _onpath=$(amux --version 2>/dev/null | sed -n 's/^amux v//p' | head -1)
+  if [ -n "$_bundled" ] && [ "$_onpath" = "$_bundled" ]; then
+    good "amux on PATH is this repo's build (v$_onpath)"
+  else
+    caveat "amux on PATH is v${_onpath:-unknown}, this checkout bundles v${_bundled:-unknown}"
+    note "fix: re-run ./install.sh, and make sure ~/.local/bin comes first on PATH"
+  fi
+fi
+if amux_have amux-remote; then
+  if amux-remote --help 2>&1 | head -3 | grep -q "another machine's amux server"; then
+    good "amux-remote is this repo's version"
+  else
+    caveat "amux-remote on your PATH is not this repo's"
+    note "fix: re-run ./install.sh from this checkout"
+  fi
+fi
+
+TOKFILE="$(amux_home)/auth_token"
+LOCAL_PORT="${AMUX_LOCAL_PORT:-8822}"
+if [ -s "$TOKFILE" ]; then
+  good "this machine has a server token ($TOKFILE)"
+  code=$(AMUX_URL="https://127.0.0.1:$LOCAL_PORT" \
+         AMUX_TOKEN="$(tr -d '\r\n' < "$TOKFILE")" \
+         AMUX_TIMEOUT=5 amux_api_code /api/sessions)
+  if [ "$code" = 200 ]; then
+    good "local amux server answering on 127.0.0.1:$LOCAL_PORT"
+  else
+    caveat "local amux server not answering on 127.0.0.1:$LOCAL_PORT (HTTP $code)"
+    note "start it:   amux serve $LOCAL_PORT"
+    note "persist it: setup/serve-install"
+  fi
+else
+  caveat "no local server token — other machines cannot reach this one"
+  note "that is fine if you only DRIVE other machines from here"
+  note "to serve: setup/serve-install"
+fi
+
+# ── 4. Claude Code + how it authenticates ────────────────────────────────────
+# This section decides whether Chrome integration can work, which is the single
+# most confusing thing about running agents on more than one machine.
+section "Claude Code"
+
+if amux_have claude; then
+  good "claude on PATH ($(claude --version 2>/dev/null | head -1 || echo 'version unknown'))"
+else
+  bad "claude not installed — amux has no agent to run"
+  note "install: curl -fsSL https://claude.ai/install.sh | bash   (see docs/auth.md)"
+fi
+
+# Which credential is in play? Presence only — never the value.
+HAS_ENV_TOKEN=0 HAS_STORED_LOGIN=0
+for f in "$HOME/.config/claude-code/env" "$HOME/.claude/.env"; do
+  [ -f "$f" ] && grep -q 'CLAUDE_CODE_OAUTH_TOKEN' "$f" 2>/dev/null && HAS_ENV_TOKEN=1
+done
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && HAS_ENV_TOKEN=1
+[ -f "$HOME/.claude/.credentials.json" ] && HAS_STORED_LOGIN=1
+if amux_have security && security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
+  HAS_STORED_LOGIN=1
+fi
+
+if [ "$HAS_ENV_TOKEN" = 1 ] && [ "$HAS_STORED_LOGIN" = 1 ]; then
+  caveat "BOTH a long-lived token and a browser login are present"
+  note "Interactive sessions prefer the stored login. When it expires (~8h) every"
+  note "session parks at /login even though the token is fine. Pick one:"
+  note "  keep the token  ->  claude auth logout"
+  note "  keep /login     ->  remove CLAUDE_CODE_OAUTH_TOKEN from your shell env"
+  note "See docs/auth.md."
+elif [ "$HAS_ENV_TOKEN" = 1 ]; then
+  good "auth: long-lived token (CLAUDE_CODE_OAUTH_TOKEN)"
+  note "Good for headless/SSH boxes. Chrome integration is OFF in this mode."
+elif [ "$HAS_STORED_LOGIN" = 1 ]; then
+  good "auth: interactive login (/login)"
+  if [ "$PLATFORM" = wsl ]; then
+    note "Chrome integration is not supported in WSL, so it stays off here."
+  else
+    note "Chrome integration is available in this mode (claude --chrome)."
+  fi
+else
+  caveat "no Claude credential found — sessions will stop at /login"
+  note "run 'claude' once and sign in, or set up a token (docs/auth.md)"
+fi
+
+# ── 5. PATH ──────────────────────────────────────────────────────────────────
+section "PATH"
+BIN="${BINDIR:-$HOME/.local/bin}"
+case ":$PATH:" in
+  *":$BIN:"*) good "$BIN is on your PATH" ;;
+  *)          caveat "$BIN is NOT on your PATH — installed commands will not be found"
+              note "add to your shell rc:  export PATH=\"$BIN:\$PATH\"" ;;
+esac
+
+# ── 6. remote boxes ──────────────────────────────────────────────────────────
+if [ "$SKIP_REMOTE" = 0 ]; then
+  section "Configured machines"
+  boxes=$(amux_list_boxes)
+  if [ -z "$boxes" ]; then
+    [ "$QUIET" = 1 ] || {
+      printf '  %s(none configured)%s\n' "$DIM" "$RESET"
+      note "add one: amux-config add <name> --host <address>"
+    }
+  else
+    for b in $boxes; do
+      code=$( amux_load_box "$b" >/dev/null 2>&1 && AMUX_TIMEOUT=8 amux_api_code /api/sessions )
+      case "$code" in
+        200)     good "$b — reachable, token accepted" ;;
+        401|403) bad  "$b — reachable but token rejected (HTTP $code)"
+                 note "refresh: amux-config token $b" ;;
+        000|'')  bad  "$b — unreachable"
+                 note "is 'amux serve' running there? is the port open to you?" ;;
+        *)       caveat "$b — HTTP $code" ;;
+      esac
+    done
+  fi
+fi
+
+# ── verdict ──────────────────────────────────────────────────────────────────
+printf '\n'
+if [ "$FAILED" = 1 ]; then
+  printf '%sSomething is broken.%s Fix the ✗ lines above.\n' "$RED" "$RESET"
+  exit 1
+elif [ "$CAVEATS" = 1 ]; then
+  printf '%sWorks, with caveats.%s The ! lines are worth reading.\n' "$YELLOW" "$RESET"
+  exit 2
+else
+  printf '%sAll good.%s\n' "$GREEN" "$RESET"
+  exit 0
+fi

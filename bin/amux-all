@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# amux-all — global view of amux sessions across all your machines (local + configured boxes).
+# Every box is shown compactly by default (like `amux ls -c`); each box in
+# ~/.amux/remotes/<box>.env is queried via `amux-remote <box>`, all in parallel.
+# Unreachable boxes are marked, not hung on (perl alarm bounds each call).
+#
+# Only boxes that HAVE sessions are shown, busiest first (running, then total);
+# empty and offline boxes are folded into one summary line at the bottom.
+#
+# Usage (amux -A <flags> and amux -ALL <flags> are the same command):
+#   amux -A                 boxes with sessions, compact grid, busiest first;
+#                           empty + offline boxes listed by name on one line at the bottom
+#   amux -A --showall       also give every empty + offline box its own block
+#   amux -A -v              verbose rows (path, model, last line) instead of the grid
+#   amux -A -p              pick a session from every box and attach (== amux pick -A)
+#   amux -A -h              this help
+#   Flags combine:   amux -A -v --showall
+#   Long forms:      --show-all · --verbose/--full · --pick · --compact (-c, the default)
+#
+# Related:  amux ls [-c]         this box only
+#           amux -H <box> ls     one other box
+#           amux pick [<box>]    interactive picker for this box / one box
+set -uo pipefail
+
+VERB=0 ALL=0
+for a in "$@"; do
+  case "$a" in
+    -v|--verbose|-f|--full) VERB=1 ;;
+    -c|--compact)           VERB=0 ;;
+    --showall|--show-all)   ALL=1 ;;
+    -p|--pick)              c="$HOME/.local/bin/ccjump"; [ -x "$c" ] || c=ccjump; exec "$c" -A ;;
+    -h|--help)              awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0"; exit 0 ;;
+    *) echo "amux-all: unknown option '$a' (see amux-all -h)" >&2; exit 2 ;;
+  esac
+done
+
+# Remote ls flags: --bare drops the per-command banner (amux-all prints its own box
+# header below); -c makes each remote a compact grid to match the local view.
+RFLAGS="--bare"; [ "$VERB" = 0 ] && RFLAGS="-c --bare"
+# Keep captured (piped) remote grids fitting the real terminal width, and colored
+# when we're on a real terminal (amux-remote otherwise strips color once captured).
+export COLUMNS="${COLUMNS:-$(tput cols 2>/dev/null || echo 100)}"
+[ -t 1 ] && export AMUX_FORCE_COLOR=1
+
+TO=15   # per-box seconds
+run_to(){ local s=$1; shift; perl -e 'my $t=shift; alarm $t; exec @ARGV or exit 127' "$s" "$@"; }
+strip(){ sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g'; }
+hr(){ printf '%s\n' "────────────────────────────────────────────────────────"; }
+
+here=$(hostname -s 2>/dev/null || hostname)
+work=$(mktemp -d "${TMPDIR:-/tmp}/amux-all.XXXXXX") || exit 1
+trap 'rm -rf "$work"' EXIT
+
+# ---- fetch every box in parallel: $work/<box>.out + .rc ----
+( { if [ "$VERB" = 1 ]; then amux ls; else amux ls -c; fi; } >"$work/@local.out" 2>/dev/null
+  echo $? >"$work/@local.rc" ) &
+
+boxes=()
+remdir="$HOME/.amux/remotes"
+for f in "$remdir"/*.env; do
+  [ -e "$f" ] || continue
+  box=$(basename "$f" .env)
+  # this box is already shown as (local); its own remote entry would be a duplicate
+  { [ "$box" = "$here" ] || [ "${AMUX_HOST_PREFIX:-}$box" = "$here" ]; } && continue
+  boxes+=("$box")
+  ( run_to "$TO" amux-remote "$box" ls $RFLAGS >"$work/$box.out" 2>&1; echo $? >"$work/$box.rc" ) &
+done
+wait
+
+# ---- classify: prints "<running> <total>", or "offline" ----
+count(){ # $1 = box key
+  local out rc; out=$(strip <"$work/$1.out"); rc=$(cat "$work/$1.rc" 2>/dev/null || echo 1)
+  if [ "$1" = "@local" ]; then
+    [ "$rc" -eq 0 ] || { echo offline; return; }
+  elif [ "$rc" -ne 0 ] || [ -z "$out" ] \
+     || printf '%s' "$out" | grep -qiE 'could not parse|refused|timed out|no route|could not connect|unauthor'; then
+    echo offline; return
+  fi
+  printf '%s\n' "$out" | grep -v ' sessions · ' | grep -viE '^[[:space:]]*no sessions' \
+  | if [ "$VERB" = 1 ]; then
+      # local rows " 3* name…", remote rows " * name…" / "   name…"
+      awk 'NF{t++} /^[[:space:]]*[0-9]*\*/{r++} END{print r+0, t+0}'
+    else
+      awk '{r+=gsub(/●/,"");t+=gsub(/○/,"")} END{print r+0, r+t}'
+    fi
+}
+
+strip_hdr(){ # drop local's own "amux · N sessions" banner + the blank line after it
+  # match on an ANSI-stripped copy: the local block is coloured too (AMUX_FORCE_COLOR)
+  awk '{t=$0; gsub(/\033\[[0-9;]*[a-zA-Z]/,"",t)} NR<=2 && (t ~ / sessions · / || t ~ /^[[:space:]]*$/){next} {print}'
+}
+show(){ # $1 box key, $2 label, $3 running, $4 total
+  hr; printf '  ▸ %s  ·  %s session%s · %s ● running\n' "$2" "$4" "$([ "$4" = 1 ] || echo s)" "$3"; hr
+  strip_hdr <"$work/$1.out" | sed 's/^/  /'
+}
+label(){ if [ "$1" = "@local" ]; then echo "$here (local)"; else echo "$1"; fi; }
+
+busy=() empty=() offline=()
+for key in "@local" "${boxes[@]+"${boxes[@]}"}"; do
+  c=$(count "$key")
+  if [ "$c" = offline ]; then offline+=("$key"); continue; fi
+  set -- $c
+  if [ "$2" -gt 0 ]; then busy+=("$1 $2 $key"); else empty+=("$key"); fi
+done
+
+# busiest first: running desc, total desc, then name
+if [ "${#busy[@]}" -gt 0 ]; then
+  while read -r r t key; do show "$key" "$(label "$key")" "$r" "$t"
+  done < <(printf '%s\n' "${busy[@]}" | sort -k1,1nr -k2,2nr -k3,3)
+else
+  echo "  (no sessions on any reachable box)"
+fi
+
+names(){ local k s=""; for k in "$@"; do s+="${s:+, }$(label "$k")"; done; printf '%s' "$s"; }
+nhid=$(( ${#empty[@]} + ${#offline[@]} ))
+echo
+if [ "$ALL" = 1 ]; then
+  for key in "${empty[@]+"${empty[@]}"}";     do hr; printf '  ▸ %s  ·  no sessions\n' "$(label "$key")"; done
+  for key in "${offline[@]+"${offline[@]}"}"; do hr; printf '  ▸ %s  ·  [unreachable / offline — no response in %ss]\n' "$(label "$key")" "$TO"; done
+  [ "$nhid" -gt 0 ] && hr
+else
+  [ "${#empty[@]}" -gt 0 ]   && printf '  empty:   %s\n' "$(names "${empty[@]}")"
+  [ "${#offline[@]}" -gt 0 ] && printf '  offline: %s\n' "$(names "${offline[@]}")"
+  [ "$nhid" -gt 0 ] && printf '  (amux -A --showall lists them in full · amux pick -A to choose a session)\n'
+fi
+[ "${#boxes[@]}" -gt 0 ] || echo "  (no boxes configured — add ~/.amux/remotes/<box>.env)"
+exit 0

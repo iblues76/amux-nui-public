@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# amux-convos — list (and optionally resume) the past CONVERSATIONS of an amux session,
+# newest first, each with a snippet of the last thing you said so you can tell them apart.
+# Solves "I have several saved conversations for this session — which one do I resume?"
+#
+# Usage:
+#   amux-convos <session>              list conversations, newest first
+#   amux-convos <session> -n N         only the top N (also: --top N)
+#   amux-convos <session> --less       page through with less
+#   amux-convos <session> --full       don't truncate the snippet
+#   amux-convos <session> --resume N   resume the Nth listed conversation in that session
+#   amux-convos <session> --cmd N      just print the resume command for #N (don't run it)
+#
+# An amux session works in a directory; its conversations are the agent's transcripts in
+# ~/.claude/projects/<dir-mangled>/*.jsonl. This never modifies them.
+set -uo pipefail
+# PATH covers the common install dirs across macOS (Homebrew intel+ARM), Linux,
+# and MSYS2/Git Bash, so these work when launched from a GUI or a cron/launchd
+# context that does not source your shell rc.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/mingw64/bin:/usr/bin:/bin:$PATH"
+
+die(){ echo "amux-convos: $*" >&2; exit 1; }
+
+name="" ; top=0 ; use_less=0 ; full=0 ; resume_idx="" ; cmd_idx=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--top)  shift; top=${1:-0} ;;
+    --less)    use_less=1 ;;
+    --full)    full=1 ;;
+    --resume)  shift; resume_idx=${1:-} ;;
+    --cmd)     shift; cmd_idx=${1:-} ;;
+    -h|--help) awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
+    -*)        die "unknown flag: $1 (see -h)" ;;
+    *)         [ -z "$name" ] && name="$1" || die "unexpected argument: $1" ;;
+  esac
+  shift
+done
+[ -n "$name" ] || die "usage: amux-convos <session> [-n N] [--less] [--resume N]  (-h for help)"
+
+# resolve the session's working directory
+envf="${CC_HOME:-$HOME/.amux}/sessions/$name.env"
+[ -f "$envf" ] || die "no such amux session: '$name' (see 'amux ls')"
+ccdir=$( . "$envf" >/dev/null 2>&1; printf %s "${CC_DIR:-}" )
+[ -n "$ccdir" ] || die "session '$name' has no working directory recorded"
+
+# map the directory to its Claude Code project dir (Claude replaces / . _ with -)
+proj="$HOME/.claude/projects/$(printf %s "$ccdir" | sed 's/[/._]/-/g')"
+[ -d "$proj" ] || proj=$(ls -d "$HOME"/.claude/projects/*"$(basename "$ccdir")" 2>/dev/null | head -1)
+{ [ -n "$proj" ] && [ -d "$proj" ]; } || die "no conversations found for '$name' ($ccdir)"
+
+# newest-first list of conversation files (top-level only; ignores backup subdirs)
+uuid_at() { ls -t "$proj"/*.jsonl 2>/dev/null | sed -n "${1}p" | while read -r f; do basename "$f" .jsonl; done; }
+
+# --resume N / --cmd N: resolve the Nth newest conversation
+if [ -n "$resume_idx" ] || [ -n "$cmd_idx" ]; then
+  idx=${resume_idx:-$cmd_idx}
+  u=$(uuid_at "$idx"); [ -n "$u" ] || die "no conversation #$idx for '$name'"
+  if [ -n "$cmd_idx" ]; then echo "amux start $name --resume $u"; exit 0; fi
+  echo "resuming '$name' conversation #$idx ($u)…"
+  amux stop "$name" >/dev/null 2>&1; sleep 1
+  exec amux start "$name" --resume "$u"
+fi
+
+render() {
+python3 - "$proj" "$top" "$full" <<'PY'
+import sys, os, glob, json, datetime
+proj, top, full = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+files = sorted(glob.glob(os.path.join(proj, "*.jsonl")), key=os.path.getmtime, reverse=True)
+if top > 0: files = files[:top]
+def summarize(f):
+    last_user=None; nmsg=0; last_ts=None; first_user=None
+    try:
+        for line in open(f, errors="ignore"):
+            line=line.strip()
+            if not line: continue
+            try: o=json.loads(line)
+            except: continue
+            ts=o.get("timestamp")
+            if ts: last_ts=ts
+            m=o.get("message") or {}
+            role=m.get("role") or o.get("type")
+            if role in ("user","assistant"): nmsg+=1
+            if role=="user":
+                c=m.get("content"); t=None
+                if isinstance(c,list):
+                    for p in c:
+                        if isinstance(p,dict) and p.get("type")=="text": t=p.get("text")
+                elif isinstance(c,str): t=c
+                if t:
+                    if first_user is None: first_user=t
+                    last_user=t
+    except: pass
+    return first_user, last_user, nmsg, last_ts
+if not files:
+    print("  (no conversations)"); sys.exit(0)
+for i,f in enumerate(files,1):
+    uuid=os.path.basename(f)[:-6]
+    fu, lu, n, ts = summarize(f)
+    when=""
+    if ts:
+        try: when=datetime.datetime.fromisoformat(ts.replace("Z","+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+        except: when=ts[:16]
+    snip=(lu or fu or "").strip().replace("\n"," ")
+    if not full and len(snip)>80: snip=snip[:80]+"…"
+    print(f"{i:>2}. {when}   {n:>4} msgs   {uuid}")
+    if snip: print(f"     “{snip}”")
+PY
+}
+
+if [ "$use_less" = 1 ]; then
+  render | less -R
+else
+  render
+  echo
+  echo "resume:  amux-convos $name --resume <N>     (or:  amux start $name --resume <UUID>)"
+fi

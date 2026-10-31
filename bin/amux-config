@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# amux-config — configure and reconfigure the machines ("boxes") you drive with amux.
+#
+# amux itself is local-only: `amux ls` shows the box you are sitting on. To reach
+# ANOTHER machine, that machine runs `amux serve` and you keep a small config file
+# describing how to reach it:
+#
+#     ~/.amux/remotes/<box>.env      mode 600, one per machine
+#         AMUX_URL       https://<host>:8822     the server's base URL
+#         AMUX_TOKEN     <token>                 from that box's ~/.amux/auth_token
+#         AMUX_SSH_HOST  <host or ssh alias>     used by `attach` and by `add --from-ssh`
+#         AMUX_SSH_USER  <user>                  optional; defaults to your local $USER
+#
+# This command creates, inspects, tests, edits, and removes those files so you
+# never have to hand-write one — and so the token lands in a mode-600 file
+# without ever passing through your shell history, your terminal, or `ps`.
+#
+# Usage:
+#   amux-config                          show this machine's setup + every box
+#   amux-config add <box>                add a box (prompts for what it needs)
+#   amux-config add <box> --host <h> [--port N] [--ssh-host <h>] [--from-ssh|--token-stdin]
+#   amux-config list                     list configured boxes
+#   amux-config show <box>               show a box's settings (token NEVER printed)
+#   amux-config test <box> | --all       prove a box answers and the token works
+#   amux-config edit <box>               open the box's file in $EDITOR
+#   amux-config rename <old> <new>       rename a box
+#   amux-config remove <box>             delete a box's config
+#   amux-config token <box>              re-fetch just the token (rotation)
+#
+# Token handling — the whole reason this exists:
+#   --from-ssh      (default) read the token over SSH from the box's ~/.amux/auth_token.
+#                   Never echoed; piped straight into the mode-600 config.
+#   --token-stdin   read the token from STDIN, for when SSH isn't available:
+#                       amux-config add mybox --host h --token-stdin < token.txt
+#   There is deliberately NO --token flag: a token on argv is visible to every
+#   user on the machine via `ps`, and lands in your shell history forever.
+#
+# Examples:
+#   amux-config add laptop  --host 192.0.2.10         # VPN / tailnet address
+#   amux-config add desktop --host desktop.local      # LAN mDNS name
+#   amux-config add lab     --host 127.0.0.1 --port 9000   # through an SSH tunnel
+#   amux-config test --all
+set -uo pipefail
+
+_here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Works both from a git checkout (lib/ is a sibling of bin/) and from an
+# install.sh symlink in ~/.local/bin (resolve the link first).
+if [ -f "$_here/../lib/amux-common.sh" ]; then
+  . "$_here/../lib/amux-common.sh"
+else
+  _real=$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  case "$_real" in /*) ;; *) _real="$_here/$_real" ;; esac
+  _libdir=$(cd "$(dirname "$_real")/../lib" 2>/dev/null && pwd)
+  [ -n "${_libdir:-}" ] && [ -f "$_libdir/amux-common.sh" ] \
+    || { echo "amux-config: cannot find lib/amux-common.sh" >&2; exit 1; }
+  . "$_libdir/amux-common.sh"
+fi
+
+case "${1:-}" in -h|--help) amux_self_help "$0"; exit 0 ;; esac
+
+DEFAULT_PORT=8822
+
+# ── validation ───────────────────────────────────────────────────────────────
+# A box name becomes a filename and a shell word; keep it boring on purpose.
+valid_box_name() {
+  case "$1" in
+    ''|.|..)            return 1 ;;
+    *[!A-Za-z0-9._-]*)  return 1 ;;
+    -*)                 return 1 ;;   # would be read as a flag
+    *)                  return 0 ;;
+  esac
+}
+
+require_box_name() {
+  valid_box_name "$1" || amux_die "invalid box name '$1' (use letters, digits, . _ -)"
+}
+
+# ── token acquisition ────────────────────────────────────────────────────────
+# Both paths end the same way: the token is in a variable, gets piped into a
+# mode-600 file, and is never printed. Callers get only prefix+length back.
+
+fetch_token_via_ssh() { # $1 = ssh target -> token on STDOUT (captured, never displayed)
+  local target="$1"
+  # BatchMode so a missing key fails fast instead of hanging on a password prompt
+  # inside a script. -T: no pty needed, and no tty means no echo of anything.
+  ssh -T -o BatchMode=yes -o ConnectTimeout=10 "$target" \
+      'cat ~/.amux/auth_token 2>/dev/null' 2>/dev/null | tr -d '\r\n'
+}
+
+# ── writing a box config ─────────────────────────────────────────────────────
+write_box_env() { # $1 box  $2 url  $3 ssh_host  $4 ssh_user; token on STDIN
+  local box="$1" url="$2" ssh_host="$3" ssh_user="$4" tok
+  tok=$(cat)
+  {
+    printf '# amux box config — written by amux-config on %s\n' "$(date +%Y-%m-%d)"
+    printf '# Mode 600 on purpose: AMUX_TOKEN grants full control of that box'"'"'s sessions.\n'
+    printf 'AMUX_URL=%s\n' "$url"
+    printf 'AMUX_TOKEN=%s\n' "$tok"
+    [ -n "$ssh_host" ] && printf 'AMUX_SSH_HOST=%s\n' "$ssh_host"
+    [ -n "$ssh_user" ] && printf 'AMUX_SSH_USER=%s\n' "$ssh_user"
+  } | amux_write_secret_file "$(amux_box_env_path "$box")"
+}
+
+# ── subcommands ──────────────────────────────────────────────────────────────
+
+cmd_list() {
+  local d; d=$(amux_remotes_dir)
+  if [ ! -d "$d" ] || ! ls "$d"/*.env >/dev/null 2>&1; then
+    printf '%sno boxes configured%s\n' "$DIM" "$RESET"
+    printf '  add one:  amux-config add <name> --host <address>\n'
+    return 0
+  fi
+  printf '%sConfigured boxes%s  %s(%s)%s\n' "$BOLD" "$RESET" "$DIM" "$d" "$RESET"
+  local f box url
+  for f in "$d"/*.env; do
+    box=$(basename "$f" .env)
+    url=$(sed -n 's/^AMUX_URL=//p' "$f" | head -1)
+    printf '  %s%-16s%s %s\n' "$CYAN" "$box" "$RESET" "${url:-<no URL>}"
+  done
+}
+
+cmd_show() {
+  local box="${1:-}"; [ -n "$box" ] || amux_die "usage: amux-config show <box>"
+  amux_box_exists "$box" || amux_die "no such box '$box' (configured: $(amux_list_boxes))"
+  local f; f=$(amux_box_env_path "$box")
+  printf '%s%s%s  %s%s%s\n' "$BOLD" "$box" "$RESET" "$DIM" "$f" "$RESET"
+  # Print every key EXCEPT the token's value. The token is summarized only.
+  # -E (extended regex): BSD/macOS sed does not accept \| alternation in basic REs,
+  # so the basic-RE form silently matches nothing and prints an empty report.
+  sed -nE 's/^(AMUX_URL|AMUX_SSH_HOST|AMUX_SSH_USER)=/  \1 = /p' "$f"
+  local tok; tok=$(sed -n 's/^AMUX_TOKEN=//p' "$f" | head -1)
+  printf '  AMUX_TOKEN = %s\n' "$(printf '%s' "$tok" | amux_secret_summary)"
+  local perm; perm=$(ls -l "$f" | cut -c1-10)
+  if [ "$perm" = "-rw-------" ]; then
+    printf '  %smode%s = %s %s(correct)%s\n' "$DIM" "$RESET" "$perm" "$GREEN" "$RESET"
+  else
+    printf '  %smode%s = %s %s(should be 600 — run: chmod 600 %s)%s\n' \
+      "$DIM" "$RESET" "$perm" "$YELLOW" "$f" "$RESET"
+  fi
+}
+
+cmd_add() {
+  local box="" host="" port="$DEFAULT_PORT" ssh_host="" ssh_user="" scheme="https"
+  local mode="from-ssh" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host)       host="${2:-}"; shift ;;
+      --port)       port="${2:-}"; shift ;;
+      --ssh-host)   ssh_host="${2:-}"; shift ;;
+      --ssh-user)   ssh_user="${2:-}"; shift ;;
+      --http)       scheme="http" ;;
+      --from-ssh)   mode="from-ssh" ;;
+      --token-stdin) mode="stdin" ;;
+      --force|-f)   force=1 ;;
+      --token)      amux_die "--token is not supported on purpose: a token on argv is visible in \`ps\` and saved to shell history. Use --token-stdin (pipe it) or --from-ssh." ;;
+      -*)           amux_die "unknown option: $1 (see -h)" ;;
+      *)            [ -z "$box" ] && box="$1" || amux_die "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$box" ] || amux_die "usage: amux-config add <box> [--host <address>]"
+  require_box_name "$box"
+
+  if amux_box_exists "$box" && [ "$force" = 0 ]; then
+    amux_die "box '$box' already exists. Reconfigure it with --force, or: amux-config edit $box"
+  fi
+
+  # Interactive fill-in for anything not given on the command line. Only prompts
+  # when there IS a terminal, so scripted use fails loudly instead of hanging.
+  if [ -z "$host" ]; then
+    [ -t 0 ] || amux_die "--host is required when not running interactively"
+    printf 'Address of %s%s%s (tailnet IP, LAN name, or hostname): ' "$CYAN" "$box" "$RESET"
+    read -r host
+    [ -n "$host" ] || amux_die "no address given"
+  fi
+  [ -n "$ssh_host" ] || ssh_host="$host"
+
+  local url="$scheme://$host:$port"
+
+  # --- get the token, without ever displaying it -----------------------------
+  local tok=""
+  case "$mode" in
+    stdin)
+      [ -t 0 ] && amux_die "--token-stdin expects the token piped in, e.g.: amux-config add $box --host $host --token-stdin < token.txt"
+      tok=$(cat | tr -d '\r\n')
+      ;;
+    from-ssh)
+      local target="$ssh_host"
+      [ -n "$ssh_user" ] && target="$ssh_user@$ssh_host"
+      amux_info "reading the token from $target:~/.amux/auth_token over SSH…"
+      tok=$(fetch_token_via_ssh "$target")
+      if [ -z "$tok" ]; then
+        printf '\n%scould not read the token over SSH.%s\n' "$YELLOW" "$RESET" >&2
+        cat >&2 <<EOF
+
+  That box needs to be running amux and reachable by SSH. Check:
+    1. ssh $target             does SSH itself work (key-based, no password)?
+    2. On that box:            ls -l ~/.amux/auth_token
+       If it is missing, start the server once there:  amux serve $port
+
+  No SSH? Get the token onto this machine some other way and pipe it in:
+    amux-config add $box --host $host --token-stdin < token.txt
+
+EOF
+        exit 1
+      fi
+      ;;
+  esac
+  [ -n "$tok" ] || amux_die "got an empty token — refusing to write a broken config"
+
+  printf '%s' "$tok" | write_box_env "$box" "$url" "$ssh_host" "$ssh_user"
+  amux_ok "wrote $(amux_box_env_path "$box") (mode 600)"
+  printf '    URL   %s\n' "$url"
+  printf '    token %s\n' "$(printf '%s' "$tok" | amux_secret_summary)"
+  unset tok
+
+  printf '\n'
+  cmd_test "$box"
+}
+
+cmd_token() { # re-fetch only the token, preserving every other setting (rotation)
+  local box="${1:-}"; [ -n "$box" ] || amux_die "usage: amux-config token <box>"
+  amux_box_exists "$box" || amux_die "no such box '$box'"
+  local f; f=$(amux_box_env_path "$box")
+  local url ssh_host ssh_user
+  url=$(sed -n 's/^AMUX_URL=//p' "$f" | head -1)
+  ssh_host=$(sed -n 's/^AMUX_SSH_HOST=//p' "$f" | head -1)
+  ssh_user=$(sed -n 's/^AMUX_SSH_USER=//p' "$f" | head -1)
+  local target="$ssh_host"; [ -n "$ssh_user" ] && target="$ssh_user@$ssh_host"
+  [ -n "$target" ] || amux_die "box '$box' has no AMUX_SSH_HOST to fetch a token from"
+
+  amux_info "re-reading the token from $target…"
+  local tok; tok=$(fetch_token_via_ssh "$target")
+  [ -n "$tok" ] || amux_die "could not read a token from $target"
+  printf '%s' "$tok" | write_box_env "$box" "$url" "$ssh_host" "$ssh_user"
+  amux_ok "token refreshed: $(printf '%s' "$tok" | amux_secret_summary)"
+  unset tok
+  cmd_test "$box"
+}
+
+cmd_test() {
+  local box="${1:-}"
+  if [ "$box" = "--all" ] || [ -z "$box" ]; then
+    local any=0 rc=0 b
+    for b in $(amux_list_boxes); do any=1; test_one "$b" || rc=1; done
+    [ "$any" = 1 ] || { printf '%sno boxes configured%s\n' "$DIM" "$RESET"; return 0; }
+    return $rc
+  fi
+  amux_box_exists "$box" || amux_die "no such box '$box' (configured: $(amux_list_boxes))"
+  test_one "$box"
+}
+
+test_one() { # $1 = box. Distinguishes "unreachable" from "reachable but token rejected".
+  local box="$1"
+  printf '%s%s%s… ' "$CYAN" "$box" "$RESET"
+  ( # subshell so one box's AMUX_* never leaks into the next box's test
+    amux_load_box "$box" || { printf 'config unreadable\n'; exit 1; }
+    local code; code=$(amux_api_code /api/sessions)
+    case "$code" in
+      200)     printf '%sOK%s (HTTP 200, token accepted)\n' "$GREEN" "$RESET"; exit 0 ;;
+      401|403) printf '%sreachable but token REJECTED%s (HTTP %s)\n' "$RED" "$RESET" "$code"
+               printf '           refresh it:  amux-config token %s\n' "$box"; exit 1 ;;
+      404)     # Server is up and authenticating; this path just isn't there on
+               # this version. Not a failure of connectivity or credentials.
+               printf '%sreachable%s (HTTP 404 on /api/sessions — different amux version)\n' "$YELLOW" "$RESET"; exit 0 ;;
+      000|'')  printf '%sUNREACHABLE%s (no response)\n' "$RED" "$RESET"
+               printf '           check: is `amux serve` running there, and is the port open?\n'; exit 1 ;;
+      *)       printf '%sHTTP %s%s\n' "$YELLOW" "$code" "$RESET"; exit 1 ;;
+    esac
+  )
+}
+
+cmd_remove() {
+  local box="${1:-}"; [ -n "$box" ] || amux_die "usage: amux-config remove <box>"
+  amux_box_exists "$box" || amux_die "no such box '$box'"
+  local f; f=$(amux_box_env_path "$box")
+  if [ -t 0 ]; then
+    printf 'Delete config for box %s%s%s (%s)? [y/N] ' "$CYAN" "$box" "$RESET" "$f"
+    local a; read -r a
+    case "$a" in y|Y|yes|YES) ;; *) printf 'cancelled\n'; return 0 ;; esac
+  fi
+  rm -f "$f" && amux_ok "removed $f"
+}
+
+cmd_rename() {
+  local old="${1:-}" new="${2:-}"
+  [ -n "$old" ] && [ -n "$new" ] || amux_die "usage: amux-config rename <old> <new>"
+  require_box_name "$new"
+  amux_box_exists "$old" || amux_die "no such box '$old'"
+  amux_box_exists "$new" && amux_die "box '$new' already exists"
+  mv "$(amux_box_env_path "$old")" "$(amux_box_env_path "$new")" \
+    && amux_ok "renamed $old -> $new"
+}
+
+cmd_edit() {
+  local box="${1:-}"; [ -n "$box" ] || amux_die "usage: amux-config edit <box>"
+  amux_box_exists "$box" || amux_die "no such box '$box'"
+  local f; f=$(amux_box_env_path "$box")
+  "${EDITOR:-vi}" "$f"
+  chmod 600 "$f" 2>/dev/null || true   # re-assert 600 in case the editor rewrote it
+  amux_ok "saved (mode re-asserted to 600)"
+}
+
+cmd_status() { # the default view: this machine, then every box
+  printf '%sThis machine%s\n' "$BOLD" "$RESET"
+  printf '  platform    %s\n' "$(amux_platform_label)"
+  printf '  package mgr %s\n' "$(amux_pkgmgr)"
+  local a
+  a=$(amux_have amux && echo "yes" || echo "%sNO — run setup/bootstrap%s")
+  # shellcheck disable=SC2059
+  printf "  amux        $a\n" "$RED" "$RESET"
+  printf '  tmux        %s\n' "$(amux_have tmux && tmux -V 2>/dev/null || echo "not installed")"
+  if [ -f "$(amux_home)/auth_token" ]; then
+    printf '  this box serves  yes (%s/auth_token exists)\n' "$(amux_home)"
+  else
+    printf '  this box serves  %sno%s — others cannot reach this machine yet\n' "$DIM" "$RESET"
+    printf '                   to allow that: setup/serve-install\n'
+  fi
+  printf '\n'
+  cmd_list
+  printf '\n%sTest them with:%s amux-config test --all\n' "$DIM" "$RESET"
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+cmd="${1:-status}"; shift 2>/dev/null || true
+case "$cmd" in
+  status)         cmd_status "$@" ;;
+  add)            cmd_add "$@" ;;
+  list|ls)        cmd_list "$@" ;;
+  show)           cmd_show "$@" ;;
+  test|check)     cmd_test "$@" ;;
+  token|retoken)  cmd_token "$@" ;;
+  edit)           cmd_edit "$@" ;;
+  rename|mv)      cmd_rename "$@" ;;
+  remove|rm|del)  cmd_remove "$@" ;;
+  -h|--help)      amux_self_help "$0" ;;
+  *)              amux_die "unknown subcommand '$cmd' (try: amux-config -h)" ;;
+esac

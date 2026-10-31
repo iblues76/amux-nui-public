@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""amux-termprobe — record which colors the terminal is ACTUALLY drawing with, around an attach.
+
+Asks the live terminal (not the settings file) for its default text + background color
+(OSC 10/11; the profile name comes from $ITERM_PROFILE, set when iTerm opened the tab), then
+prints one dim line and appends the same facts to ~/.amux/logs/term-probe.log.
+amux calls it before every attach and again after you detach, so a tab that changes
+color during a session shows up as a before/after difference in the log.
+
+  amux-termprobe <phase> <target>     e.g.  amux-termprobe before myhost:api
+  amux-termprobe --log [N]            show the last N log lines (default 20)
+
+On a Mac it also looks the profile up in iTerm's saved settings and flags a mismatch
+("≠ profile #f5c96a") — the tab is not drawing the color its profile says. iTerm reports
+colors after its own color-space adjustment (#f5c96a comes back as #eecb78), so only a
+channel difference above MISMATCH_TOLERANCE counts; amber vs cream (#ebdbb2) is ~70.
+Silent no-op when there is no terminal. AMUX_TERMPROBE=0 disables it.
+"""
+import datetime, os, plistlib, re, select, socket, sys, termios, time, tty
+
+LOG = os.path.expanduser("~/.amux/logs/term-probe.log")
+MISMATCH_TOLERANCE = 32   # max per-channel difference still treated as "the same color"
+
+
+def delta(a, b):
+    """Largest per-channel difference between two #rrggbb colors (None if either is unknown)."""
+    try:
+        return max(abs(int(a[i:i + 2], 16) - int(b[i:i + 2], 16)) for i in (1, 3, 5))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def rgb(reply):
+    # 'rgb:ffff/c9c9/6a6a' (or 2-digit groups) -> '#ffc96a'
+    m = re.search(r"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", reply or "")
+    return "#" + "".join(g[:2].rjust(2, "0").lower() for g in m.groups()) if m else ""
+
+
+def query_terminal():
+    """Returns dict fg/bg from the live terminal ('' when it did not answer)."""
+    fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    old = termios.tcgetattr(fd)
+    out = b""
+    try:
+        tty.setraw(fd)
+        # DA1 last: every terminal answers it, and in order, so once its reply is in,
+        # the OSC 10/11 replies (if any) are too.
+        os.write(fd, b"\x1b]10;?\x07\x1b]11;?\x07\x1b[c")
+        deadline = time.time() + 0.8
+        while time.time() < deadline:
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                out += os.read(fd, 4096)
+                if re.search(rb"\x1b\[\?[0-9;]*c", out):
+                    break
+    finally:
+        # discard anything still in flight, so no late reply gets typed into the next program
+        termios.tcflush(fd, termios.TCIFLUSH)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+    s = out.decode("latin-1")
+    res = {"fg": "", "bg": ""}
+    m = re.search(r"\x1b\]10;([^\x07\x1b]*)", s); res["fg"] = rgb(m.group(1)) if m else ""
+    m = re.search(r"\x1b\]11;([^\x07\x1b]*)", s); res["bg"] = rgb(m.group(1)) if m else ""
+    return res
+
+
+def profile_fg(name):
+    """The text color iTerm's SAVED settings give this profile (Mac only)."""
+    p = os.path.expanduser("~/Library/Preferences/com.googlecode.iterm2.plist")
+    try:
+        d = plistlib.load(open(p, "rb"))
+    except Exception:
+        return ""
+    for b in d.get("New Bookmarks", []):
+        if name and b.get("Name") == name or not name and b.get("Guid") == d.get("Default Bookmark Guid"):
+            c = b.get("Foreground Color") or {}
+            if not c:
+                return ""
+            return "#" + "".join("%02x" % int(round(c.get(k, 0) * 255))
+                                 for k in ("Red Component", "Green Component", "Blue Component"))
+    return ""
+
+
+def main(argv):
+    if argv[:1] == ["--log"]:
+        n = int(argv[1]) if len(argv) > 1 else 20
+        try:
+            print("".join(open(LOG).readlines()[-n:]), end="")
+        except FileNotFoundError:
+            print("(no probes logged yet)")
+        return 0
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip()); return 0
+    if os.environ.get("AMUX_TERMPROBE", "1") in ("0", "no", "off", "false"):
+        return 0
+    phase = argv[0] if argv else "probe"
+    target = argv[1] if len(argv) > 1 else ""
+    in_tmux = bool(os.environ.get("TMUX"))
+    try:
+        t = query_terminal()
+    except OSError:
+        return 0          # no controlling terminal (scripted use): nothing to probe
+    prof = os.environ.get("ITERM_PROFILE", "")
+    want = profile_fg(prof) if sys.platform == "darwin" else ""
+    d = delta(want, t["fg"]) if want and t["fg"] else None
+    mism = d is not None and d > MISMATCH_TOLERANCE
+    fields = [
+        ("time", datetime.datetime.now().astimezone().isoformat(timespec="seconds")),
+        ("host", socket.gethostname().split(".")[0]), ("phase", phase), ("target", target),
+        ("fg", t["fg"] or "?"), ("bg", t["bg"] or "?"),
+        ("profile", prof or "-"), ("profile_fg", want or "-"),
+        ("fg_delta", "-" if d is None else d), ("mismatch", "YES" if mism else "no"),
+        ("in_tmux", "yes" if in_tmux else "no"), ("term", os.environ.get("TERM_PROGRAM", "-")),
+        ("iterm_session", os.environ.get("ITERM_SESSION_ID", "-")),
+    ]
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(" ".join(f"{k}={v!r}" if " " in str(v) else f"{k}={v}" for k, v in fields) + "\n")
+    note = f" \033[1;33m≠ profile {want}\033[0;2m" if mism else ""
+    sys.stderr.write(f"\033[2mterm {phase}: profile={prof or '?'} · text={t['fg'] or '?'}{note}"
+                     f" · bg={t['bg'] or '?'}  (amux-termprobe --log)\033[0m\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception:
+        sys.exit(0)       # a probe must never break an attach

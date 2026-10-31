@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# amux-up — one command to ENSURE a session is started and ATTACH to it.
+# Solves the "amux-remote start only started it but never connected me" footgun.
+# (Since 2026-07-30 an INTERACTIVE `amux-remote <box> start <name>` ALSO
+# attaches, so the two converge for the remote case — intended. amux-up remains
+# the one that adds the local-lane pick and the <box>:<name> routing.)
+#
+# Picks the right lane automatically:
+#   - if this box's LOCAL amux knows the session -> `amux start` (which attaches)
+#   - else, on a configured box                  -> `amux-remote <box> start` then `… attach`
+#
+# The remote lane ALWAYS names its machine — a box is never inferred (no default
+# remote, no $AMUX_HUB, no "the only configured box"):
+#   amux-up <name>            LOCAL sessions only; errors if not found locally
+#   amux-up <box> <name>      remote — box first, like every other companion
+#   amux-up <box>:<name>      remote — same thing, colon form
+#
+# Two-arg form: if $1 names a configured box (~/.amux/remotes/$1.env exists) and
+# $2 is a session name (not a flag), it is <box> <name> — and the box
+# interpretation WINS over a local session that happens to share the box's name.
+# With ONE argument a local session still resolves locally, exactly as before.
+#
+# Flags after the name go to the remote `start` (one-shot), except --cc/--plain/--mosh
+# which go to `attach`. For claude sessions resume is AUTOMATIC (the server
+# auto-resumes the newest conversation on start), so --continue is rarely
+# needed — but it is forwarded and honored.
+#
+# Usage: amux-up [<box>] <name> [extra claude/amux flags]
+#        amux-up <box>:<name> [flags]
+#   e.g. amux-up api
+#        amux-up box1 api --continue
+#        amux-up box1:api
+case "${1:-}" in -h|--help)
+  awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
+esac
+set -uo pipefail
+
+remdir="$HOME/.amux/remotes"
+raw="${1:-}"
+[ -z "$raw" ] && { echo "usage: amux-up [<box>] <name> [flags]   (-h for details)"; exit 2; }
+shift || true
+# box selector — colon form (<box>:<name>) or two-arg form (<box> <name>).
+box=""; name="$raw"; box_explicit=0
+case "$raw" in
+  *:*) box="${raw%%:*}"; name="${raw#*:}" ;;
+  *)
+    # two-arg form (mirrors amux-remote <box> <cmd> <name>): $1 is a configured
+    # box AND the next arg is a name (not a flag) -> treat as <box> <name>.
+    # ONLY here does the box interpretation beat a same-named local session;
+    # a single bare argument stays local-first, exactly as before.
+    if [ -f "$remdir/$raw.env" ]; then
+      case "${1:-}" in
+        ""|-*) : ;;   # nothing (or a flag) follows -> $raw is a session name
+        *) box="$raw"; name="$1"; box_explicit=1; shift ;;
+      esac
+    fi
+    ;;
+esac
+
+known_local=0
+if [ "$box_explicit" = 1 ]; then
+  : # box named explicitly (two-arg form) — go remote, skip the local lane
+elif command -v amux >/dev/null 2>&1; then
+  if amux ls -c 2>/dev/null | grep -qE "(^|[[:space:]])${name}([[:space:]]|\$)"; then
+    known_local=1
+  fi
+fi
+
+if [ "$known_local" = 1 ]; then
+  # local: `amux start` starts if stopped (auto-resumes newest) and attaches; if
+  # already running it short-circuits to attach. Either way you end up inside it.
+  exec amux start "$name" "$@"
+fi
+
+# Remote lane: session isn't local. A MACHINE IS NEVER INFERRED — you name it as
+# <box> <name> (or <box>:<name>). No $AMUX_HUB, no "the only configured box":
+# guessing which machine to drive is how you start/attach on the wrong one.
+if [ -z "$box" ]; then
+  echo "amux-up: '$name' is not a local session, and no box was named." >&2
+  echo "  name the machine explicitly:  amux-up <box> $name" >&2
+  boxes="$(ls "$remdir" 2>/dev/null | sed -n 's/\.env$//p' | tr '\n' ' ')"
+  [ -n "$boxes" ] && echo "  boxes: $boxes" >&2
+  exit 2
+fi
+
+if command -v amux-remote >/dev/null 2>&1 && [ -f "$remdir/$box.env" ]; then
+  # Route flags: --cc/--plain/--mosh belong to `attach`; everything else (--continue,
+  # --provider …) is a one-shot launch flag for `start`.
+  start_flags=(); attach_flags=()
+  for a in "$@"; do
+    case "$a" in
+      --cc|--plain|--mosh) attach_flags+=("$a") ;;
+      *)            start_flags+=("$a") ;;
+    esac
+  done
+  echo "· starting '$name' on box '$box' (if not already up)…"
+  # A failed start must NOT be swallowed — attaching after one just drops you
+  # into a missing/dead tmux target. AMUX_NO_HINT=1: we attach right after, so
+  # amux-remote's "attach: amux-up …" next-step hint would be noise here.
+  if ! AMUX_NO_HINT=1 amux-remote "$box" start "$name" ${start_flags[@]+"${start_flags[@]}"}; then
+    echo "amux-up: starting '$name' on '$box' FAILED — not attaching." >&2
+    exit 1
+  fi
+  exec amux-remote "$box" attach "$name" ${attach_flags[@]+"${attach_flags[@]}"}
+fi
+
+echo "amux-up: '$name' not found locally and no box resolved." >&2
+boxes="$(ls "$remdir"/*.env 2>/dev/null | sed -E 's#.*/##; s/\.env$//' | tr '\n' ' ')"
+[ -n "$boxes" ] && echo "  boxes: ${boxes} — try 'amux-up <box> $name'" >&2
+echo "  local sessions:" >&2
+amux ls -c 2>/dev/null | sed 's/^/    /' >&2
+exit 1

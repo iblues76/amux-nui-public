@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# amux-tabs.sh — open one iTerm2 tab per amux session, so you don't create tabs by
+# hand. macOS + iTerm2 only (drives it via AppleScript). Run it from an iTerm window.
+#
+#   amux-tabs.sh futhci graphms hugosite        # a tab per LOCAL session (amux start <name>)
+#   amux-tabs.sh futhci graphms --continue      # trailing flags go to EVERY session
+#   amux-tabs.sh -w futhci graphms              # open them in a NEW iTerm window
+#   amux-tabs.sh --host host1 mysession foo    # tabs attached to REMOTE sessions on host1 (ssh -t)
+#   amux-tabs.sh host1:mysession host2:other   # per-session host:name (mix hosts)
+#
+# Each tab runs `amux start <name> [flags]` (local) or `ssh -t BOX 'amux start <name> [flags]'`
+# (with --host / box:name). It does NOT resume the conversation unless you add `--continue`.
+# Detach with Ctrl-b d. Tabs are labelled by session (box:name when remote).
+set -eu
+
+usage() {
+  cat <<'EOF'
+amux-tabs — open one iTerm2 tab per amux session, instead of making tabs by hand.
+macOS + iTerm2 only; run it from iTerm.
+
+USAGE
+  amux-tabs [-w] <name> [<name> ...] [amux-flags...]
+  amux-tabs [-w] --all [amux-flags...]
+
+WHAT EACH TAB RUNS
+  amux start <name> [amux-flags...]
+    -> starts the session if stopped, or attaches if already running. (Bare `amux
+       <name>` only attaches a RUNNING session, so the tabs use `amux start`.)
+       It does NOT resume the conversation unless you add a flag (see below).
+
+PASS-THROUGH  (the "at the end" part)
+  Any flags placed AFTER the names are passed to EVERY session, e.g.:
+    amux-tabs futhci graphms --continue       # amux futhci --continue ; amux graphms --continue
+    amux-tabs futhci --model opus --continue  # applied to each
+  Use `--` first if a value might look like a name:  amux-tabs futhci -- --continue
+
+OPTIONS (amux-tabs's own — put them BEFORE the names)
+  -w, --window     put the tabs in a NEW iTerm window instead of the current one.
+  -H, --host BOX   run each session on a REMOTE box: the tab does `ssh -t BOX 'amux start <name>'`,
+                   so from your Mac you get a tab attached to a session on a remote host over SSH
+  --all            a tab for every session (`amux ls`, or `ssh BOX amux ls` with --host).
+  -h, --help       this help.
+
+REMOTE (drive a Linux box's amux from your Mac)
+  amux-tabs --host host1 mysession foo --continue  # 2 Mac tabs, each ssh'd into host1 + attached
+  amux-tabs host1:mysession host2:other            # per-session host:name (mix hosts in one call)
+  BOX must be reachable over SSH from the Mac; private hosts may require a VPN first.
+
+NOTES
+  Detach a session with Ctrl-b d. Tabs are labelled by session (box:name when remote).
+EOF
+}
+
+NEWWIN=0; ALL=0; NAMES=""; PASS=""; HOST=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -w|--window) NEWWIN=1; shift ;;
+    -H|--host)   HOST="${2:-}"; shift 2 ;;      # run each tab's session on a REMOTE box (ssh -t)
+    --all)       ALL=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    --)          shift; PASS="$*"; break ;;     # everything after -- is passed to each amux
+    -*)          PASS="$*"; break ;;            # first flag after the names -> passed to each amux
+    *)           NAMES="$NAMES $1"; shift ;;
+  esac
+done
+
+if [ "$ALL" = 1 ]; then
+  # name column from `amux ls` (col 1 may carry a running-marker like 4*; col 2 is the name).
+  # with --host, list the REMOTE box's sessions.
+  LSCMD="amux ls"; [ -n "$HOST" ] && LSCMD="ssh $HOST amux ls"
+  NAMES=$($LSCMD 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '{n=$2; gsub(/\*/,"",n); if (n ~ /^[A-Za-z0-9]/) print n}')
+fi
+NAMES=$(printf '%s\n' $NAMES | sed '/^$/d')
+[ -n "$NAMES" ] || { echo "no session names given (and --all found none)"; exit 1; }
+
+# Per-session iTerm2 tab color: a deep jewel tone chosen by a stable crc32 hash of the
+# session name — the SAME palette as the Claude statusline square, so the tab color and
+# the status-bar square match. Emitted BEFORE tmux starts (direct OSC 6 to iTerm, no
+# passthrough needed); iTerm keeps the tab color for the life of the tab. Prints a
+# `printf '…' ; ` prefix to prepend to the tab command. No-op if python3 is missing.
+tabcolor_prefix() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$1" <<'PY'
+import sys, zlib
+name = sys.argv[1]
+SQUARE = [160,130,94,58,28,22,23,25,26,27,57,91,127,162,125,161]
+def rgb(i):
+    j = i - 16; s = [0,95,135,175,215,255]
+    return (s[j//36], s[(j//6)%6], s[j%6])
+r, g, b = rgb(SQUARE[zlib.crc32(name.encode()) % 16])
+esc = ("\\033]6;1;bg;red;brightness;%d\\007"
+       "\\033]6;1;bg;green;brightness;%d\\007"
+       "\\033]6;1;bg;blue;brightness;%d\\007") % (r, g, b)
+sys.stdout.write("printf '" + esc + "' ; ")
+PY
+}
+
+first=1
+printf '%s\n' "$NAMES" | while IFS= read -r n; do
+  [ -n "$n" ] || continue
+  box="$HOST"
+  case "$n" in *:*) box="${n%%:*}"; n="${n#*:}" ;; esac   # per-name box:name overrides --host
+  if [ -n "$box" ]; then cmd="ssh -t $box 'amux start $n${PASS:+ $PASS}'"; lbl="$box:$n"; else cmd="amux start $n${PASS:+ $PASS}"; lbl="$n"; fi
+  cmd="$(tabcolor_prefix "$n")$cmd"   # colour the iTerm tab (deep palette) before the session starts
+  if [ "$NEWWIN" = 1 ] && [ "$first" = 1 ]; then
+    osascript - "$cmd" "$lbl" <<'OSA'
+on run argv
+  tell application "iTerm2"
+    activate
+    set w to (create window with default profile)
+    tell current session of w
+      set name to (item 2 of argv)
+      write text (item 1 of argv)
+    end tell
+  end tell
+end run
+OSA
+  else
+    osascript - "$cmd" "$lbl" <<'OSA'
+on run argv
+  tell application "iTerm2"
+    activate
+    if (count of windows) = 0 then
+      create window with default profile
+      tell current session of current window
+        set name to (item 2 of argv)
+        write text (item 1 of argv)
+      end tell
+    else
+      tell current window
+        set t to (create tab with default profile)
+        select t
+        tell current session of t
+          set name to (item 2 of argv)
+          write text (item 1 of argv)
+        end tell
+      end tell
+    end if
+  end tell
+end run
+OSA
+  fi
+  first=0
+  echo "  tab -> $cmd"
+done
