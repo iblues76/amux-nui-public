@@ -17,6 +17,7 @@
 #   7. the bundled amux: version, help, server syntax, register/ls/account/rm on a
 #      dummy session (never launched), completion generation
 #   7b. the status line renders, sheds, and installs without clobbering settings
+#   7c. amux search finds a project by content and ends with the --agentic tip
 #   8. the audit catches a planted secret
 #
 # Usage:
@@ -606,6 +607,23 @@ fi
 "$SL" --uninstall >/dev/null 2>&1
 grep -q my-own-line "$HOME/.claude/settings.json" && ok "--uninstall leaves a foreign status line alone" || bad "--uninstall removed a foreign status line"
 rm -rf "$HOME/.claude"
+
+# ── 7c. amux search ──────────────────────────────────────────────────────────
+sect "7c. amux search"
+mkdir -p "$HOME/claudecode/searchproj"
+printf 'notes about zebrafinch42\n' > "$HOME/claudecode/searchproj/notes.txt"
+o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux" search zebrafinch42 2>&1 | plain)
+has "searchproj" "$o" && ok "finds a session-less project dir by file content" || bad "amux search missed the project dir" "$o"
+if has "amux search --agentic 'which sessions worked on zebrafinch42, and what did they do?'" "$o"; then
+  ok "ends with a one-line --agentic tip built from the search"
+else
+  bad "no --agentic tip" "$o"
+fi
+o=$(PATH="$BINDIR:$PATH" "$BINDIR/amux" search "how did we fix zebrafinch42" 2>&1 | plain)
+has "amux search --agentic 'how did we fix zebrafinch42'" "$o" && ok "a question is suggested as typed, not wrapped again" || bad "question re-wrapped" "$o"
+o=$(AMUX_SEARCH_INNER=1 PATH="$BINDIR:$PATH" "$BINDIR/amux" search zebrafinch42 2>&1)
+! has "tip:" "$o" && ok "no tip when the agentic run's own agent reads it" || bad "tip shown to the agent"
+rm -rf "$HOME/claudecode"
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"

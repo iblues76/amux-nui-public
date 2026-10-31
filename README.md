@@ -4,7 +4,7 @@ A ready-to-use build of [**amux**](https://github.com/mixpeek/amux) — the sess
 
 This is the setup its maintainer uses every day, with the personal parts taken out: no machine names, accounts, addresses or credentials ship in it. You bring your own.
 
-**Version 0.3.1** — bundles a modified **amux 0.9.14** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
+**Version 0.4.0** — bundles a modified **amux 0.9.14** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
 
 Works on **macOS and Linux**, and on **Windows** through WSL (driving other machines from MSYS2 or Git Bash is untested; see [docs/windows.md](docs/windows.md)).
 
@@ -95,6 +95,18 @@ The colored square holds the session's `amux ls` row, so `amux 4` attaches to ex
 
 It backs up `~/.claude/settings.json` and will not replace a status line you already have unless you add `--force`. Every segment, the color settings and removal: **[docs/statusline.md](docs/statusline.md)**.
 
+## Finding a session
+
+Which session was it where you fixed that bug? `amux search` looks through every session's conversations, the files in its folder, and its name, and prints the matches with their `amux ls` row numbers, so `amux <row>` opens the one you want:
+
+```sh
+amux search "login bug"               # this machine
+amux search --fleet "login bug"       # every machine you drive (see "More than one computer")
+amux search --agentic "which session set up the login page, and is it finished?"
+```
+
+With `--agentic`, a coding agent (Claude by default) runs several searches for you, reads the matching conversations, and ranks the sessions with a reason for each. It takes a minute or two. `amux search -c "follow-up"` continues the same conversation. Every plain search ends with a one-line tip showing the `--agentic` version of what you typed. All options: `amux-search -h`.
+
 ## Commands
 
 | Command | What it does |
@@ -111,6 +123,7 @@ It backs up `~/.claude/settings.json` and will not replace a status line you alr
 | [`amux-convos`](bin/amux-convos) | A session's past conversations with a snippet of each; resume the right one |
 | [`amux-reauth`](bin/amux-reauth) | Fix sessions stuck at `401 / Please run /login`, with no browser |
 | [`check-claude-auth`](bin/check-claude-auth) | Whether sessions here will really authenticate, per account |
+| [`amux-search`](bin/amux-search) | Which sessions talked about something, on one machine or all (what `amux search` runs) |
 | [`amux-rename`](bin/amux-rename) | Rename a session everywhere at once without losing its context |
 | [`amux-rm-stopped`](bin/amux-rm-stopped) | Remove every stopped session from the list (asks first) |
 | [`amux-statusline`](bin/amux-statusline) | The Claude Code status line above; `--install` / `--uninstall` |
@@ -127,6 +140,7 @@ Every command answers `-h`.
 - [**statusline.md**](docs/statusline.md) — the status line: every segment, settings, install and removal
 - [**windows.md**](docs/windows.md) — WSL vs MSYS2 vs Git Bash
 - [**troubleshooting.md**](docs/troubleshooting.md) — symptoms, causes, fixes
+- [**CHANGELOG.md**](CHANGELOG.md) — what changed in each release
 
 ## What is different from upstream amux
 

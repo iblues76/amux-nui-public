@@ -88,7 +88,7 @@ files() {
 #                     host; kept as an exact string so a real `nui-<box>` still trips.
 #   /home/linuxbrew, /home/u, /Users/you — a generic install dir and test fixtures
 #   email@example.com, git@github.com    — upstream amux's own placeholder/URL text
-ALLOW='^(git\.nuilab\.org|100\.64\.0\.0(/10)?|nui-public|/home/linuxbrew|/home/u|/Users/you|email@example\.com|git@github\.com)$'
+ALLOW='^(git\.nuilab\.org|amux\.nuilab\.org|100\.64\.0\.0(/10)?|nui-public|/home/linuxbrew|/home/u|/Users/you|email@example\.com|git@github\.com)$'
 
 scan() { # $1 = extended regex, $2 = label, $3 = severity
   local hits

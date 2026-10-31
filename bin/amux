@@ -3364,6 +3364,11 @@ ${BOLD}Sessions:${RESET}
   amux register <name> --provider <p> [--account P|T|X] [flags]   Register without starting
   amux rm <name>                 Remove a session (stops if running)
   amux rmnum <n,n,a-b> [-y]      Remove several by amux ls row number (resolved to names first; asks y/N)
+  amux search [<box,box>|--fleet] [--providers p,p] [--in chat,files,name] [-w] ("text" | --prompt)
+                                 Which sessions talked about / contain "text" (+ session-less dirs); all options: amux-search -h
+  amux search --agentic "question" [--local|<box,box>] [--provider claude|codex|opencode] [--model m] [--effort e] [--account P|T|X]
+                                 An agent (default claude opus medium on P) runs the literal searches on every machine and ranks the sessions
+  amux search -c ["follow-up"]   Reply to the last agentic answer (same agent + scope, keeps its memory); no text = prompt
   amux rename <old> <new>        Rename (keeps its dir; restarts + auto-resumes)
   amux provider <name> [<p>]     Show or change which agent a session runs
   amux account <name> [P|T|X]    Show or change which Claude subscription it bills to
@@ -3782,6 +3787,7 @@ _amux() {
     send)              _amux_name_then --keys ;;
     rm|remove|del|rename|mv|info) _amux_name_then ;;
     rmnum)             _amux_opts -y ;;
+    search|find)       _amux_opts --fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t --agentic --local -c --continue --provider --model --effort --account --raw ;;
     provider)          (( pos == 2 )) && _amux_opts claude codex gemini opencode iterm2 agy || _amux_name_then ;;
     account|acct)      (( pos == 2 )) && _amux_opts P T X personal team team2 || _amux_name_then ;;
     register|reg|exec|run)
@@ -3905,6 +3911,7 @@ _amux_complete() {
     send)              words="--keys" ;;
     rm|remove|del|rename|mv|info) words="" ;;
     rmnum)             words="-y" ;;
+    search|find)       words="--fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t --agentic --local -c --continue --provider --model --effort --account --raw" ;;
     provider)          (( pos == 2 )) && { COMPREPLY=( $(compgen -W "$providers" -- "$cur") ); return; } ;;
     account|acct)      (( pos == 2 )) && { COMPREPLY=( $(compgen -W "$accounts" -- "$cur") ); return; } ;;
     register|reg|exec|run)
@@ -4034,6 +4041,10 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     stop|kill)        shift; cmd_stop "$@" ;;
     rm|remove|del)    shift; cmd_rm "$@" ;;
     rmnum)            shift; cmd_rmnum "$@" ;;
+    search|find)      shift
+                      command -v amux-search >/dev/null 2>&1 \
+                        || die "search needs amux-search, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
+                      exec amux-search "$@" ;;
     rename|mv)        shift; cmd_rename "$@" ;;
     provider)         shift; cmd_provider "$@" ;;
     account|acct)     shift; cmd_account "$@" ;;
