@@ -1,0 +1,588 @@
+#!/bin/bash
+# amux-statusline — a Claude Code status line built for amux.
+#
+#   amux-statusline --install     point Claude Code at it (backs up ~/.claude/settings.json first)
+#   amux-statusline --uninstall   remove it again (only if the status line is still this one)
+#   amux-statusline --help        this text
+#
+# Claude Code runs it on every render, with a JSON status payload on stdin. One line:
+#
+#   [N] machine:…/dir ○ T Op5⁵ hi · ctx 82% · in 36k · Σ251k · ⎇ feat/x* · 7d 75% 2d 7h · 5h 61% 3h 29m ↻
+#
+#   [N]          colored square with the session's `amux ls` row number in it, so `amux N` attaches
+#                to exactly what you see. Square color is per session; an M inside means the session
+#                is attached over mosh. A plain square outside amux.
+#   machine:dir  machine name (one stable color per machine) and the live working directory
+#   ◉ / ○        focus (brief) transcript view on / off
+#   P / T / X    which Claude subscription the session bills to (docs/accounts.md); blank with /login
+#   Op5⁵ hi      model tier + version (Opus 5.5) and effort level
+#   ctx          context left before auto-compaction; green, then yellow, then red
+#   in           tokens the next prompt sends; Σ = whole-session total, kept across /compact
+#   ⎇ branch     only when it needs attention: off main/master, or uncommitted work (*)
+#   7d / 5h      subscription quota used, with time until reset
+#   ↻            a newer Claude Code is waiting: amber = restart to apply, red = upgrade it yourself
+#
+# Narrow panes shed segments in a fixed order (branch, then the directory, Σ, 7d, 5h, in, ctx);
+# the session square and machine name always stay. Also renames the tmux window to
+# "name (O hi)" so iTerm2 and other tab titles show model and effort.
+#
+# Optional settings, one per line, in ~/.config/amux/statusline.conf:
+#   color <name-substring> <0-255>   fix a machine's color (default: picked from its name)
+#   strip-prefix <text>              drop a common hostname prefix ("lab-desk01" -> "desk01")
+#   quota-log on                     append quota readings to ~/.claude/quota.log
+#
+# Needs python3; git for the branch segment. Works in any terminal with 256 colors and a
+# Unicode font (built on iTerm2, also used in Linux terminals).
+_self="$0"
+_t="$(readlink "$_self" 2>/dev/null)" && case "$_t" in /*) _self="$_t" ;; *) _self="$(dirname "$_self")/$_t" ;; esac
+AMUX_SL_LIB="$(cd "$(dirname "$_self")/../lib" 2>/dev/null && pwd)"
+export AMUX_SL_LIB
+
+case "${1:-}" in
+  -h|--help) awk 'NR==1&&/^#!/{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
+  --install|--uninstall)
+    # The command written into settings.json is the path this was invoked by (normally the
+    # ~/.local/bin symlink), so a `git pull` in the checkout updates the status line too.
+    case "$0" in /*) _cmd="$0" ;; *) _cmd="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;; esac
+    exec python3 - "$1" "$_cmd" "${2:-}" <<'PY'
+import json, os, sys, time, shutil
+mode, cmd, force = sys.argv[1], sys.argv[2], sys.argv[3] == "--force"
+p = os.path.expanduser("~/.claude/settings.json")
+try:
+    d = json.load(open(p)) if os.path.exists(p) else {}
+except Exception as e:
+    sys.exit(f"{p} is not valid JSON ({e}); fix it first, nothing changed")
+if not isinstance(d, dict):
+    sys.exit(f"{p} is not a JSON object; nothing changed")
+cur = d.get("statusLine")
+mine = {"type": "command", "command": cmd}
+if mode == "--install":
+    if cur == mine:
+        print(f"status line: already installed ({cmd})"); sys.exit(0)
+    if cur and not force:
+        sys.exit(f"status line: settings.json already has one:\n  {json.dumps(cur)}\n"
+                 f"re-run with --force to replace it (a backup is made either way)")
+    d["statusLine"] = mine
+else:
+    if not cur or "amux-statusline" not in str(cur.get("command", "")):
+        print("status line: not ours, left alone"); sys.exit(0)
+    del d["statusLine"]
+os.makedirs(os.path.dirname(p), exist_ok=True)
+if os.path.exists(p):
+    b = p + ".bak-amux-" + time.strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(p, b); print(f"backup: {b}")
+tmp = p + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2); f.write("\n")
+os.replace(tmp, p)
+print("status line: " + ("installed -> " + cmd if mode == "--install" else "removed")
+      + " (Claude Code picks it up on the next render)")
+PY
+    ;;
+esac
+if [ -t 0 ]; then
+  echo "amux-statusline reads Claude Code's status JSON on stdin; see --help (--install to set it up)" >&2
+  exit 2
+fi
+exec python3 -c '
+import sys, json, os, time, subprocess, glob, zlib, unicodedata, re
+def cells(t):                       # display columns, not code points
+    return sum(0 if unicodedata.combining(c) else
+               (2 if unicodedata.east_asian_width(c) in ("W","F") else 1) for c in t)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+def g(*ks):
+    cur = d
+    for k in ks:
+        if not isinstance(cur, dict): return None
+        cur = cur.get(k)
+    return cur
+cwd  = g("workspace","current_dir") or d.get("cwd") or os.getcwd()
+# Stable session label: prefer the amux session name (the locked tmux window name,
+# which survives the agent cd-ing around) over the live cwd, which drifts. Env
+# override AMUX_NAME wins if set; falls back to the launch/project dir basename.
+def _tmux_w():
+    if os.environ.get("TMUX"):
+        try:
+            return subprocess.run(["tmux","display-message","-p","#W"],
+                                  capture_output=True, text=True, timeout=1).stdout.strip()
+        except Exception:
+            return ""
+    return ""
+_raw_w = _tmux_w()
+def _strip_sfx(s):   # drop a trailing " (…)" so our own "name (M eff)" round-trips to the clean name
+    return s[:s.rfind(" (")].rstrip() if (s.endswith(")") and " (" in s) else s
+proj = os.environ.get("AMUX_NAME") or _strip_sfx(_raw_w) or os.path.basename((g("workspace","project_dir") or cwd).rstrip("/")) or cwd
+# Optional config: ~/.config/amux/statusline.conf (or $AMUX_STATUSLINE_CONF), one setting per line:
+#   color <name-substring> <0-255>   machine-name color; first match wins (default: picked from the name)
+#   strip-prefix <text>              drop a common hostname prefix ("lab-" makes lab-desk01 read desk01)
+#   quota-log on                     append 5h/7d quota readings to ~/.claude/quota.log (default off)
+CONF = {"color": [], "strip-prefix": "", "quota-log": False}
+try:
+    for _ln in open(os.environ.get("AMUX_STATUSLINE_CONF") or os.path.expanduser("~/.config/amux/statusline.conf")):
+        _f = _ln.split("#", 1)[0].split()
+        if len(_f) == 3 and _f[0] == "color" and _f[2].isdigit():
+            CONF["color"].append((_f[1].lower(), int(_f[2]) % 256))
+        elif len(_f) == 2 and _f[0] == "strip-prefix":
+            CONF["strip-prefix"] = _f[1]
+        elif len(_f) == 2 and _f[0] == "quota-log":
+            CONF["quota-log"] = _f[1].lower() in ("on", "yes", "true", "1")
+except Exception:
+    pass
+node = os.uname().nodename.split(".")[0]
+_sp = CONF["strip-prefix"]
+host = node[len(_sp):] if (_sp and node.startswith(_sp) and len(node) > len(_sp)) else node
+HOSTCOL = [208,159,216,183,135,51,203,177,49,154,218,40,117,222,147,114]   # readable on dark and light
+def host_color(n):
+    n = n.lower()
+    if os.geteuid() == 0: return 196                          # root is always red
+    for sub, c in CONF["color"]:
+        if sub in n: return c
+    return HOSTCOL[zlib.crc32(n.encode()) % len(HOSTCOL)]     # stable per machine, no setup needed
+mc = host_color(node)
+# Per-session color SQUARE: a bright xterm-256 color chosen by a stable crc32 hash of
+# the session name, drawn as a leading solid square. Pure color block (no text on it)
+# so it is always readable; the machine:session text keeps the machine color -> the line
+# carries BOTH box identity (text color) and session identity (square color).
+SQUARE = [160,130,94,58,28,22,23,25,26,27,57,91,127,162,125,161]   # deep jewel tones -> uniform WHITE number, contrast >=4.7
+sq = SQUARE[zlib.crc32(proj.encode()) % len(SQUARE)]
+# Auto-contrast text color for the number sitting INSIDE the colored square: black on
+# light squares, white on dark ones, so the number always reads no matter which color.
+def xlum(i):
+    if i < 16:
+        base = [(0,0,0),(128,0,0),(0,128,0),(128,128,0),(0,0,128),(128,0,128),(0,128,128),
+                (192,192,192),(128,128,128),(255,0,0),(0,255,0),(255,255,0),(0,0,255),
+                (255,0,255),(0,255,255),(255,255,255)]
+        r, gg, b = base[i]
+    elif i < 232:
+        j = i - 16; s = [0,95,135,175,215,255]
+        r, gg, b = s[j//36], s[(j//6)%6], s[j%6]
+    else:
+        v = 8 + 10*(i-232); r = gg = b = v
+    def lin(c):
+        c = c / 255.0
+        return c/12.92 if c <= 0.03928 else ((c+0.055)/1.055) ** 2.4
+    return 0.2126*lin(r) + 0.7152*lin(gg) + 0.0722*lin(b)   # WCAG relative luminance 0..1
+# black if the square is light enough that black beats white (crossover at L=0.179);
+# use TRUE 256 black/white (16/231) because 30;1 bold-black renders as grey.
+tcol = "38;5;16" if xlum(sq) > 0.179 else "38;5;231"
+# Live `amux ls -c` row number: the rank of this session among
+# all amux sessions sorted by name like the `sort -f` in amux (upper-fold, ties byte-wise),
+# so the number on the badge is the one `amux <N>` / rmnum / pick --sessionid take.
+# None if not an amux session.
+def spawn_num(name):
+    sdir = os.path.expanduser("~/.amux/sessions")
+    try:
+        names = [fn[:-4] for fn in os.listdir(sdir)
+                 if fn.endswith(".env") and os.path.isfile(os.path.join(sdir, fn))]
+    except Exception:
+        return None
+    names.sort(key=lambda n: (n.upper(), n))
+    for i, n in enumerate(names, 1):
+        if n == name:
+            return i
+    return None
+snum = spawn_num(proj)
+# Mosh marker: True when any tmux client attached to THIS session came in over
+# mosh -- i.e. a mosh-server is among the client process ancestors. amux attaches remote
+# sessions as mosh-server -> tmux attach (via --mosh / AMUX_MOSH / the picker F5 lane).
+def mosh_attached():
+    if not os.environ.get("TMUX"):
+        return False
+    try:
+        r = subprocess.run(["tmux","list-clients","-t",os.environ.get("TMUX_PANE",""),"-F","#{client_pid}"],
+                           capture_output=True, text=True, timeout=1)
+        pids = [int(p) for p in r.stdout.split() if p.isdigit()]
+        if not pids:
+            return False
+        ps = subprocess.run(["ps","-A","-o","pid=,ppid=,comm="], capture_output=True, text=True, timeout=1).stdout
+    except Exception:
+        return False
+    par, nm = {}, {}
+    for ln in ps.splitlines():
+        f = ln.split(None, 2)
+        if len(f) == 3 and f[0].isdigit() and f[1].isdigit():
+            par[int(f[0])] = int(f[1]); nm[int(f[0])] = os.path.basename(f[2])
+    for p in pids:
+        for _ in range(6):
+            p = par.get(p, 0)
+            if p <= 1: break
+            if nm.get(p, "").startswith("mosh-server"): return True
+    return False
+_mosh = mosh_attached()
+DEFAULTB = ("main", "master")
+def gitbranch(path):   # -> (branch, dirty) for the repo holding path; None if not a repo / detached
+    if not path: return None
+    try:
+        out = subprocess.run(["git","-C",path,"status","-sb","-uno"],
+                             capture_output=True, text=True, timeout=1).stdout
+    except Exception:
+        return None
+    ls = out.splitlines()
+    if not ls or not ls[0].startswith("## "): return None
+    hdr = ls[0][3:]
+    if "no branch" in hdr: return None
+    if hdr.startswith("No commits yet on "): hdr = hdr[18:]   # unborn branch: used to render as "No"
+    return (hdr.split("...")[0].split(" ")[0], len(ls) > 1)
+def worth(bi):         # spend status-line width only on off-default branches or uncommitted work
+    return bool(bi) and (bi[0] not in DEFAULTB or bi[1])
+# Anchor on project_dir (the stable session root). current_dir follows whatever a Bash call last cd-ed
+# into, so it drifts and can even name a deleted dir -> it is the FALLBACK, and it wins only when it is
+# the better of the two (anchor clean on main, but the live cwd is in another repo on a real
+# branch). _bsrc remembers which one won so the label can name the repo if it is not the dir at left.
+_pdir = g("workspace","project_dir")
+_bp = gitbranch(_pdir)
+_bc = _bp if cwd == _pdir else gitbranch(cwd)
+_bi, _bsrc = (_bp, _pdir) if worth(_bp) else ((_bc, cwd) if worth(_bc) else (None, None))
+br = (_bi[0] + ("*" if _bi[1] else "")) if _bi else None
+def headbranch(repo):   # cheap branch read, NO subprocess: .git/HEAD -> branch name (None if detached)
+    try:
+        p = os.path.join(repo, ".git")
+        if not os.path.isdir(p): return None             # worktree/submodule .git FILE -> skip, stay cheap
+        h = open(os.path.join(p, "HEAD")).read().strip()
+    except Exception:
+        return None
+    return h[16:] if h.startswith("ref: refs/heads/") else None
+# CONTAINER dir -- holds sibling repos but is not one itself (e.g. ~/work holding app, api and docs
+# as separate clones). git only ever walks UP, so such a dir has no branch
+# of its own and the segment used to go blank. Surface the children that sit OFF the default branch, read
+# straight from .git/HEAD -- a plain file read, because git status on a Unity-sized child can burn the full
+# 1s timeout on every render. No dirty check for children for the same reason (no * on a roll-up).
+if br is None:
+    _kids = []
+    try:
+        _base = _pdir or cwd
+        for nm in sorted(os.listdir(_base))[:24]:
+            kb = headbranch(os.path.join(_base, nm))
+            if kb and kb not in DEFAULTB: _kids.append((nm, kb))
+    except Exception:
+        _kids = []
+    if _kids:
+        br = "%s:%s" % _kids[0]
+        if len(_kids) > 1: br += " +%d" % (len(_kids) - 1)
+        _bsrc = None                                     # already repo-labeled -> skip the rev-parse prefix
+def cdown(ts):
+    if not ts: return ""
+    s = int(ts - time.time())
+    if s <= 0: return ""
+    if s >= 86400:
+        dd = s // 86400; hh = (s % 86400) // 3600
+        return f"{dd}d {hh}h" if hh else f"{dd}d"
+    if s >= 3600:
+        hh = s // 3600; mm = (s % 3600) // 60
+        return f"{hh}h {mm}m" if mm else f"{hh}h"   # hours range -> show minutes too (days range stays d/h)
+    return f"{max(1,s//60)}m"
+model  = g("model","display_name") or ""
+effort = g("effort","level") or ""
+ctxL   = g("context_window","remaining_percentage")
+d7     = g("rate_limits","seven_day","used_percentage")
+d7r    = cdown(g("rate_limits","seven_day","resets_at"))
+d5     = g("rate_limits","five_hour","used_percentage")
+d5ts   = g("rate_limits","five_hour","resets_at")           # epoch of the next 5h reset
+d5r    = cdown(d5ts)
+cost_usd = g("cost","total_cost_usd")
+sid    = g("session_id") or ""
+HOME   = os.path.expanduser("~")
+TOKCOL = "38;5;117"; COSTCOL = "38;5;144"
+def humantok(n):
+    n = int(n)
+    if n >= 1000000: return f"{n/1000000:.1f}M"
+    if n >= 1000: return f"{n/1000:.0f}k"
+    return str(n)
+def safe_sid(s):
+    return "".join(c for c in s if c.isalnum() or c in "-_") or "nosession"
+# Cumulative tokens for the WHOLE session, surviving /compact. context_window.total_input_tokens and
+# total_output_tokens only describe the CURRENT window (per Claude Code docs: reflects the most recent
+# API response, collapses toward 0 right after /compact until the next call repopulates it) -- there is
+# no field for lifetime session tokens, so bank it in a tiny per-session state file. On every render: if
+# the current total DROPS versus last time, that is a compaction event -- bank the pre-drop peak and keep
+# counting on top of the smaller number. Resets naturally because /clear starts a brand-new session_id.
+tokdir = os.path.join(HOME, ".claude", ".token-state")
+try: os.makedirs(tokdir, exist_ok=True)
+except Exception: pass
+tokfile = os.path.join(tokdir, safe_sid(sid) + ".state")
+ti = g("context_window","total_input_tokens") or 0
+to = g("context_window","total_output_tokens") or 0
+raw = int(ti)                                                 # input only: output varies per response
+last_raw, banked = 0, 0
+try:
+    parts = open(tokfile).read().split()
+    if len(parts) == 2: last_raw, banked = int(parts[0]), int(parts[1])
+except Exception: pass
+if raw > 0:
+    if raw < last_raw * 0.9: banked += last_raw               # a real compaction, not output jitter
+    last_raw = raw
+    try: open(tokfile, "w").write(f"{last_raw} {banked}")
+    except Exception: pass
+total_tok = banked + last_raw + int(to)
+try:                                                          # best-effort weekly sweep of old session files
+    swstamp = os.path.join(tokdir, ".sweep-stamp")
+    if not (os.path.exists(swstamp) and time.time() - os.path.getmtime(swstamp) < 86400):
+        open(swstamp, "a").close(); os.utime(swstamp, None)
+        cutoff = time.time() - 7*86400
+        for fn in os.listdir(tokdir):
+            fp = os.path.join(tokdir, fn)
+            if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                try: os.remove(fp)
+                except Exception: pass
+except Exception: pass
+def col(code, s): return f"\033[{code}m{s}\033[0m"
+DIM = "2;37"; SEP = " · "; AMBER = "38;2;245;201;106"   # truecolor amber #f5c96a; terminals without truecolor show the nearest color
+segs = []   # [prio, visible, colored] in display order; higher prio = kept longer
+def add(prio, vis, code): segs.append([prio, vis, col(code, vis)])
+_wd = os.path.basename(cwd.rstrip("/")) or host               # LIVE working dir (drifts on purpose: the fixed
+                                                              # session name is already the prompt-box tag above)
+# Label variants, widest first: machine:.../dir -> machine:dir -> machine. ALWAYS starts with the
+# .../ form (it used to drop it whenever a branch showed, which made the label jump on every edit).
+_lblv = [f"{host}:…/{_wd}", f"{host}:{_wd}"]
+if _wd != host: _lblv.append(host)                            # last resort: machine only
+_lbl = _lblv[0]
+if snum:
+    _bvis = f" {snum} M " if _mosh else f" {snum} "            # M = attached over mosh
+    _bcol = col(f"48;5;{sq};{tcol};1", _bvis)                   # number INSIDE the color square
+else:
+    _bvis = "■ M" if _mosh else "■"; _bcol = col(f"1;38;5;{sq}", _bvis)   # no amux number -> plain square
+segs.append([100, f"{_bvis} {_lbl}", _bcol + " " + col(f"1;38;5;{mc}", _lbl)])
+# Focus-view chip. SILENT when focus view is off -- same rule as the branch segment: a visible chip
+# always means the transcript is hiding tool detail (ctrl+o expands, ctrl+shift+b / focus toggles).
+# The status JSON carries NO view-mode field, so resolve it exactly the way Claude Code does:
+# settings viewMode wins when set, else the briefTranscript flag in ~/.claude.json. Prio 90 -> it
+# outlives every shed except the machine:session label.
+def focus_on():
+    _h = os.path.expanduser("~")
+    _root = _pdir or cwd or _h
+    for _p in (os.path.join(_root, ".claude", "settings.local.json"),
+               os.path.join(_root, ".claude", "settings.json"),
+               _h + "/.claude/settings.local.json",
+               _h + "/.claude/settings.json"):
+        try:
+            _vm = json.load(open(_p)).get("viewMode")
+        except Exception:
+            continue
+        if _vm:
+            return _vm == "focus"
+    try:
+        return bool(json.load(open(_h + "/.claude.json")).get("briefTranscript"))
+    except Exception:
+        return False
+_fc = focus_on()
+# It rides ON the label segment -- one space after the session name, no " . " separator, so the chip
+# costs 2 cells instead of 5. It is therefore never shed on its own; it lives and dies with the label.
+_fvis = "◉" if _fc else "○"
+_fcol = col("38;5;111" if _fc else "38;5;244", _fvis)   # filled+blue = focus ON, hollow+grey = OFF
+segs[0][1] += " " + _fvis
+segs[0][2] += " " + _fcol
+# Account chip: WHICH subscription identity this session authenticated as.
+# P = personal (the default), T = team, X = team2 (see docs/accounts.md).
+# CLAUDE_ACCOUNT is exported by ~/.config/claude-code/env (personal),
+# env.team and env.team2; a shell that predates that wiring
+# falls back to matching the live token against the slot files, so the chip is never a
+# guess -- it reads ? only when the token belongs to neither slot. Rides ON the label
+# like the focus chip, so it is never shed on its own.
+def acct_badge():
+    _a = (os.environ.get("CLAUDE_ACCOUNT") or "").strip().lower()
+    if _a == "personal": return "P"
+    if _a == "team":     return "T"
+    if _a == "team2":    return "X"
+    _t = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or ""
+    if not _t: return ""
+    # Paths are built by concatenation (the slot names carry their own slash).
+    _cd = os.path.expanduser("~") + "/.config/claude-code"
+    _q = chr(39) + chr(34)
+    for _n, _f in (("P", _cd + "/env"), ("T", _cd + "/env.team"), ("X", _cd + "/env.team2")):
+        try:
+            for _ln in open(_f):
+                _ln = _ln.strip()
+                if _ln.startswith("export CLAUDE_CODE_OAUTH_TOKEN="):
+                    if _ln.split("=", 1)[1].strip().strip(_q) == _t: return _n
+        except Exception:
+            continue
+    return "?"
+_ab = acct_badge()
+# --- quota log (opt-in: quota-log on) ----------------------------------------------
+# Claude Code exposes rate_limits.* ONLY on the status-line stdin payload: headless
+# claude -p never sees them, and /api/oauth/usage refuses a setup token (P/X -> 403
+# missing user:profile, T -> 429). So this is the one place the live 5h/7d numbers can
+# be captured. Append one line per render, throttled to 60s so a busy session does not
+# spam the file. Account is tagged per line, because P, T and X sessions all render here.
+# The log lives at ~/.claude/quota.log. Off unless the config says quota-log on.
+try:
+    _qh = os.path.expanduser("~")
+    _qlog = _qh + "/.claude/quota.log"
+    # One throttle stamp PER ACCOUNT, so busy P sessions cannot suppress T/X readings.
+    _qst = _qh + "/.claude/.quota-log.stamp-" + (_ab or "unknown").replace("?", "unknown")
+    if CONF["quota-log"] and ((d5 is not None) or (d7 is not None)):
+        _qfresh = True
+        try:
+            _qfresh = (time.time() - os.path.getmtime(_qst)) >= 60
+        except Exception:
+            _qfresh = True
+        if _qfresh:
+            open(_qst, "a").close(); os.utime(_qst, None)
+            _qts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _qrs = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(d5ts)) if d5ts else "-"
+            _q5 = ("%.0f" % d5) if d5 is not None else "-"
+            _q7 = ("%.0f" % d7) if d7 is not None else "-"
+            with open(_qlog, "a") as _qfh:
+                _qfh.write("%s %s 5h=%s%% reset=%s 7d=%s%% sid=%s\n"
+                           % (_qts, (_ab or "?"), _q5, _qrs, _q7, (sid or "-")[:8]))
+except Exception:
+    pass
+# --- end quota log ----------------------------------------------------------------
+_avis = f"  {_ab} " if _ab else ""
+# Badge look: P = dark-blue text on white; T = white text on dark blue; X = white text on magenta.
+_ACOL = {"P": "1;38;5;18;48;5;231", "T": "1;38;5;231;48;5;18", "X": "1;38;5;231;48;5;90"}
+_acol = (" " + col(_ACOL.get(_ab, "1;38;5;231;48;5;18"), f" {_ab} ")) if _ab else ""
+segs[0][1] += _avis
+segs[0][2] += _acol
+mp = model.rsplit(" ", 1)
+tier = mp[0] if len(mp) == 2 and mp[1][:1].isdigit() else model   # "Opus 4.8" -> "Opus" (CC = always latest)
+# Tier + version, one scheme for every model: two-letter tier, major digit, minor
+# as a SUPERSCRIPT -- Op5 = Opus 5, Op5⁵ = Opus 5.5, Fa5¹ = Fable 5.1, Op4⁷ = Opus 4.7, Ha4⁵ = Haiku 4.5.
+# Version from model.id first (claude-opus-5-5[1m], claude-haiku-4-5-2025..., claude-3-5-sonnet-...),
+# display_name second. Unknown shapes fall back to the tier word alone.
+TIERABBR = {"opus":"Op","sonnet":"So","haiku":"Ha","fable":"Fa","mythos":"My"}
+SUPD = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+EFFABBR  = {"xhigh":"xh","high":"hi","medium":"md","low":"lo","max":"mx","minimal":"mn","ultra":"ul"}
+_ea = EFFABBR.get(effort.lower(), effort[:2].lower())             # two letters, same as the tier
+_mid = (g("model","id") or "").lower()
+_tn = "|".join(TIERABBR)
+_mv = re.search(r"(" + _tn + r")-(\d{1,2})(?:-(\d{1,2}))?(?!\d)", _mid)       # claude-opus-5-5
+_mo = re.search(r"(\d{1,2})(?:-(\d{1,2}))?-(" + _tn + r")\b", _mid)          # claude-3-5-sonnet (old order)
+_md = re.search(r"(" + _tn + r")\s+(\d{1,2})(?:\.(\d{1,2}))?", model.lower())  # display_name "Opus 5.5"
+if _mo and not _mv:
+    _mv = _mo; _mv_t, _mv_M, _mv_m = _mo.group(3), _mo.group(1), _mo.group(2)
+elif _mv or _md:
+    _mv = _mv or _md; _mv_t, _mv_M, _mv_m = _mv.group(1), _mv.group(2), _mv.group(3)
+if _mv:
+    _ta = TIERABBR[_mv_t] + _mv_M + (_mv_m or "").lstrip("0").translate(SUPD)
+else:
+    _ta = TIERABBR.get(tier.lower(), tier)
+me = f"{_ta} {_ea}".strip() if (tier or effort) else ""
+# Glued onto the label segment after the focus chip ("○ Fb hi", no separator, 2 cells saved), so it
+# is never shed on its own -- the label shrinks to the bare machine first.
+_mevis = f" {me}" if me else ""; _mecol = (" " + col(AMBER, me)) if me else ""
+segs[0][1] += _mevis; segs[0][2] += _mecol
+# Drive the iTerm tab title (via tmux set-titles = #W): "name (M eff!)" — model initial + short effort,
+# ! marks Fable. Live (recomputed each render), tracks /model & /effort. Rename only when it changed.
+if _raw_w and os.environ.get("TMUX_PANE"):
+    _es = {"xhigh":"xh","high":"hi","medium":"md","low":"lo","max":"mx","minimal":"mn","ultra":"ul"}.get(effort.lower(), effort[:2])
+    _mi = tier[:1].upper() if tier else ""
+    _fab = "fable" in model.lower() or tier.lower().startswith("fable")
+    _lab = (f"{_mi} {_es}".strip() + ("!" if _fab else "")).strip()
+    _want = f"{proj} ({_lab})" if _lab else proj
+    if _want != _raw_w:
+        try: subprocess.run(["tmux","rename-window","-t",os.environ["TMUX_PANE"],_want],capture_output=True,timeout=1)
+        except Exception: pass
+if ctxL is not None:
+    c = "38;5;46" if ctxL > 50 else "38;5;226" if ctxL > 20 else "38;5;196"
+    add(50, f"ctx {ctxL:.0f}%", c)
+if ti > 0:                                                    # raw input tokens for the NEXT prompt (prompt + everything
+    add(42, f"in {humantok(ti)}", "38;5;81")                  # else sent) -- current window only, unlike Sigma below
+if total_tok > 0:
+    add(12, f"Σ{humantok(total_tok)}", TOKCOL)                   # prio 12: first real segment shed
+if br:                                                        # branch sits right before 7d
+    if _bsrc:                                                 # name the repo only when it is NOT the dir at left
+        _rn = ""
+        try:
+            _rn = os.path.basename(subprocess.run(["git","-C",_bsrc,"rev-parse","--show-toplevel"],
+                                   capture_output=True, text=True, timeout=1).stdout.strip())
+        except Exception: pass
+        if _rn and _rn != _wd: br = f"{_rn}:{br}"
+    add(5, f"⎇ {br}", "38;5;214" if br.endswith("*") else "38;5;109")   # prio 5 = LOWEST: the repo/branch is the first thing shed
+if d7 is not None:
+    c = "38;5;46" if d7 < 70 else "38;5;226" if d7 < 90 else "38;5;196"
+    # With a branch on the line the 6-char reset countdown is what pushes the whole thing over, so carry
+    # it only when there is room (no branch). Keeping it at high usage backfired: the longer segment then
+    # got shed whole, hiding 7d exactly when it mattered -- the color already carries the urgency.
+    _7 = f"7d {d7:.0f}%" + (f" {d7r}" if d7r else "")
+    add(20, _7, c)
+# 5h quota: shown as "5h 14% 2h". An alternative pie-pair design is kept below, commented out:
+#   left  = QUOTA USED, filling up   (empty -> quarter -> half -> three-quarter -> solid)
+#   right = TIME LEFT in the window, draining the other way (starts solid, empties, resets solid)
+# They are independent: burning the whole quota in the first hour reads solid+solid, coasting reads
+# empty+near-empty. Left is colored on the same three bands ctx/7d use (green under 50%, amber 50-89,
+# BOLD RED from 90) so it is never the plain amber of the effort chip; right stays a cool blue so the
+# pair never mushes into one glyph.
+PIE = "○◔◑◕●"
+def pie(p): return PIE[min(4, max(0, int((p + 12.5) // 25)))]
+if d5 is not None:
+    pc = "38;5;46" if d5 < 50 else AMBER if d5 < 90 else "1;38;5;196"
+    _v = f"5h {d5:.0f}%"; _g = col(pc, _v)
+    # --- PIE PAIR (disabled) -- to restore, delete the two lines above and uncomment these:
+    # _g = col(pc, pie(d5))
+    # _v = pie(d5)
+    # if d5ts:                                                # window length is 5h = 18000s
+    #     _lf = max(0.0, min(1.0, (d5ts - time.time()) / 18000.0)) * 100
+    #     _v += pie(_lf); _g += col("38;5;110", pie(_lf))
+    if d5r:                                                   # countdown in numbers next to the glyphs
+        _v += f" {d5r}"; _g += " " + col("38;5;110", d5r)
+    segs.append([33, _v, _g])
+# if cost_usd is not None and cost_usd > 0:                  # $cost: off by default.
+#     add(15, f"${cost_usd:.2f}", COSTCOL)                     # uncomment these two lines to restore it.
+# Pending-upgrade indicator. native installer self-updates -> a newer build already on disk
+# means "restart to apply" (amber arrows, computed inline, no network). brew/npm do NOT
+# auto-update -> the same arrows in bold red from the throttled background check below (overrides).
+# NOTE: this whole program is a single-quoted  python3 -c  string — keep it APOSTROPHE-FREE.
+HOME = os.path.expanduser("~")
+def _vt(s):
+    try: return tuple(int(x) for x in s.split("."))
+    except Exception: return ()
+ver = g("version") or ""
+up = ""; upc = "38;5;214"
+nv = [b for b in (os.path.basename(p) for p in glob.glob(HOME+"/.local/share/claude/versions/*")) if _vt(b)]
+if ver and nv and _vt(max(nv, key=_vt)) > _vt(ver):
+    up = "↻"                                                 # restart to apply downloaded build (signal only, no version)
+try:
+    fl = open(HOME+"/.claude/.upgrade-flag").read().strip()
+    if fl: up, upc = "↻", "1;38;5;196"                       # bold red: brew/npm needs a manual upgrade
+except Exception: pass
+# The restart arrow is never shed. It trails the whole line after a plain space
+# (no dot separator), i.e. right after the 5h countdown: "... 5h 1% 3h 17m ↻". Two cells are reserved
+# for it before shedding, so whatever ends up last, the arrow still fits.
+_upcol = col(upc, up) if up else ""
+try:                                                          # refresh the brew/npm flag, detached, <=2h
+    st = HOME+"/.claude/.upgrade-stamp"
+    if not (os.path.exists(st) and time.time()-os.path.getmtime(st) < 7200):
+        open(st,"a").close(); os.utime(st, None)
+        subprocess.Popen(["bash", os.environ.get("AMUX_SL_LIB", HOME + "/.claude") + "/statusline-upgrade-check.sh"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+except Exception: pass
+# Responsive: Claude Code sets $COLUMNS (>=2.1.153; tput/TTY do NOT work here). If the
+# joined line would exceed it: shed branch, then collapse the label to the bare machine, then shed
+# segments lowest-prio first; machine (prio 100) always survives.
+try: cols = int(os.environ.get("COLUMNS", "0"))
+except ValueError: cols = 0
+# COLUMNS is the TERMINAL width, but Claude Code draws the status line indented ~2 columns inside its
+# own box, so the usable width is smaller and a line computed as exactly COLUMNS gets clipped with an
+# ellipsis (measured: a 124-char line in a 124-column pane lost its end). Shed against COLUMNS-PAD.
+PAD = 4
+if cols > PAD: cols -= PAD
+# On a narrow pane (laptop, ~90 cols) Sigma is not wanted even when it would fit --
+# space is premium there. Below NARROW raw columns it is dropped up front.
+NARROW = 100
+if 0 < cols + PAD < NARROW: segs = [s for s in segs if s[0] != 12]
+if up and cols > 2: cols -= 2                                 # room for the trailing restart arrow
+def width(ss): return (sum(cells(s[1]) for s in ss) + len(SEP)*(len(ss)-1)) if ss else 0
+def setlbl(t):                                                # rebuild segs[0] (badge + label + focus) shorter
+    segs[0][1] = f"{_bvis} {t} {_fvis}{_avis}{_mevis}"
+    segs[0][2] = _bcol + " " + col(f"1;38;5;{mc}", t) + " " + _fcol + _acol + _mecol
+def shed():                                                   # lowest prio, rightmost on ties
+    segs.pop(max(range(len(segs)), key=lambda i: (-segs[i][0], i)))
+_li = 0
+# Shed order: the quotas must survive.
+# STEP 1: the repo/branch segment goes first (prio 5, the only one under 10).
+while cols > 0 and width(segs) > cols and any(s[0] < 10 for s in segs):
+    shed()
+# STEP 2: collapse the label straight to the bare machine name (no directory) -- one jump, no
+# intermediate machine:dir form, so the line does not flap between three widths.
+if cols > 0 and width(segs) > cols and len(_lblv) > 1:
+    _li = len(_lblv) - 1; setlbl(_lblv[_li])
+# STEP 3: only now drop real segments, lowest prio first (Σ 12 -> 7d 20 -> 5h 33 -> in 42 -> ctx 50).
+while cols > 0 and len(segs) > 1 and width(segs) > cols:
+    shed()
+sys.stdout.write(col(DIM, SEP).join(s[2] for s in segs) + ((" " + _upcol) if up else ""))
+'

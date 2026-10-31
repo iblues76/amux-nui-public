@@ -4,9 +4,11 @@ A ready-to-use build of [**amux**](https://github.com/mixpeek/amux) — the sess
 
 This is the setup its maintainer uses every day, with the personal parts taken out: no machine names, accounts, addresses or credentials ship in it. You bring your own.
 
-**Version 0.3.0** — bundles a modified **amux 0.9.14** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
+**Version 0.3.1** — bundles a modified **amux 0.9.14** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
 
 Works on **macOS and Linux**, and on **Windows** through WSL (driving other machines from MSYS2 or Git Bash is untested; see [docs/windows.md](docs/windows.md)).
+
+I use it every day in **iTerm2 on macOS**, and it works the same in other terminals: it is tested in Linux terminals too. Anything that runs tmux will do; the iTerm2 extras (`amux-tabs`, tab titles) are optional.
 
 ## Install
 
@@ -17,6 +19,8 @@ cd amux-nui-public
 amux-doctor           # what this machine can and cannot do
 setup/bootstrap       # installs whatever amux-doctor says is missing (tmux, python3, fzf, Claude Code)
 ```
+
+Add `--statusline` to also set up the amux status line in Claude Code (see [below](#status-line)).
 
 `install.sh` **copies** `amux`, `amux-server.py` and `amux-remote` (the dashboard reloads itself when its file changes, so it must not run from a checkout you `git pull`), and **symlinks** the companions. To update: `git pull && ./install.sh`. It also adds one line to `~/.zshrc` / `~/.bashrc` for tab completion (`AMUX_NO_COMPLETION=1 ./install.sh` to skip). `./install.sh --help` lists every option.
 
@@ -75,6 +79,22 @@ amux pick -A                                 # fuzzy-pick any session anywhere, 
 
 Use a private network — a mesh VPN such as Tailscale, a trusted LAN, or an SSH tunnel. Never expose the dashboard to the internet: its token controls every session on that machine. Details: **[docs/remote.md](docs/remote.md)**.
 
+## Status line
+
+The bottom line of every Claude Code session, built to go with amux:
+
+```
+ 4  laptop:…/api ○  T  Op5⁵ hi · ctx 82% · in 36k · Σ251k · ⎇ feat/login* · 7d 75% 2d 7h · 5h 61% 3h 29m
+```
+
+The colored square holds the session's `amux ls` row, so `amux 4` attaches to exactly that session. Then the machine (one color per machine) and directory, focus view, which subscription it bills (`P`/`T`/`X`), model and effort, context left, tokens, the branch when it needs attention, and both quota windows with their reset times. Narrow panes drop the least useful parts first.
+
+```sh
+./install.sh --statusline           # or, once installed: amux-statusline --install
+```
+
+It backs up `~/.claude/settings.json` and will not replace a status line you already have unless you add `--force`. Every segment, the color settings and removal: **[docs/statusline.md](docs/statusline.md)**.
+
 ## Commands
 
 | Command | What it does |
@@ -93,6 +113,7 @@ Use a private network — a mesh VPN such as Tailscale, a trusted LAN, or an SSH
 | [`check-claude-auth`](bin/check-claude-auth) | Whether sessions here will really authenticate, per account |
 | [`amux-rename`](bin/amux-rename) | Rename a session everywhere at once without losing its context |
 | [`amux-rm-stopped`](bin/amux-rm-stopped) | Remove every stopped session from the list (asks first) |
+| [`amux-statusline`](bin/amux-statusline) | The Claude Code status line above; `--install` / `--uninstall` |
 | [`amux-tabs`](bin/amux-tabs) | One iTerm2 tab per session (macOS) |
 | [`amux-termprobe`](bin/amux-termprobe) | Logs the terminal's real colors around each attach (debugging aid; `AMUX_TERMPROBE=0` disables) |
 
@@ -103,6 +124,7 @@ Every command answers `-h`.
 - [**accounts.md**](docs/accounts.md) — several Claude subscriptions: slots, tokens, the logout step
 - [**auth.md**](docs/auth.md) — `/login` vs long-lived tokens, browser control, the both-at-once trap
 - [**remote.md**](docs/remote.md) — connecting machines; tokens and rotation
+- [**statusline.md**](docs/statusline.md) — the status line: every segment, settings, install and removal
 - [**windows.md**](docs/windows.md) — WSL vs MSYS2 vs Git Bash
 - [**troubleshooting.md**](docs/troubleshooting.md) — symptoms, causes, fixes
 

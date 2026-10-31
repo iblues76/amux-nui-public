@@ -4,6 +4,8 @@
 #   ./install.sh                  install or update everything into ~/.local/bin
 #   ./install.sh --client         companions + amux-remote only (drive other machines,
 #                                 run no sessions here)
+#   ./install.sh --statusline     also set up the amux status line in Claude Code
+#                                 (backs up ~/.claude/settings.json; see docs/statusline.md)
 #   ./install.sh --uninstall      remove the symlinks we created (core copies stay)
 #   ./install.sh --show-config    print where things would go; change nothing
 #
@@ -44,10 +46,12 @@ fi
 
 MODE=install
 ROLE=full
+STATUSLINE=0
 [ -n "${AMUX_ROLE-}" ] && ROLE="$AMUX_ROLE"
 while [ $# -gt 0 ]; do
   case "$1" in
     --client)      ROLE=client ;;
+    --statusline)  STATUSLINE=1 ;;
     --uninstall)   MODE=uninstall ;;
     --show-config) MODE=show ;;
     -h|--help)     awk 'NR==1&&/^#!/{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
@@ -80,6 +84,10 @@ if [ "$MODE" = show ]; then
 fi
 
 if [ "$MODE" = uninstall ]; then
+  # Unwire the status line first, or Claude Code would be left pointing at a removed file.
+  if [ -L "$BIN/amux-statusline" ] && [ "$(readlink "$BIN/amux-statusline")" = "$here/bin/amux-statusline" ]; then
+    "$BIN/amux-statusline" --uninstall || true
+  fi
   n=0
   for f in "$here"/bin/*; do
     l="$BIN/$(basename "$f")"
@@ -140,6 +148,13 @@ for f in "$here"/bin/*; do
 done
 chmod +x "$here"/lib/*.py 2>/dev/null || true
 echo "linked $n companion commands into $BIN"
+
+# ── status line (opt-in) ─────────────────────────────────────────────────────
+# Never automatic: it edits ~/.claude/settings.json, and refuses to replace a status
+# line you already have unless you run  amux-statusline --install --force  yourself.
+if [ "$STATUSLINE" = 1 ]; then
+  "$BIN/amux-statusline" --install || echo "  status line: not installed (see above)" >&2
+fi
 
 # ── Linux: keep tmux alive when the amux-serve service restarts ──────────────
 # amux-server.py starts the tmux server, so tmux and EVERY agent session can be

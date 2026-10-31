@@ -16,6 +16,7 @@
 #   6. the renderer produces the same output for local and remote given the same data
 #   7. the bundled amux: version, help, server syntax, register/ls/account/rm on a
 #      dummy session (never launched), completion generation
+#   7b. the status line renders, sheds, and installs without clobbering settings
 #   8. the audit catches a planted secret
 #
 # Usage:
@@ -563,6 +564,48 @@ if has "compdef" "$o"; then ok "zsh completion generates"; else bad "zsh complet
 
 printf 'y\n' | run "$BINDIR/amux" rm demo
 [ ! -f "$CC_HOME/sessions/demo.env" ] && ok "rm removes the dummy session" || bad "rm left the session behind"
+
+# ── 7b. status line ──────────────────────────────────────────────────────────
+sect "7b. Status line"
+SL="$BINDIR/amux-statusline"
+_now=$(date +%s)
+SLJSON='{"model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"effort":{"level":"high"},"workspace":{"current_dir":"'"$SANDBOX"'","project_dir":"'"$SANDBOX"'"},"context_window":{"remaining_percentage":82,"total_input_tokens":36000,"total_output_tokens":2000},"rate_limits":{"five_hour":{"used_percentage":61,"resets_at":'$((_now+12000))'},"seven_day":{"used_percentage":75,"resets_at":'$((_now+200000))'}},"session_id":"selftest-sl","version":"0.0.1"}'
+plain() { sed 's/\x1b\[[0-9;]*m//g'; }
+o=$(printf '%s' "$SLJSON" | COLUMNS=200 "$SL" 2>&1 | plain)
+if has "Op5⁵ hi" "$o" && has "ctx 82%" "$o" && has "in 36k" "$o" && has "7d 75%" "$o" && has "5h 61%" "$o"; then
+  ok "renders model, context, tokens and both quotas"
+else
+  bad "status line render" "$o"
+fi
+o=$(printf '%s' "$SLJSON" | COLUMNS=70 "$SL" 2>&1 | plain)
+if has "ctx 82%" "$o" && ! has "Σ" "$o"; then ok "narrow pane sheds Σ and keeps ctx"; else bad "narrow shedding" "$o"; fi
+n=$(awk '/^exec python3 -c /{on=1;next} on' "$REPO/bin/amux-statusline" | tr -cd "'" | wc -c | tr -d ' ')
+[ "$n" = 1 ] && ok "python body has no stray apostrophe" || bad "python body has $((n-1)) stray apostrophe(s)"
+printf '%s' "$SLJSON" | COLUMNS=200 "$SL" >/dev/null 2>&1
+[ ! -e "$HOME/.claude/quota.log" ] && ok "quota log is off by default" || bad "quota log written without opt-in"
+mkdir -p "$HOME/.config/amux"
+printf 'color %s 99\nquota-log on\n' "$(uname -n | cut -c1-3)" > "$HOME/.config/amux/statusline.conf"
+o=$(printf '%s' "$SLJSON" | COLUMNS=200 "$SL" 2>&1)
+has "38;5;99m" "$o" && ok "config fixes the machine color" || bad "config color ignored"
+[ -s "$HOME/.claude/quota.log" ] && ok "quota-log on writes the log" || bad "quota-log on wrote nothing"
+rm -f "$HOME/.config/amux/statusline.conf" "$HOME/.claude/quota.log"
+o=$("$SL" --install 2>&1)
+if python3 -c 'import json,os,sys; c=json.load(open(os.path.expanduser("~/.claude/settings.json")))["statusLine"]["command"]; sys.exit(0 if c.endswith("/amux-statusline") else 1)' 2>/dev/null; then
+  ok "--install wires settings.json"
+else
+  bad "--install did not wire settings.json" "$o"
+fi
+has "already installed" "$("$SL" --install 2>&1)" && ok "--install is idempotent" || bad "--install not idempotent"
+"$SL" --uninstall >/dev/null 2>&1
+printf '{"statusLine":{"type":"command","command":"my-own-line"},"keep":1}\n' > "$HOME/.claude/settings.json"
+if ! "$SL" --install >/dev/null 2>&1 && grep -q my-own-line "$HOME/.claude/settings.json"; then
+  ok "--install refuses to replace an existing status line"
+else
+  bad "--install replaced someone else's status line"
+fi
+"$SL" --uninstall >/dev/null 2>&1
+grep -q my-own-line "$HOME/.claude/settings.json" && ok "--uninstall leaves a foreign status line alone" || bad "--uninstall removed a foreign status line"
+rm -rf "$HOME/.claude"
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"
