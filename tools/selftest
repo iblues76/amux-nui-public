@@ -17,7 +17,8 @@
 #   7. the bundled amux: version, help, server syntax, register/ls/account/rm on a
 #      dummy session (never launched), completion generation
 #   7b. the status line renders, sheds, and installs without clobbering settings
-#   7c. amux search finds a project by content and ends with the --agentic tip
+#   7c. amux search finds a project by content and ends with the --agentic tip;
+#       -e ranks by co-occurrence, skips injected text, --show, groups, | head
 #   8. the audit catches a planted secret
 #
 # Usage:
@@ -623,7 +624,30 @@ o=$(PATH="$BINDIR:$PATH" "$BINDIR/amux" search "how did we fix zebrafinch42" 2>&
 has "amux search --agentic 'how did we fix zebrafinch42'" "$o" && ok "a question is suggested as typed, not wrapped again" || bad "question re-wrapped" "$o"
 o=$(AMUX_SEARCH_INNER=1 PATH="$BINDIR:$PATH" "$BINDIR/amux" search zebrafinch42 2>&1)
 ! has "tip:" "$o" && ok "no tip when the agentic run's own agent reads it" || bad "tip shown to the agent"
-rm -rf "$HOME/claudecode"
+# a Claude transcript: one real mention of both words, plus words that live only in an
+# injected reminder (must not count)
+key=$(python3 -c 'import os,re,sys; print(re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(sys.argv[1])))' "$HOME/claudecode/searchproj")
+mkdir -p "$HOME/.claude/projects/$key"
+{
+  printf '%s\n' '{"type":"user","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"set up wombat99 with quokka77 please"}}'
+  printf '%s\n' '{"type":"user","timestamp":"2026-10-01T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>numbat55 rules</system-reminder> ok"}]}}'
+} > "$HOME/.claude/projects/$key/0000aaaa-test.jsonl"
+o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux" search -e wombat99 -e quokka77 2>&1 | plain)
+has "wombat99×1 quokka77×1 · all in 1" "$o" && ok "-e terms are counted together (co-occurrence)" || bad "-e co-occurrence line missing" "$o"
+o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux" search --in chat numbat55 2>&1 | plain)
+has "no matches" "$o" && ok "text inside an injected reminder is not a match" || bad "injected reminder text matched" "$o"
+[ -d "$HOME/.amux/cache/search" ] && ok "the said-text cache was built" || bad "no ~/.amux/cache/search"
+o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux-search" --show "$HOME/claudecode/searchproj" -e quokka77 2>&1 | plain)
+has "set up wombat99 with quokka77" "$o" && ok "--show prints the session's prompts and excerpts" || bad "--show output missing" "$o"
+o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux" search --corefleet zebrafinch42 2>&1 | plain)
+has "no CORE group defined" "$o" && has "searchproj" "$o" && ok "--corefleet without groups searches this machine" || bad "--corefleet without groups" "$o"
+printf 'CORE="local"\n' > "$HOME/.amux/search-groups.conf"
+o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux" search --corefleet zebrafinch42 2>&1 | plain)
+! has "no CORE group" "$o" && has "searchproj" "$o" && ok "--corefleet reads ~/.amux/search-groups.conf" || bad "--corefleet with a group file" "$o"
+rm -f "$HOME/.amux/search-groups.conf"
+o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux-search" zebrafinch42 2>&1 | head -1; echo "rc=${PIPESTATUS[0]}")
+! has "BrokenPipe" "$o" && ! has "rc=120" "$o" && ok "piping into head ends quietly" || bad "| head raised" "$o"
+rm -rf "$HOME/claudecode" "$HOME/.claude" "$HOME/.amux/cache"
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"

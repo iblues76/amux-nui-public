@@ -6,15 +6,30 @@ fleet) have talked about / contain a string. Returns amux sessions, with their
 Usage:
   amux search "text"                         this box
   amux search laptop,desk "text"              those boxes (comma list; 'local' = this box)
-  amux search --fleet "text"                 this box + every box in ~/.amux/remotes
+  amux search --corefleet "text"             the core group of boxes (see Box groups)
+  amux search --fleetall "text"              this box + every box in ~/.amux/remotes
+  amux search -e luks -e clevis [boxes]      several terms in one pass, sessions ranked by
+                                             how densely they mention them together
   amux search desk --prompt                  ask for the text (no shell quoting worries)
+  amux search --show <box> <row|dir> -e t    what one session said around the terms
   amux search --agentic "question" [--provider claude|codex|opencode] [--model m] [--effort e] [--account P|T|X]
                                              an agent runs the literal searches for you (below)
   amux search -c "follow-up"                 reply to the last agentic answer (same agent, scope, memory)
   amux search -c                             …typing the reply at a prompt
 
+Box groups (literal default: this box; agentic default: --corefleet):
+  --corefleet          the CORE boxes
+  --mainfleet          the MAIN boxes (always includes CORE)
+  --fleetall           every box (--fleet, -A and --all are the same)
+  Groups are CORE="a b c" / MAIN="…" lines in ~/.amux/search-groups.conf (machine
+  names or ssh aliases). No group defined = this machine.
+
 Options:
-  --fleet, -A          every box
+  -e TERM              a search term; repeat for several (a lone positional is then the
+                       box list). Results rank by co-occurrence, then recency
+  --and                with several terms: only sessions that mention every term
+  --since N[dhw]|DATE  only sessions active since then (30d, 12h, 2w, 2026-10-01)
+  -n N                 --show: how many excerpts (default 20)
   --providers p,p      only sessions of these agents: claude,codex,opencode,agy,gemini
                        (also picks which project roots are scanned for session-less dirs)
   --in s,s             what to match (default: all three)
@@ -25,15 +40,17 @@ Options:
   -s, --case-sensitive (default: case-insensitive)
   -w, --word           whole words only ("num" no longer matches "confirmNumber")
   --no-orphans         hide project dirs that have no amux session
-  -t SEC               per-box time budget (default 90)
+  -t SEC               per-box time budget (default 45)
   -h, --help           this help
 
-Agentic mode (--agentic): instead of one literal match, a headless agent reads your
-question, runs several literal `amux search` variants (synonyms, box/file names,
---in scopes), reads the matching transcripts, and returns the sessions ranked with
-a one-line reason each. Scope is the WHOLE FLEET by default (the reverse of the
-literal mode): a box list narrows it, --local means this box only, and a question
-that names boxes is searched on those. --providers / --in / -t pass through.
+Agentic mode (--agentic): a quick literal look at the question's keywords prints
+first (seconds), then a headless agent runs more literal searches (synonyms,
+file names, --in scopes), reads what the matching sessions said, and returns the
+sessions ranked with a one-line reason each. Each step it takes prints as it goes.
+Scope is --corefleet by default; the agent widens to --mainfleet / --fleetall only
+when core has nothing. A box list or --mainfleet / --fleetall sets the scope,
+--local means this box only. --providers / --in / -t / --since pass through. If the
+agent runs out of time (10 min) you get what it had found, not nothing.
   -c, --continue       follow up on the last agentic answer; the agent keeps its memory
                        and settings (stored in ~/.amux/search-last.json). No text = prompt
   --local              this box only
@@ -48,8 +65,12 @@ Takes one to several minutes. Same spellings as `amux exec --provider/--model/--
 Project roots scanned for session-less dirs: ~/claudecode ~/codex ~/opencode ~/agy
 ~/antigravity. A registered session's dir is searched wherever it lives.
 
-Output: one block per box, one line per hit:
-  <row>  <session>  <provider>  <dir>  chat×N files×N name
+Conversation text is matched against a per-box cache of what was actually said
+(~/.amux/cache/search, a few % of the transcripts' size), built on first use and
+refreshed per transcript when it changes.
+
+Output: one block per box as each box answers, one line per hit:
+  <row>  <session>  <provider>  <dir>  chat×N files×N name   [term×N term×N · all in N]
        ↳ snippet
 then `amux -H <box> attach <row>` (or `amux <row>` locally) opens it.
 """
@@ -60,10 +81,12 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser("~")
 CC_HOME = os.environ.get("CC_HOME") or (HOME + "/.amux")
@@ -86,7 +109,15 @@ AGENTS = ("claude", "codex", "opencode")
 AGENT_DEFAULTS = {"provider": "claude", "model": {"claude": "opus"}, "effort": "medium",
                   "account": "personal"}
 ACCOUNT_SLOT = {"personal": "env", "team": "env.team", "team2": "env.team2"}
-AGENT_BUDGET = 900  # wall-clock cap on one agentic run
+AGENT_BUDGET = 600  # wall-clock cap on one agentic run; what it found by then is shown
+AGENT_SOFT = 420    # the agent is told to stop searching and answer by this point
+AGENT_TURNS = 60
+BOX_BUDGET = 45     # default per-box literal budget (-t)
+CACHE = CC_HOME + "/cache/search"
+CACHE_VER = 2
+OUT_CAP = 4000     # a cached tool result keeps its first 3/4 and last 1/4 up to this
+SCOPES = ("core", "main", "all")
+SCOPE_FLAG = {"core": "--corefleet", "main": "--mainfleet", "all": "--fleetall"}
 
 
 def die(msg, rc=2):
@@ -130,7 +161,7 @@ def registered_sessions():
 
 def canary_globs():
     names = []
-    for p in ("/etc/nui-canary.files", "/usr/local/etc/nui-canary.paths"):
+    for p in (os.path.expanduser("~/.config/amux/search-exclude.txt"),):
         try:
             for line in open(p):
                 line = line.strip()
@@ -187,87 +218,9 @@ def snippet(text, q, cs):
     return ("…" if a > 0 else "") + s + ("…" if b < len(text) else "")
 
 
-def file_snippet(path, q, cs):
-    try:
-        with open(path, errors="replace") as fh:
-            for line in fh:
-                s = snippet(line, q, cs)
-                if s:
-                    return s
-    except OSError:
-        pass
-    return ""
-
-
 REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 INJECTED = ("# AGENTS.md instructions", "<environment_context>", "<user_instructions>",
             "<skills_instructions>", "<permissions instructions>")
-
-
-def _texts_claude(o):
-    """What was actually SAID in one Claude Code JSONL line — prompts, replies, tool
-    calls and results — minus the injected CLAUDE.md / skill list / reminders that
-    every transcript carries (or every session would match every fleet word)."""
-    if o.get("type") not in ("user", "assistant") or o.get("isMeta"):
-        return
-    c = (o.get("message") or {}).get("content")
-    items = [{"type": "text", "text": c}] if isinstance(c, str) else (c or [])
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        t = it.get("type")
-        if t == "text":
-            yield REMINDER.sub(" ", it.get("text") or "")
-        elif t == "tool_use":
-            yield json.dumps(it.get("input"), ensure_ascii=False)
-        elif t == "tool_result":
-            r = it.get("content")
-            if isinstance(r, list):
-                r = " ".join(x.get("text") or "" for x in r if isinstance(x, dict))
-            yield REMINDER.sub(" ", r or "")
-
-
-def _texts_codex(o):
-    """Same for one Codex JSONL line: user/assistant messages + tool calls/outputs;
-    developer messages and injected AGENTS.md / environment blocks are skipped."""
-    if o.get("type") != "response_item":
-        return
-    p = o.get("payload") or {}
-    t = p.get("type")
-    if t == "message" and p.get("role") in ("user", "assistant"):
-        for it in p.get("content") or []:
-            s = (it or {}).get("text") or ""
-            if not s.lstrip().startswith(INJECTED):
-                yield s
-    elif t in ("function_call", "custom_tool_call"):
-        yield str(p.get("arguments") or p.get("input") or "")
-    elif t in ("function_call_output", "custom_tool_call_output"):
-        out = p.get("output")
-        if isinstance(out, list):
-            out = " ".join((x or {}).get("text") or "" for x in out if isinstance(x, dict))
-        yield str(out or "")
-
-
-def convo_snippet(path, q, cs, texts):
-    # the raw-line prefilter is exact only for plain ASCII queries (JSON may escape the rest)
-    pre = q.isascii() and '"' not in q and "\\" not in q
-    ql = q.lower()
-    try:
-        with open(path, errors="replace") as fh:
-            for line in fh:
-                if pre and (q not in line if cs else ql not in line.lower()):
-                    continue
-                try:
-                    o = json.loads(line)
-                except ValueError:
-                    continue
-                for t in texts(o):
-                    s = snippet(t, q, cs)
-                    if s:
-                        return s
-    except OSError:
-        pass
-    return ""
 
 
 def find_rg():
@@ -282,44 +235,72 @@ def find_rg():
     return None
 
 
-def grep_files(paths, q, cs, extra=None):
-    """Files under `paths` containing q (fixed string). rg if present, else grep."""
-    paths = [p for p in paths if os.path.exists(p)]
-    if not paths:
-        return []
+def _grep_cmd(rg_mode, grep_mode, cs, extra=None, maxsize="20M"):
+    """(argv, executable) for a fixed-string rg (else grep) with the exclude list (~/.config/amux/search-exclude.txt)."""
     excl = canary_globs()
     rg = find_rg()
-    exe = None
     if rg:
-        exe = rg
-        cmd = ["rg", "-l", "-F", "--no-messages", "--max-filesize", "20M"]
+        cmd = ["rg"] + rg_mode + ["-F", "--no-messages"]
+        if maxsize:
+            cmd += ["--max-filesize", maxsize]
         if not cs:
             cmd.append("-i")
         if WORD:
             cmd.append("-w")
         for n in excl:
             cmd += ["-g", "!" + n]
-        cmd += extra or []
-        cmd += ["-e", q, "--"] + paths
-    else:
-        cmd = ["grep", "-rIl", "-F", "--exclude-dir=.git", "--exclude-dir=node_modules",
-               "--exclude-dir=.venv"]
-        if not cs:
-            cmd.append("-i")
-        if WORD:
-            cmd.append("-w")
-        for n in excl:
-            cmd.append("--exclude=" + n)
-        cmd += ["-e", q, "--"] + paths
+        return cmd + (extra or []), rg
+    cmd = ["grep"] + grep_mode + ["-F", "--exclude-dir=.git", "--exclude-dir=node_modules",
+                                  "--exclude-dir=.venv"]
+    if not cs:
+        cmd.append("-i")
+    if WORD:
+        cmd.append("-w")
+    for n in excl:
+        cmd.append("--exclude=" + n)
+    return cmd, None
+
+
+def _run_lines(cmd, exe):
     try:
         r = subprocess.run(cmd, executable=exe, capture_output=True, text=True,
                            timeout=FILE_TIMEOUT, errors="replace")
+        out = r.stdout
     except subprocess.TimeoutExpired as e:
-        r = e
-        out = (e.stdout or b"")
+        out = e.stdout or b""
         out = out.decode(errors="replace") if isinstance(out, bytes) else out
-        return [l for l in out.splitlines() if l]
-    return [l for l in r.stdout.splitlines() if l]
+    return [l for l in out.splitlines() if l]
+
+
+def grep_files(paths, terms, cs, extra=None, maxsize="20M"):
+    """Files under `paths` containing any of the terms (fixed strings)."""
+    if isinstance(terms, str):
+        terms = [terms]
+    paths = [p for p in paths if os.path.exists(p)]
+    if not paths or not terms:
+        return []
+    cmd, exe = _grep_cmd(["-l"], ["-rIl"], cs, extra, maxsize)
+    for t in terms:
+        cmd += ["-e", t]
+    return _run_lines(cmd + ["--"] + paths, exe)
+
+
+def count_files(paths, term, cs, extra=None):
+    """{file: matching line count} for one term under `paths` (files with ≥1 match)."""
+    paths = [p for p in paths if os.path.exists(p)]
+    if not paths:
+        return {}
+    cmd, exe = _grep_cmd(["-c"], ["-rIc"], cs, extra, None)
+    out = {}
+    for l in _run_lines(cmd + ["-e", term, "--"] + paths, exe):
+        p, _, n = l.rpartition(":")
+        try:
+            n = int(n)
+        except ValueError:
+            continue
+        if n > 0 and p:
+            out[p] = n
+    return out
 
 
 def owner(path, dirs):
@@ -336,14 +317,201 @@ def claude_key(d):
     return re.sub(r"[^A-Za-z0-9]", "-", d)
 
 
+def claude_roots():
+    """(cache name, projects dir) for every ~/.claude*/projects on this box."""
+    out = []
+    for proj in sorted(glob.glob(HOME + "/.claude*/projects")):
+        out.append((os.path.basename(os.path.dirname(proj)).lstrip(".") or "claude", proj))
+    return out
+
+
+SELF_KEYS = ("amux-search-agentic",)  # the agentic runs' own scratch projects
+
+
+def excluded_ids():
+    """Conversation ids never to report: the session that launched this search (a
+    Claude session asking about X always 'matches' X) and the agentic run itself."""
+    ids = set()
+    for v in ("AMUX_SEARCH_EXCLUDE", "CLAUDE_CODE_SESSION_ID"):
+        ids.update(x for x in (os.environ.get(v) or "").replace(",", " ").split() if x)
+    return ids
+
+
+# ───────────────────────────── said-text cache ─────────────────────────────
+
+class SaidCache:
+    """What each transcript actually SAID (the _roles_*() output), one item per line,
+    under ~/.amux/cache/search/<kind>/…/<id>.txt. A transcript is re-extracted only
+    when its size or mtime changes, so a search greps a few % of the raw JSONL and
+    never parses JSON (and never matches the injected CLAUDE.md every transcript
+    carries)."""
+
+    def __init__(self):
+        self.idx_path = CACHE + "/index.json"
+        self.idx = {"v": CACHE_VER, "files": {}}
+        try:
+            with open(self.idx_path) as fh:
+                d = json.load(fh)
+            if d.get("v") == CACHE_VER:
+                self.idx = d
+        except (OSError, ValueError):
+            pass
+        self.dirty = False
+        self.built = 0
+
+    def get(self, src, dst, roles, meta=None):
+        """Cache path for src (re-extracted when stale) and its index entry; None if
+        the source is unreadable. meta(src) → extra entry fields (codex: cwd)."""
+        try:
+            st = os.stat(src)
+        except OSError:
+            return None, None
+        sig = [st.st_size, st.st_mtime_ns]
+        ent = self.idx["files"].get(src)
+        if ent and ent.get("sig") == sig and os.path.exists(dst):
+            return dst, ent
+        ent = {"sig": sig, "mtime": st.st_mtime, "dst": dst}
+        if meta:
+            ent.update(meta(src))
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tmp = "%s.%d.tmp" % (dst, os.getpid())
+            with open(tmp, "w", errors="replace") as out, open(src, errors="replace") as fh:
+                for line in fh:
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(o, dict):
+                        continue
+                    for role, t in roles(o):
+                        t = " ".join((t or "").split())
+                        if role == "out" and len(t) > OUT_CAP:
+                            # long tool output is mostly file dumps (the files search
+                            # covers those); keep its head and tail
+                            t = t[:OUT_CAP * 3 // 4] + " … " + t[-(OUT_CAP // 4):]
+                        if t:
+                            out.write(t + "\n")
+            os.replace(tmp, dst)
+        except OSError:
+            return None, None
+        self.idx["files"][src] = ent
+        self.dirty = True
+        self.built += 1
+        if self.built % 50 == 0:
+            self.save()  # a first build cut off by the time budget resumes next run
+        return dst, ent
+
+    def save(self):
+        # drop the cache of transcripts that no longer exist
+        for src in [s for s in self.idx["files"] if not os.path.exists(s)]:
+            dst = self.idx["files"].pop(src).get("dst")
+            if dst and dst.startswith(CACHE + "/"):
+                try:
+                    os.unlink(dst)
+                except OSError:
+                    pass
+            self.dirty = True
+        if not self.dirty:
+            return
+        try:
+            os.makedirs(CACHE, exist_ok=True)
+            tmp = "%s.%d.tmp" % (self.idx_path, os.getpid())
+            with open(tmp, "w") as fh:
+                json.dump(self.idx, fh)
+            os.replace(tmp, self.idx_path)
+        except OSError:
+            pass
+
+
+def codex_meta(src):
+    try:
+        with open(src, errors="replace") as fh:
+            meta = json.loads(fh.readline())
+        return {"cwd": os.path.realpath(meta.get("payload", {}).get("cwd") or "")}
+    except (OSError, ValueError, AttributeError):
+        return {"cwd": ""}
+
+
+def transcripts(dirs, since=None, exclude=()):
+    """[(cache file, candidate dir, source, mtime)] for every Claude/Codex transcript
+    that belongs to one of `dirs`, with the cache brought up to date."""
+    cache = SaidCache()
+    out = []
+    keymap = {claude_key(d): d for d in dirs}
+    for name, proj in claude_roots():
+        for k, d in keymap.items():
+            if any(s in k for s in SELF_KEYS):
+                continue
+            for src in glob.glob(proj + "/" + k + "/*.jsonl"):
+                sid = os.path.basename(src)[:-6]
+                if sid in exclude:
+                    continue
+                try:
+                    mt = os.path.getmtime(src)
+                except OSError:
+                    continue
+                if since and mt < since:
+                    continue
+                dst, ent = cache.get(src, "%s/claude/%s/%s/%s.txt" % (CACHE, name, k, sid), _roles_claude)
+                if dst:
+                    out.append((dst, d, src, mt))
+    cdir = HOME + "/.codex/sessions"
+    if os.path.isdir(cdir):
+        for src in glob.glob(cdir + "/**/*.jsonl", recursive=True):
+            try:
+                mt = os.path.getmtime(src)
+            except OSError:
+                continue
+            if since and mt < since:
+                continue
+            rel = os.path.relpath(src, cdir)
+            if any(x in rel for x in exclude):
+                continue
+            dst, ent = cache.get(src, CACHE + "/codex/" + rel[:-6] + ".txt", _roles_codex, codex_meta)
+            d = dst and owner(ent.get("cwd") or "", dirs)
+            if d:
+                out.append((dst, d, src, mt))
+    cache.save()
+    if cache.built > 20:
+        print("amux search: cached %d transcripts (one-time, then incremental)" % cache.built,
+              file=sys.stderr)
+    return out
+
+
+# ───────────────────────────── search ─────────────────────────────
+
+def line_terms(path, terms, cs, limit=None):
+    """({term: lines containing it}, snippet) for one plain-text file. The snippet
+    prefers a line with the most terms; hits inside encoded blobs don't count."""
+    counts = dict.fromkeys(terms, 0)
+    best, best_n = "", 0
+    try:
+        with open(path, errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if limit and i >= limit:
+                    break
+                present = [t for t in terms if snippet(line, t, cs)]
+                for t in present:
+                    counts[t] += 1
+                if len(present) > best_n:
+                    best_n = len(present)
+                    best = snippet(line, present[0], cs)
+    except OSError:
+        pass
+    return counts, best
+
+
 def search_local(req):
     global WORD
-    q, cs = req["query"], req.get("case_sensitive", False)
+    terms = [t for t in (req.get("terms") or [req.get("query")]) if t]
+    cs = req.get("case_sensitive", False)
     WORD = bool(req.get("word"))
     kinds = set(req.get("kinds") or KINDS)
     provs = set(req.get("providers") or [])
     orphans = req.get("orphans", True)
-    has = lambda s: next(occurrences(s, q, cs), None) is not None
+    since = req.get("since")
+    exclude = set(req.get("exclude") or []) | excluded_ids()
 
     regs = registered_sessions()
     all_reg_dirs = {s["dir"] for s in regs if s["dir"]}
@@ -369,32 +537,20 @@ def search_local(req):
                     continue  # its registered sub-dir already represents it
                 cands[d] = {"row": None, "name": None, "provider": None, "dir": d,
                             "hits": {}, "snip": ""}
+    for c in cands.values():
+        c.update(tc={}, cooc=0, allin=0, newest=0)
     dirs = [d for d in cands if not d.startswith("<nodir>:")]
 
     tries = {}
 
-    def verify(d, f, kind, texts=None):
-        """file_snippet(), but read at most VERIFY_CAP files per (dir, kind); past
-        that the file is counted unverified and the count renders as N+."""
-        if not d:
-            return ""
-        k = (d, kind)
-        tries[k] = tries.get(k, 0) + 1
-        if tries[k] > VERIFY_CAP:
-            # only trusted once this session already has a verified hit of this kind
-            if cands[d]["hits"].get(kind):
-                bump(d, kind)
-                more = cands[d].setdefault("more", [])
-                if kind not in more:
-                    more.append(kind)
-            return ""
-        return convo_snippet(f, q, cs, texts) if texts else file_snippet(f, q, cs)
-
-    def bump(d, kind, n=1, snip=""):
+    def bump(d, kind, n=1, snip="", tc=None):
         c = cands.get(d)
         if c is None:
             return
         c["hits"][kind] = c["hits"].get(kind, 0) + n
+        for t, v in (tc or {}).items():
+            if v:
+                c["tc"][t] = c["tc"].get(t, 0) + v
         if snip and (not c["snip"] or kind == "chat" and not c.get("_chat_snip")):
             c["snip"] = snip
             if kind == "chat":
@@ -402,88 +558,115 @@ def search_local(req):
 
     if "name" in kinds:
         for d, c in cands.items():
-            if any(has(x or "") for x in (c["name"], c["provider"], c["dir"])):
-                bump(d, "name")
+            found = {t: 1 for t in terms
+                     if any(next(occurrences(x or "", t, cs), None) for x in (c["name"], c["provider"], c["dir"]))}
+            if found:
+                bump(d, "name", 1, "", found)
 
     if "files" in kinds and dirs:
-        for f in grep_files(dirs, q, cs):
+        for f in grep_files(dirs, terms, cs):
             d = owner(f, dirs)
-            s = verify(d, f, "files")  # drops files whose only hits are encoded blobs
-            if s:
-                bump(d, "files", 1, os.path.relpath(f, d) + ": " + s)
+            if not d:
+                continue
+            k = (d, "files")
+            tries[k] = tries.get(k, 0) + 1
+            if tries[k] > VERIFY_CAP:
+                # past the cap a file is counted unverified, once a verified hit exists
+                if cands[d]["hits"].get("files"):
+                    bump(d, "files")
+                    more = cands[d].setdefault("more", [])
+                    if "files" not in more:
+                        more.append("files")
+                continue
+            counts, s = line_terms(f, terms, cs, limit=200000)
+            if s:  # drops files whose only hits are encoded blobs
+                bump(d, "files", 1, os.path.relpath(f, d) + ": " + s, counts)
 
     if "chat" in kinds and dirs:
-        chat_search(q, cs, cands, dirs, regs, bump, verify)
+        chat_search(terms, cs, cands, dirs, regs, bump, since, exclude)
 
     hits = []
     for c in cands.values():
-        if c["hits"]:
-            c.pop("_chat_snip", None)
-            try:
-                import time
-                c["mtime"] = time.strftime("%Y-%m-%d", time.localtime(os.stat(c["dir"]).st_mtime))
-            except OSError:
-                c["mtime"] = ""
-            hits.append(c)
-    hits.sort(key=lambda c: (c["row"] is None, c["row"] or 0, c["dir"]))
+        if not c["hits"]:
+            continue
+        c.pop("_chat_snip", None)
+        try:
+            act = max(os.stat(c["dir"]).st_mtime, c["newest"])
+        except OSError:
+            act = c["newest"]
+        if since and act and act < since:
+            continue
+        if req.get("every") and len(terms) > 1 and any(not c["tc"].get(t) for t in terms):
+            continue
+        c["mtime"] = time.strftime("%Y-%m-%d", time.localtime(act)) if act else ""
+        c["act"] = act
+        hits.append(c)
+    if len(terms) > 1:
+        # sessions that mention every term first, densest co-occurrence, then newest
+        hits.sort(key=lambda c: (-all(c["tc"].get(t) for t in terms), -c["cooc"],
+                                 -sum(c["tc"].values()), -(c["act"] or 0)))
+    else:
+        hits.sort(key=lambda c: (c["row"] is None, c["row"] or 0, c["dir"]))
     return {"host": socket.gethostname().split(".")[0], "hits": hits}
 
 
-def chat_search(q, cs, cands, dirs, regs, bump, verify):
-    # Claude Code: ~/.claude*/projects/<dir with non-alnum → '-'>/<uuid>.jsonl
-    keymap = {claude_key(d): d for d in dirs}
-    pdirs = []
-    for proj in glob.glob(HOME + "/.claude*/projects"):
-        for k in keymap:
-            p = proj + "/" + k
-            if os.path.isdir(p):
-                pdirs.append(p)
-    # every chat source counts a hit only where snippet() finds a REAL occurrence
-    for f in grep_files(pdirs, q, cs, ["--no-ignore", "--hidden", "-g", "*.jsonl"]):
-        if not f.endswith(".jsonl"):
+def chat_search(terms, cs, cands, dirs, regs, bump, since=None, exclude=()):
+    # Claude Code + Codex: grep the said-text cache (exact per-term line counts)
+    files = transcripts(dirs, since, exclude)
+    cmap = {f[0]: f for f in files}
+    roots = sorted(set([CACHE + "/codex"] + [os.path.dirname(f[0]) for f in files
+                                             if "/claude/" in f[0]]))
+    counts = {t: count_files(roots, t, cs, ["--no-ignore", "--hidden"]) for t in terms}
+    per = {}  # cache file -> {term: n}
+    for t, m in counts.items():
+        for p, n in m.items():
+            if p in cmap:
+                per.setdefault(p, {})[t] = n
+    best = {}  # dir -> (score, cache file)
+    for p, tc in per.items():
+        _, d, src, mt = cmap[p]
+        c = cands.get(d)
+        if c is None:
             continue
-        d = keymap.get(os.path.basename(os.path.dirname(f)))
-        s = verify(d, f, "chat", _texts_claude)
+        bump(d, "chat", 1, "", tc)
+        c["newest"] = max(c["newest"], mt)
+        if len(tc) == len(terms):
+            c["allin"] += 1
+            c["cooc"] += min(tc.values())
+        score = (len(tc), min(tc.values()), mt)
+        if d not in best or score > best[d][0]:
+            best[d] = (score, p)
+    for d, (_, p) in best.items():
+        _, s = line_terms(p, terms, cs, limit=400000)
         if s:
-            bump(d, "chat", 1, s)
+            c = cands[d]
+            if not c.get("_chat_snip"):
+                c["snip"], c["_chat_snip"] = s, True
 
-    # Codex: ~/.codex/sessions/**/*.jsonl — first line is session_meta with cwd
-    cdir = HOME + "/.codex/sessions"
-    for f in grep_files([cdir], q, cs, ["--no-ignore", "--hidden", "-g", "*.jsonl"]):
-        try:
-            with open(f, errors="replace") as fh:
-                meta = json.loads(fh.readline())
-            cwd = os.path.realpath(meta.get("payload", {}).get("cwd") or "")
-        except (OSError, ValueError, AttributeError):
-            continue
-        d = owner(cwd, dirs)
-        s = verify(d, f, "chat", _texts_codex)
-        if s:
-            bump(d, "chat", 1, s)
-
-    # OpenCode: sqlite — part.data joined to session.directory
-    ocdb = HOME + "/.local/share/opencode/opencode.db"
-    if os.path.isfile(ocdb):
-        try:
-            con = sqlite3.connect("file:" + ocdb + "?mode=ro", uri=True, timeout=5)
-            cond = "instr(p.data, ?) > 0" if cs else "p.data LIKE ? ESCAPE '\\'"
-            arg = q if cs else "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-            rows = con.execute(
-                "SELECT s.directory, count(DISTINCT s.id), min(p.data) FROM part p "
-                "JOIN session s ON s.id = p.session_id "
-                "WHERE " + cond + " GROUP BY s.directory", (arg,)).fetchall()
-            con.close()
-            for directory, n, data in rows:
-                d = owner(os.path.realpath(directory or ""), dirs)
-                s = d and snippet(data or "", q, cs)
-                if s:
-                    bump(d, "chat", n, s)
-        except sqlite3.Error:
-            pass
+    for q in terms:
+        # OpenCode: sqlite — part.data joined to session.directory
+        ocdb = HOME + "/.local/share/opencode/opencode.db"
+        if os.path.isfile(ocdb):
+            try:
+                con = sqlite3.connect("file:" + ocdb + "?mode=ro", uri=True, timeout=5)
+                cond = "instr(p.data, ?) > 0" if cs else "p.data LIKE ? ESCAPE '\\'"
+                arg = q if cs else "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                rows = con.execute(
+                    "SELECT s.directory, count(DISTINCT s.id), min(p.data) FROM part p "
+                    "JOIN session s ON s.id = p.session_id "
+                    "WHERE " + cond + " GROUP BY s.directory", (arg,)).fetchall()
+                con.close()
+                for directory, n, data in rows:
+                    d = owner(os.path.realpath(directory or ""), dirs)
+                    s = d and snippet(data or "", q, cs)
+                    if s:
+                        bump(d, "chat", n, s, {q: n})
+            except sqlite3.Error:
+                pass
 
     # Antigravity (agy): ~/.gemini/antigravity-cli/conversations/<id>.db — the .db
     # records no cwd, so map via the session's recorded conversation id, else by
-    # which candidate dir path the conversation mentions most.
+    # which candidate dir path the conversation mentions most. Each .db is read once.
     convs = HOME + "/.gemini/antigravity-cli/conversations"
     if os.path.isdir(convs):
         byid = {}
@@ -495,28 +678,196 @@ def chat_search(q, cs, cands, dirs, regs, bump, verify):
                     byid[cid] = s["dir"]
             except (OSError, ValueError):
                 pass
-        qb = q.encode()
         for f in glob.glob(convs + "/*.db"):
             try:
                 if os.path.getsize(f) > 200 * 1024 * 1024:
+                    continue
+                if since and os.path.getmtime(f) < since:
                     continue
                 b = open(f, "rb").read()
             except OSError:
                 continue
             hay = b if cs else b.lower()
-            i = hay.find(qb if cs else qb.lower())
-            if i < 0:
-                continue
-            d = byid.get(os.path.basename(f)[:-3])
-            if not d:
-                counts = [(b.count(x.encode()), x) for x in dirs]
-                counts = [c for c in counts if c[0]]
-                d = max(counts)[1] if counts else None
-            txt = b[max(0, i - 200): i + len(qb) + 200].decode("utf-8", "replace")
-            txt = re.sub(r"[^\x20-\x7e\u00a0-\uffff]+", " ", txt)
-            s = d and snippet(txt, q, cs)
-            if s:
-                bump(d, "chat", 1, s)
+            d, counted = None, False
+            for q in terms:
+                qb = q.encode()
+                i = hay.find(qb if cs else qb.lower())
+                if i < 0:
+                    continue
+                if d is None:
+                    d = byid.get(os.path.basename(f)[:-3])
+                    if not d:
+                        counts_ = [(b.count(x.encode()), x) for x in dirs]
+                        counts_ = [c for c in counts_ if c[0]]
+                        d = max(counts_)[1] if counts_ else ""
+                txt = b[max(0, i - 200): i + len(qb) + 200].decode("utf-8", "replace")
+                txt = re.sub(r"[^\x20-\x7e\u00a0-\uffff]+", " ", txt)
+                s = d and snippet(txt, q, cs)
+                if s:
+                    bump(d, "chat", 0 if counted else 1, s, {q: 1})  # one conversation, once
+                    counted = True
+
+
+# ───────────────────────────── --show ─────────────────────────────
+
+def _roles_claude(o):
+    """(role, text) for one Claude JSONL line; role: you / agent / tool / out."""
+    if o.get("type") not in ("user", "assistant") or o.get("isMeta"):
+        return
+    c = (o.get("message") or {}).get("content")
+    who = "you" if o.get("type") == "user" else "agent"
+    items = [{"type": "text", "text": c}] if isinstance(c, str) else (c or [])
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        t = it.get("type")
+        if t == "text":
+            yield who, REMINDER.sub(" ", it.get("text") or "")
+        elif t == "tool_use":
+            yield "tool", json.dumps(it.get("input"), ensure_ascii=False)
+        elif t == "tool_result":
+            r = it.get("content")
+            if isinstance(r, list):
+                r = " ".join(x.get("text") or "" for x in r if isinstance(x, dict))
+            yield "out", REMINDER.sub(" ", r or "")
+
+
+def _roles_codex(o):
+    if o.get("type") != "response_item":
+        return
+    p = o.get("payload") or {}
+    t = p.get("type")
+    if t == "message" and p.get("role") in ("user", "assistant"):
+        for it in p.get("content") or []:
+            s = (it or {}).get("text") or ""
+            if not s.lstrip().startswith(INJECTED):
+                yield ("you" if p.get("role") == "user" else "agent"), s
+    elif t in ("function_call", "custom_tool_call"):
+        yield "tool", str(p.get("arguments") or p.get("input") or "")
+    elif t in ("function_call_output", "custom_tool_call_output"):
+        out = p.get("output")
+        if isinstance(out, list):
+            out = " ".join((x or {}).get("text") or "" for x in out if isinstance(x, dict))
+        yield "out", str(out or "")
+
+
+def _prompt_like(role, text):
+    s = text.strip()
+    return role == "you" and s and not s.startswith(("<", "This session is being continued", "[Request interrupted"))
+
+
+def show_local(req):
+    """One session's transcripts (newest first, with their opening prompts) and the
+    excerpts around the terms, read straight from the JSONL with timestamps."""
+    global WORD
+    target, terms = str(req.get("target") or ""), [t for t in (req.get("terms") or []) if t]
+    cs, n = req.get("case_sensitive", False), int(req.get("n") or 20)
+    WORD = bool(req.get("word"))
+    host = socket.gethostname().split(".")[0]
+    regs = registered_sessions()
+    s = None
+    if target.isdigit():
+        s = next((r for r in regs if r["row"] == int(target)), None)
+    else:
+        s = next((r for r in regs if r["name"] == target), None)
+    if s:
+        d = s["dir"]
+    else:
+        d = ""
+        for c in [target] + [HOME + "/" + r + "/" + target for rs in ROOTS.values() for r in rs]:
+            c = os.path.realpath(os.path.expanduser(c))
+            if os.path.isdir(c):
+                d = c
+                break
+        if not d:
+            return {"host": host, "error": "no session row/name or dir %r on %s" % (target, host)}
+    srcs = []
+    for _, proj in claude_roots():
+        for f in glob.glob(proj + "/" + claude_key(d) + "/*.jsonl"):
+            srcs.append((f, _roles_claude))
+    cdir = HOME + "/.codex/sessions"
+    if os.path.isdir(cdir):
+        cache = SaidCache()
+        for f in glob.glob(cdir + "/**/*.jsonl", recursive=True):
+            ent = cache.idx["files"].get(f) or codex_meta(f)
+            if owner(ent.get("cwd") or "", [d]):
+                srcs.append((f, _roles_codex))
+    ex = excluded_ids()
+    srcs = [x for x in srcs if os.path.basename(x[0])[:-6] not in ex]
+    srcs.sort(key=lambda x: -os.path.getmtime(x[0]))
+    older = max(0, len(srcs) - 12)
+    srcs = srcs[:12]
+    files, pool = [], []  # pool: (-terms in it, file idx, order, excerpt)
+    for f, roles in srcs:
+        prompts, first_ts, last_ts = [], "", ""
+        try:
+            fh = open(f, errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(o, dict):
+                    continue
+                ts = (o.get("timestamp") or "")[:16].replace("T", " ")
+                if ts:
+                    first_ts = first_ts or ts
+                    last_ts = ts
+                for role, text in roles(o):
+                    if len(prompts) < 3 and _prompt_like(role, text):
+                        prompts.append(" ".join(text.split())[:140])
+                    if terms and len(pool) < 3000:
+                        ms = []
+                        for t in terms:
+                            m = next((m for m in occurrences(text, t, cs)
+                                      if not encoded(text, m.start(), m.end())), None)
+                            if m:
+                                ms.append(m)
+                        if ms:
+                            m = ms[-1] if len(ms) > 1 else ms[0]  # centre on the later term
+                            a, b = max(0, m.start() - 180), m.end() + 180
+                            x = " ".join(text[a:b].split())
+                            pool.append((-len(ms), len(files), len(pool), {
+                                "ts": ts, "role": role, "file": len(files), "terms": len(ms),
+                                "text": ("…" if a else "") + x + ("…" if b < len(text) else "")}))
+        files.append({"path": f, "size": os.path.getsize(f), "first": first_ts, "last": last_ts,
+                      "prompts": prompts})
+    # the excerpts mentioning the most terms win, newest transcript first; shown in order
+    pick = sorted(pool)[:n]
+    excerpts = [e for *_, e in sorted(pick, key=lambda p: (p[1], p[2]))]
+    info = s or {"row": None, "name": None, "provider": None, "dir": d}
+    return {"host": host, "home": HOME, "session": info, "files": files, "excerpts": excerpts,
+            "terms": terms, "older": older}
+
+
+def render_show(res):
+    k = colors()
+    if res.get("error"):
+        print("%s== %s ==%s  %s%s%s" % (k["B"], res["host"], k["X"], k["R"], res["error"], k["X"]))
+        return
+    s, rhome = res["session"], res.get("home") or HOME
+    d = s["dir"]
+    d = "~" + d[len(rhome):] if d.startswith(rhome + "/") else d
+    who = ("row %s  %s  %s" % (s["row"], s["name"], s["provider"] or "")) if s.get("row") else "(no session)"
+    print("%s== %s ==%s  %s  %s" % (k["B"], res["host"], k["X"], who, d))
+    files = res.get("files") or []
+    if not files:
+        print("  %sno transcripts for this dir%s" % (k["D"], k["X"]))
+    for i, f in enumerate(files):
+        print("  %s[%d]%s %s → %s  %4.1f MB  %s" % (k["C"], i, k["X"], f["first"], f["last"],
+              f["size"] / 1e6, os.path.basename(f["path"])))
+        for p in f["prompts"]:
+            print("       %s› %s%s" % (k["D"], p, k["X"]))
+    if res.get("older"):
+        print("  %s… and %d older transcripts not shown%s" % (k["D"], res["older"], k["X"]))
+    ex = res.get("excerpts") or []
+    if res.get("terms"):
+        print("%sexcerpts for %s (%d):%s" % (k["B"], ", ".join(repr(t) for t in res["terms"]), len(ex), k["X"]))
+        for e in ex:
+            print("  %s[%d] %s %-5s%s %s" % (k["D"], e["file"], e["ts"], e["role"], k["X"], e["text"][:420]))
 
 
 # ───────────────────────────── fleet fan-out ─────────────────────────────
@@ -549,7 +900,37 @@ def this_box_names():
     return {norm(h), "local", "."}
 
 
-def resolve_boxes(spec, fleet):
+def group_files():
+    tree = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    return [tree + "/fleet/search-groups.conf", CC_HOME + "/search-groups.conf"]
+
+
+def groups():
+    """{'core': [...], 'main': [...]} from the group files (later files win per key).
+    MAIN always includes CORE, so widening a scope never drops a box."""
+    g = {}
+    for f in group_files():
+        kv = read_keys(f, ("CORE", "MAIN"))
+        for key, v in kv.items():
+            g[key.lower()] = v.replace(",", " ").split()
+    core = g.get("core") or []
+    main = core + [b for b in (g.get("main") or []) if b not in core]
+    return {"core": core, "main": main}
+
+
+def scope_boxes(scope):
+    """Box spec for a scope, or None for 'all'. An undefined group means this box."""
+    if scope == "all":
+        return None
+    names = groups().get(scope) or []
+    if not names:
+        print("amux search: no %s group defined (%s) — searching this box"
+              % (scope.upper(), " or ".join(tilde(f) for f in group_files())), file=sys.stderr)
+        return "local"
+    return ",".join(names)
+
+
+def resolve_boxes(spec, fleet, quiet=False):
     rem = remotes()
     here = this_box_names()
     picked = []  # (label, ladder or None for local)
@@ -570,8 +951,9 @@ def resolve_boxes(spec, fleet):
         if hit:
             picked.append(hit[0])
         else:
-            print("amux search: '%s' is not in %s — trying it as an ssh alias" % (b, REMOTES),
-                  file=sys.stderr)
+            if not quiet:
+                print("amux search: '%s' is not in %s — trying it as an ssh alias" % (b, REMOTES),
+                      file=sys.stderr)
             picked.append((b, [b]))
     seen, out = set(), []
     for p in picked:
@@ -579,6 +961,16 @@ def resolve_boxes(spec, fleet):
             seen.add(p[0])
             out.append(p)
     return out
+
+
+def targets_for(boxes, scope):
+    """(label, ladder) list for an explicit box list, a scope, or this box."""
+    if boxes:
+        return resolve_boxes(boxes, False)
+    if scope:
+        spec = scope_boxes(scope)
+        return resolve_boxes(None, True) if spec is None else resolve_boxes(spec, False, quiet=True)
+    return resolve_boxes(None, False)
 
 
 def search_remote(label, ladder, req, budget):
@@ -642,38 +1034,45 @@ RESULT_SCHEMA = {
 
 AGENT_SYSTEM = """You are a friendly search agent for the user's amux sessions (Claude Code,
 Codex and OpenCode coding sessions on their machines). They ask in plain language;
-you dig through the sessions and come back with the ones they mean, ranked, with a
-reason each. Be thorough and curious, like a colleague who knows where everything
-is. Everything you do is read-only: never create, modify or delete anything.
+you dig through what those sessions SAID and come back with the ones they mean,
+ranked, with a reason each. Be thorough and curious, like a colleague who knows
+where everything is. You are searching conversations, not inspecting machines:
+everything you do is read-only, and you never run system, package, disk, service
+or network commands on any box (no systemctl, mokutil, cryptsetup, lsblk, dnf, apt,
+zpool …). A question about a machine means: find the sessions that worked on it.
 
 Scope: {scope}
 
+Time: you have about {soft} minutes (you started at {start}; `date` tells you the
+time). Stop searching by then and answer with what you have: a ranked partial
+answer beats none.
+
 Your tools, best first:
-- `{prefix} "string"` — literal, case-insensitive substring search over every
-  session's transcript, working-dir files and name, across the boxes in scope. One
-  block per box (`== box ==`), one line per hit: `<row>  <session>  <provider>
-  <modified>  <dir>  chat×N files×N name` plus a snippet, or `–  (no session)
-  <modified>  <dir>` for a project dir with no session. Flags: `--in chat|files|name`,
-  `-w` (whole word), `--providers claude,codex,opencode`. Run several strings:
-  distinctive nouns, file/command names, error text, synonyms, misspellings — a
-  literal match never finds a paraphrase, so cast a wide net and then confirm.
+- `{prefix} -e term -e term …` — literal, case-insensitive search over what every
+  session said (its transcripts), its working-dir files and its name, across the
+  boxes in scope. Put ALL your strings in ONE call with repeated -e: distinctive
+  nouns, file/command names, error text, synonyms, misspellings. Results rank by how
+  densely a session mentions the terms together, then by recency: `luks×217
+  clevis×100 · all in 3` means 3 of its conversations mention every term. One block per
+  box (`== box ==`), one line per hit: `<row>  <session>  <provider>  <modified>
+  <dir>  chat×N files×N name` plus a snippet, or `–  (no session)  <modified>  <dir>`
+  for a project dir with no session. Flags: `--in chat|files|name`, `-w` (whole
+  word), `--and` (only sessions with every term), `--since 30d`, `--providers
+  claude,codex,opencode`. A literal match never finds a paraphrase, so cast a wide
+  net in that one call, then confirm.
+- `amux-search --show <box> <row|dir> -e term -e term` — one session: its
+  transcripts newest first with their opening prompts and dates, and timestamped
+  excerpts of what was said around the terms. This is how you confirm what a session
+  was about and when; use it instead of reading transcripts by hand.
 - `amux ls` (this box) and `amux-remote <box> ls` — the session list with row numbers,
   names, dirs and status; the same rows the search prints.
-- Transcripts, to confirm what a session was really about and when it was last
-  active. Claude: `~/.claude/projects/<dir with every non-alphanumeric char replaced
-  by '-'>/*.jsonl` (one file per conversation; `ls -lt` gives the last activity).
-  Codex: `~/.codex/sessions/YYYY/MM/DD/*.jsonl` (the cwd is in the first lines).
-  OpenCode: `~/.local/share/opencode/opencode.db` (sqlite, read-only queries). Use
-  Read/grep/head/tail with offsets or patterns, never whole files into context.
-- Other boxes: the box names in scope are ssh aliases — `ssh <box> 'ls -lt …'`,
-  `ssh <box> 'grep -c … file'` etc. give the same read-only look at their
-  transcripts. A box that times out is off; say so and move on.
 
-Rules of the road: grep only the transcript/session directories named above, never
-recursively over $HOME, /etc, /opt or / (slow, and full of files that have nothing
-to do with sessions). Take as many steps as the question needs — a dozen
-searches and a few transcript reads is normal; stop when more digging would not change
-the answer.
+Rules of the road: never loop over transcripts yourself (no `for f in …jsonl`, no
+`ssh box 'grep … ~/.claude/projects'`): it is minutes slower than the tools above
+and matches the instructions injected into every transcript. Never grep recursively
+over $HOME, /etc, /opt or / (slow, and full of files that have nothing to do with
+sessions). A box that times out is off; say so and move on. Two to four
+searches and a few --show calls answer most questions.
 
 Answer, in the JSON schema you were given:
 - hits: every session or project dir that plausibly matches, in the order the
@@ -681,7 +1080,7 @@ Answer, in the JSON schema you were given:
   the user decides what is relevant, you rank. Copy box/row/session/provider/dir
   exactly from the tool output. `why` is one or two plain sentences (no markdown)
   saying what the session was for and the evidence. `date` is the last activity you
-  can vouch for (newest transcript file or <modified>), as YYYY-MM-DD.
+  can vouch for (newest transcript or <modified>), as YYYY-MM-DD.
 - queries: the search strings you ran.
 - summary: plain text, as long as it needs to be (no markdown, no bullet list).
   What was not covered (a box down, a scope you could not reach), what you noticed
@@ -698,24 +1097,36 @@ def norm_account(a):
             "x": "team2", "team2": "team2", "t2": "team2"}.get(a.lower())
 
 
+READ_ONLY = ["Bash(amux-search:*)", "Bash(amux:*)", "Bash(amux-remote:*)",
+             "Bash(ls:*)", "Bash(grep:*)", "Bash(rg:*)", "Bash(find:*)", "Bash(head:*)",
+             "Bash(tail:*)", "Bash(cat:*)", "Bash(wc:*)", "Bash(stat:*)", "Bash(sqlite3:*)",
+             "Bash(date:*)", "Bash(ssh:*)", "Read", "Grep", "Glob"]
+# deny beats allow: the write-capable commands an interactive user's own allow rules
+# would otherwise hand the headless agent
+DENIED = ["Write", "Edit", "NotebookEdit", "Bash(rm:*)", "Bash(mv:*)", "Bash(cp:*)",
+          "Bash(sed -i:*)", "Bash(tee:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(git:*)",
+          "Bash(scp:*)", "Bash(rsync:*)", "Bash(python3:*)", "Bash(python:*)",
+          "Bash(chmod:*)", "Bash(mkdir:*)"]
+
+
 def agent_cmd(agent, model, effort, account, system, prompt, work, resume=None):
     """argv (and a stdin string) that runs one headless agent turn; the account slot
     is sourced by bash inside the child so no credential ever touches argv or stdout.
     resume = the previous run's session id for a follow-up turn."""
     if agent == "claude":
         argv = ["claude", "-p", "--model", model, "--effort", effort,
-                "--output-format", "json", "--json-schema", json.dumps(RESULT_SCHEMA),
+                # events stream as they happen: progress lines, and a partial answer
+                # survives a timeout
+                "--output-format", "stream-json", "--verbose",
+                "--json-schema", json.dumps(RESULT_SCHEMA),
+                # no MCP servers: a search needs none, and they cost startup time
+                "--strict-mcp-config",
                 # read-only tool set, pre-approved so a headless run never stalls on a
-                # prompt; the user's own settings (secret-guard hook, allow rules,
-                # permission mode) load as in any interactive session
+                # prompt; the user's own settings (hooks, permission mode)
+                # load as in any interactive session
                 "--tools", "Bash,Read,Grep,Glob",
-                "--allowedTools", "Bash(amux-search:*)", "Bash(amux:*)", "Bash(amux-remote:*)",
-                "Bash(ls:*)", "Bash(grep:*)", "Bash(rg:*)", "Bash(find:*)", "Bash(head:*)",
-                "Bash(tail:*)", "Bash(cat:*)", "Bash(wc:*)", "Bash(stat:*)", "Bash(sqlite3:*)",
-                "Bash(ssh:*)", "Read", "Grep", "Glob",
-                "--disallowedTools", "Write", "Edit", "NotebookEdit", "Bash(rm:*)", "Bash(mv:*)",
-                "Bash(sed -i:*)", "Bash(tee:*)",
-                "--disable-slash-commands", "--max-turns", "120"]
+                "--allowedTools"] + READ_ONLY + ["--disallowedTools"] + DENIED + [
+                "--disable-slash-commands", "--max-turns", str(AGENT_TURNS)]
         argv += ["--resume", resume] if resume else ["--system-prompt", system]
         argv.append(prompt)
         f = slot_file(account)
@@ -741,12 +1152,7 @@ def agent_cmd(agent, model, effort, account, system, prompt, work, resume=None):
         argv = ["codex", "exec"] + common + ["-C", work, "-"]
         return argv, system + "\n\n" + prompt
     # opencode: no tool allow-list and no schema flag — best effort. A Read outside
-    # the run dir is auto-rejected headless and the turn dies with it, so this agent
-    # works from snippets only.
-    system = re.sub(r"- Transcripts, to confirm what a session.*?say so and move on\.",
-                    "- You cannot read files or reach other boxes; rank from the snippets and\n"
-                    "  repeated hits alone.",
-                    system, flags=re.S)
+    # the run dir is auto-rejected headless, so it works through amux-search only.
     if not model:
         model = os.environ.get("AMUX_OPENCODE_MODEL")
     if not model:
@@ -757,20 +1163,36 @@ def agent_cmd(agent, model, effort, account, system, prompt, work, resume=None):
     return argv + [system + "\n\n" + prompt], None
 
 
-def parse_agent_output(agent, out, work):
+def _loads(s):
+    s = (s or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-z]*\n|\n```$", "", s)
+    return json.loads(s)
+
+
+def parse_agent_output(agent, out, work, cap=None):
     """(the schema'd JSON object, the agent's session id for a follow-up)."""
-    def loads(s):
-        s = s.strip()
-        if s.startswith("```"):
-            s = re.sub(r"^```[a-z]*\n|\n```$", "", s)
-        return json.loads(s)
+    cap = cap or {}
     if agent == "claude":
-        o = json.loads(out)
-        if isinstance(o, list):  # stream-ish: last result object
-            o = next((x for x in reversed(o) if x.get("type") == "result"), o[-1])
-        if o.get("is_error"):
-            raise RuntimeError(o.get("result") or "claude returned is_error")
-        return (o.get("structured_output") or loads(o.get("result") or "")), o.get("session_id")
+        evs = []
+        for line in out.splitlines():
+            try:
+                evs.append(json.loads(line))
+            except ValueError:
+                continue
+        if not evs:
+            evs = [json.loads(out)]
+        o = next((x for x in reversed(evs) if isinstance(x, dict) and x.get("type") == "result"), None)
+        if o is None:
+            if cap.get("result"):
+                return cap["result"], cap.get("sid")
+            raise RuntimeError("claude returned no result event")
+        if o.get("is_error") and not cap.get("result"):
+            raise RuntimeError(o.get("result") or o.get("subtype") or "claude returned is_error")
+        res = o.get("structured_output") or cap.get("result")
+        if res is None:
+            res = _loads(o.get("result"))
+        return res, o.get("session_id") or cap.get("sid")
     sid = None
     texts = []
     for line in out.splitlines():
@@ -788,14 +1210,14 @@ def parse_agent_output(agent, out, work):
     if agent == "codex":
         try:
             with open(work + "/out.json") as fh:
-                return loads(fh.read()), sid
+                return _loads(fh.read()), sid
         except FileNotFoundError:
             raise RuntimeError("codex wrote no final message")
     blob = "\n".join(texts) or out
     m = re.search(r"\{.*\}", blob, re.S)
     if not m:
         raise RuntimeError("opencode returned no JSON object")
-    return loads(m.group(0)), sid
+    return _loads(m.group(0)), sid
 
 
 def load_last():
@@ -814,41 +1236,214 @@ def save_last(d):
     os.replace(tmp, LAST)
 
 
-def agentic_search(q, run, resume=None):
-    """run = {agent, model, effort, account, prefix, scope}; resume = last session id."""
+def _say(t0, what):
+    k = colors(sys.stderr)
+    el = int(time.time() - t0)
+    w = shutil.get_terminal_size((160, 20)).columns
+    line = " ".join(str(what).split())
+    print("%s  %d:%02d · %s%s" % (k["D"], el // 60, el % 60, line[:max(40, w - 12)], k["X"]),
+          file=sys.stderr)
+
+
+def _progress(agent, ev, cap, t0):
+    """One stream event: remember the session id / answer, print the step taken."""
+    if not isinstance(ev, dict):
+        return
+    if agent == "claude":
+        if ev.get("session_id"):
+            cap["sid"] = cap.get("sid") or ev["session_id"]
+        if ev.get("type") == "assistant":
+            for b in (ev.get("message") or {}).get("content") or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use":
+                    inp = b.get("input") or {}
+                    if b.get("name") == "StructuredOutput":
+                        cap["result"] = inp
+                        _say(t0, "ranking the sessions")
+                    else:
+                        _say(t0, inp.get("command") or inp.get("file_path") or inp.get("pattern")
+                             or b.get("name"))
+                elif b.get("type") == "text" and (b.get("text") or "").strip():
+                    cap["text"] = b["text"]
+        return
+    if agent == "codex":
+        cap["sid"] = cap.get("sid") or ev.get("thread_id")
+        it = ev.get("item") or {}
+        if ev.get("type") == "item.started" and it.get("command"):
+            _say(t0, it["command"])
+        return
+    cap["sid"] = cap.get("sid") or ev.get("sessionID")
+    p = ev.get("part") or {}
+    if isinstance(p, dict) and p.get("type") == "tool":
+        inp = (p.get("state") or {}).get("input") or {}
+        key = p.get("id") or p.get("callID")
+        if inp and key not in cap.setdefault("seen", set()):
+            cap["seen"].add(key)
+            _say(t0, inp.get("command") or p.get("tool"))
+
+
+def _killpg(p):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:
+            return
+        try:
+            p.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run_agent(argv, stdin, env, work, agent, budget=AGENT_BUDGET):
+    """Run the agent in its own process group, streaming its events into progress
+    lines. Returns (stdout, stderr, rc, timed_out, captured). On timeout or ^C the
+    whole group (agent, its ssh and search children) is killed — nothing is orphaned."""
+    import queue
+    import threading
+    t0 = time.time()
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         errors="replace", env=env, cwd=work, start_new_session=True)
+    if stdin:
+        def feed():
+            try:
+                p.stdin.write(stdin)
+                p.stdin.close()
+            except OSError:
+                pass
+        threading.Thread(target=feed, daemon=True).start()
+    lines, err = queue.Queue(), []
+
+    def rd():
+        for l in p.stdout:
+            lines.put(l)
+        lines.put(None)
+    threading.Thread(target=rd, daemon=True).start()
+    threading.Thread(target=lambda: err.extend(p.stderr), daemon=True).start()
+    out, cap, timed = [], {}, False
+    try:
+        while True:
+            left = budget - (time.time() - t0)
+            if left <= 0:
+                timed = True
+                break
+            try:
+                l = lines.get(timeout=min(1.0, left))
+            except queue.Empty:
+                continue
+            if l is None:
+                break
+            out.append(l)
+            try:
+                _progress(agent, json.loads(l), cap, t0)
+            except ValueError:
+                pass
+    except KeyboardInterrupt:
+        _killpg(p)
+        raise
+    if timed:
+        _killpg(p)
+    else:
+        try:
+            p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            _killpg(p)
+    return "".join(out), "".join(err), p.returncode, timed, cap
+
+
+STOP = set("""a an and are as at be by can did do does for from had has have how i in into is it
+its me my of on or our over that the their them then there these this those to was we were what
+when where which who why will with you your about after again all also any been before being both
+but each few more most other some such than too very just only own same so not no nor out up down
+off once here session sessions worked work working find show list tell did done thing things
+whatever someone something""".split())
+
+
+def keywords(q):
+    """The distinctive words of a question, for the quick literal look."""
+    out = []
+    for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9_./:+@-]*", q):
+        w = w.strip(".:/-+@")
+        if (len(w) < 3 and not any(ch.isdigit() for ch in w)) or w.lower() in STOP:
+            continue
+        if w.lower() not in [x.lower() for x in out]:
+            out.append(w)
+    return out[:6]
+
+
+def evidence_text(results, terms, per_box=6):
+    """The quick look as plain lines for the agent's prompt."""
+    rows = []
+    for r in results:
+        if r.get("error"):
+            rows.append("%s: %s" % (r["host"], r["error"]))
+            continue
+        for c in (r.get("hits") or [])[:per_box]:
+            tc = c.get("tc") or {}
+            rows.append("%s row %s %s %s %s  %s%s" % (
+                r["host"], c.get("row") or "–", c.get("name") or "(no session)", c.get("mtime") or "",
+                tilde(c["dir"]), " ".join("%s×%d" % (t, tc.get(t, 0)) for t in terms if tc.get(t)),
+                (" · all in %d" % c["allin"]) if c.get("allin") and len(terms) > 1 else ""))
+    return "\n".join(rows) or "(no literal hits for %s)" % ", ".join(terms)
+
+
+def agentic_search(q, run, resume=None, evidence=""):
+    """run = {agent, model, effort, account, prefix, scope}; resume = last session id.
+    Returns (answer or None, can_reply, note)."""
     import tempfile
-    k = colors()
+    k = colors(sys.stderr)
     agent, model, effort, account = run["agent"], run["model"], run["effort"], run["account"]
     prompt = ("Question: %s\n\nSearch prefix: %s\nScope: %s\nCurrent box: %s"
               % (q, run["prefix"], run["scope"], socket.gethostname().split(".")[0]))
+    if evidence:
+        prompt += ("\n\nA quick literal look at the question's keywords already ran (start from "
+                   "it, don't repeat it):\n" + evidence)
     if resume:
         prompt = "Follow-up: " + q
-    system = AGENT_SYSTEM.replace("{prefix}", run["prefix"]).replace("{scope}", run["scope"])
-    work = tempfile.mkdtemp(prefix="amux-search-agentic.")
-    argv, stdin = agent_cmd(agent, model, effort, account, system, prompt, work, resume)
+    system = (AGENT_SYSTEM.replace("{prefix}", run["prefix"]).replace("{scope}", run["scope"])
+              .replace("{soft}", str(AGENT_SOFT // 60)).replace("{start}", time.strftime("%H:%M")))
     who = "%s %s %s" % (agent, model or "(default model)", effort)
     if agent == "claude":
         who += " on %s" % {"personal": "P", "team": "T", "team2": "X"}[account]
-    print("%sagentic search: %s%s — %s%s" % (k["D"], who, " (follow-up)" if resume else "",
-          run["label"], "…" if resume else " — this takes a few minutes…"), file=sys.stderr)
-    env = dict(os.environ, AMUX_SEARCH_INNER="1", NO_COLOR="1")
+    work = tempfile.mkdtemp(prefix="amux-search-agentic.")
+    note = ""
     try:
-        p = subprocess.run(argv, input=stdin, capture_output=True, text=True, env=env,
-                           cwd=work, timeout=AGENT_BUDGET)
-    except subprocess.TimeoutExpired:
-        die("the %s run exceeded %ds" % (agent, AGENT_BUDGET))
-    except FileNotFoundError:
-        die("%s is not installed on this box" % agent)
-    if p.returncode != 0 and not p.stdout.strip():
-        die("%s failed (rc %d): %s" % (agent, p.returncode, (p.stderr or "").strip()[-800:]))
-    try:
-        res, sid = parse_agent_output(agent, p.stdout, work)
-    except Exception as e:  # noqa: BLE001 — show what came back instead of a traceback
-        die("could not read the %s answer (%s):\n%s" % (agent, e, p.stdout.strip()[-1200:]))
-    shutil.rmtree(work, ignore_errors=True)
+        argv, stdin = agent_cmd(agent, model, effort, account, system, prompt, work, resume)
+        print("%sagentic search: %s%s — %s — up to %d min, each step prints as it goes%s"
+              % (k["D"], who, " (follow-up)" if resume else "", run["label"], AGENT_BUDGET // 60,
+                 k["X"]), file=sys.stderr)
+        env = dict(os.environ, AMUX_SEARCH_INNER="1", NO_COLOR="1",
+                   AMUX_SEARCH_EXCLUDE=",".join(sorted(excluded_ids())))
+        try:
+            out, err, rc, timed, cap = run_agent(argv, stdin, env, work, agent)
+        except FileNotFoundError:
+            die("%s is not installed on this box" % agent)
+        sid, res = cap.get("sid"), None
+        if timed:
+            res = cap.get("result")
+            note = "the agent ran out of time (%d min)%s" % (
+                AGENT_BUDGET // 60, " — this is what it had ranked" if res else "")
+            if res is None and cap.get("text"):
+                res = {"hits": [], "queries": [], "summary": cap["text"]}
+        else:
+            if rc != 0 and not out.strip():
+                die("%s failed (rc %s): %s" % (agent, rc, (err or "").strip()[-800:]))
+            try:
+                res, sid2 = parse_agent_output(agent, out, work, cap)
+                sid = sid2 or sid
+            except Exception as e:  # noqa: BLE001 — show what came back instead of a traceback
+                if cap.get("text"):
+                    res, note = {"hits": [], "queries": [], "summary": cap["text"]}, \
+                        "could not read the %s answer (%s); its last words:" % (agent, e)
+                else:
+                    die("could not read the %s answer (%s):\n%s" % (agent, e, out.strip()[-1200:]))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     if sid:
         save_last(dict(run, session=sid, question=q))
-    return res, bool(sid)
+    return res, bool(sid), note
 
 
 def plain(s):
@@ -857,8 +1452,15 @@ def plain(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def render_agentic(res, q, can_reply):
+def render_agentic(res, q, can_reply, note=""):
     k = colors()
+    if note:
+        print("%s%s%s" % (k["Y"], note, k["X"]))
+    if res is None:
+        print("%sno ranked answer — the quick look above is the best literal answer%s" % (k["D"], k["X"]))
+        if can_reply:
+            print("%sreply: amux search -c \"…\"   (the agent keeps what it found so far)%s" % (k["D"], k["X"]))
+        return
     hits = res.get("hits") or []
     conf = {"high": k["G"], "medium": k["Y"], "low": k["D"]}
     here = socket.gethostname().split(".")[0]
@@ -880,7 +1482,7 @@ def render_agentic(res, q, can_reply):
             print("%s   %s↳ %s%s" % (" " * bw, k["D"], plain(h["why"])[:400], k["X"]))
     if res.get("summary"):
         print("%s%s%s" % (k["C"], plain(res["summary"]), k["X"]))
-    if not hits:
+    if not hits and not res.get("summary"):
         print("%sno sessions found for %r%s" % (k["D"], q, k["X"]))
     if res.get("queries"):
         print("%ssearched: %s%s" % (k["D"], " · ".join(repr(x) for x in res["queries"]), k["X"]))
@@ -893,8 +1495,9 @@ def render_agentic(res, q, can_reply):
 
 # ───────────────────────────── output ─────────────────────────────
 
-def colors():
-    on = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def colors(stream=None):
+    stream = stream or sys.stdout
+    on = stream.isatty() and not os.environ.get("NO_COLOR")
     c = lambda code: ("\033[" + code + "m") if on else ""
     return dict(B=c("1"), D=c("2"), R=c("31"), G=c("32"), Y=c("33"), C=c("36"), X=c("0"))
 
@@ -903,60 +1506,150 @@ def tilde(p):
     return "~" + p[len(HOME):] if p.startswith(HOME + "/") else p
 
 
-def render(results, local_label, q):
+def src_text(c, terms):
+    more = c.get("more") or []
+    src = " ".join(("%s×%d%s" % (kk, c["hits"].get(kk, 0), "+" if kk in more else "")) if kk != "name" else "name"
+                   for kk in KINDS if kk in c["hits"])
+    tc = c.get("tc") or {}
+    if len(terms) > 1:
+        src += "   " + " ".join("%s×%d" % (t, tc[t]) for t in terms if tc.get(t))
+        if c.get("allin"):
+            src += " · all in %d" % c["allin"]
+    return src
+
+
+def render_box(res, terms, limit=None, elapsed=None):
+    """One box's block; returns how many hits it printed."""
     k = colors()
-    total = 0
+    host = res["host"]
+    took = (" %s(%.1fs)%s" % (k["D"], elapsed, k["X"])) if elapsed is not None else ""
+    if res.get("error"):
+        print("%s== %s ==%s  %s%s%s%s" % (k["B"], host, k["X"], k["R"], res["error"], k["X"], took))
+        return 0
+    hits = res.get("hits", [])
+    print("%s== %s ==%s  %s%d match%s%s%s" % (k["B"], host, k["X"], k["D"], len(hits),
+                                             "" if len(hits) == 1 else "es", k["X"], took))
+    rhome = res.get("home") or HOME
+    inner = bool(os.environ.get("AMUX_SEARCH_INNER"))  # an agent is reading: give it the date
+    shown = hits[:limit] if limit else hits
+    for c in shown:
+        when = ("%-10s " % (c.get("mtime") or "")) if inner or len(terms) > 1 else ""
+        d = c["dir"]
+        d = "~" + d[len(rhome):] if rhome and d.startswith(rhome + "/") else d
+        if c["row"]:
+            print("  %s%3d%s  %-24s %-8s %s%s  %s%s%s" % (k["G"], c["row"], k["X"], c["name"],
+                  c["provider"] or "", when, d, k["C"], src_text(c, terms), k["X"]))
+        else:
+            print("  %s  –  %-24s %-8s %s%s  %s%s%s" % (k["D"], "(no session)", "", when, d + k["X"],
+                  k["C"], src_text(c, terms), k["X"]))
+        if c.get("snip"):
+            print("       %s↳ %s%s" % (k["D"], c["snip"][:200], k["X"]))
+    if limit and len(hits) > limit:
+        print("  %s… %d more%s" % (k["D"], len(hits) - limit, k["X"]))
+    return len(shown)
+
+
+def render_footer(results, q, total, hint=True):
+    k = colors()
     empty = [r["host"] for r in results if not r.get("error") and not r.get("hits")]
-    for res in results:
-        host = res["host"]
-        if res.get("error"):
-            print("%s== %s ==%s  %s%s%s" % (k["B"], host, k["X"], k["R"], res["error"], k["X"]))
-            continue
-        hits = res.get("hits", [])
-        if not hits and len(results) > 1:
-            continue  # folded into the one "no matches" line below
-        print("%s== %s ==%s  %s%d match%s%s" % (k["B"], host, k["X"], k["D"], len(hits),
-                                               "" if len(hits) == 1 else "es", k["X"]))
-        rhome = res.get("home") or HOME
-        inner = bool(os.environ.get("AMUX_SEARCH_INNER"))  # an agent is reading: give it the date
-        for c in hits:
-            total += 1
-            when = ("%-10s " % (c.get("mtime") or "")) if inner else ""
-            more = c.get("more") or []
-            src = " ".join(("%s×%d%s" % (kk, c["hits"].get(kk, 0), "+" if kk in more else "")) if kk != "name" else "name"
-                           for kk in KINDS if kk in c["hits"])
-            d = c["dir"]
-            d = "~" + d[len(rhome):] if rhome and d.startswith(rhome + "/") else d
-            if c["row"]:
-                print("  %s%3d%s  %-24s %-8s %s%s  %s%s%s" % (k["G"], c["row"], k["X"], c["name"],
-                      c["provider"] or "", when, d, k["C"], src, k["X"]))
-            else:
-                print("  %s  –  %-24s %-8s %s%s  %s%s%s" % (k["D"], "(no session)", "", when, d + k["X"],
-                      k["C"], src, k["X"]))
-            if c.get("snip"):
-                print("       %s↳ %s%s" % (k["D"], c["snip"][:200], k["X"]))
     if empty and len(results) > 1:
         print("%sno matches on: %s%s" % (k["D"], ", ".join(empty), k["X"]))
-    if total:
+    if total and hint:
         print("%sopen one: amux <row> (this box) · amux -H <box> attach <row> · "
               "session-less dir: amux exec <name> --provider <p> --dir <dir>%s" % (k["D"], k["X"]))
-    else:
+    elif not total:
         print("%sno matches for %r%s" % (k["D"], q, k["X"]))
+
+
+def fanout(targets, req, budget, show=True, terms=None, limit=None):
+    """Search every target in parallel; with show, print each box's block the moment
+    it answers (one slow box no longer holds the others back)."""
+    terms = terms or [req.get("query")]
+
+    def one(t):
+        label, ladder = t
+        t0 = time.time()
+        if ladder is None:
+            try:
+                r = dict(search_local(req), host=label)
+            except Exception as e:  # noqa: BLE001 — one box failing must not sink the rest
+                r = {"host": label, "error": "%s: %s" % (type(e).__name__, e)}
+        else:
+            r = search_remote(label, ladder, req, budget)
+        r["elapsed"] = time.time() - t0
+        return r
+
+    results, total = [], 0
+    with cf.ThreadPoolExecutor(max_workers=max(1, min(16, len(targets)))) as ex:
+        futs = [ex.submit(one, t) for t in targets]
+        for fu in cf.as_completed(futs):
+            r = fu.result()
+            results.append(r)
+            if show and (r.get("error") or r.get("hits") or len(targets) == 1):
+                total += render_box(r, terms, limit, r["elapsed"] if len(targets) > 1 else None)
+                sys.stdout.flush()
+    return results, total
 
 
 # ───────────────────────────── main ─────────────────────────────
 
+def parse_since(v):
+    m = re.match(r"^(\d+)([hdw])$", v.strip())
+    if m:
+        return time.time() - int(m.group(1)) * {"h": 3600, "d": 86400, "w": 7 * 86400}[m.group(2)]
+    try:
+        return time.mktime(time.strptime(v.strip(), "%Y-%m-%d"))
+    except ValueError:
+        die("--since takes 30d, 12h, 2w or YYYY-MM-DD, not %r" % v)
+
+
+def agent_scope(boxes, local, scope):
+    """(scope text for the agent, label for the user, scope used for the quick look)."""
+    if boxes:
+        return ("only `%s` (the user chose these boxes): `amux-search %s …`" % (boxes, boxes),
+                boxes, None)
+    if local:
+        return "this box only: `amux-search …` with no box argument", "this box", None
+    g = groups()
+    sc = scope or "core"
+    rest = sorted(remotes()) if os.path.isdir(REMOTES) else []
+    allt = "`--fleetall` (every box: this one plus %s)" % (", ".join(rest) or "no remotes")
+    if sc != "all" and not g.get(sc):
+        return ("this box only (no %s group is defined): `amux-search …` with no box argument; "
+                "widen to %s only when this box has nothing" % (sc.upper(), allt), "this box", "local")
+    topic = (" A box named in the question is usually the TOPIC, not where the sessions ran "
+             "(a question about \"encryption of the file server\" usually finds sessions run from the "
+             "laptops, not on that server), so keep "
+             "this scope unless the question says the session ran on that box.")
+    if sc == "core":
+        return ("the core boxes (%s): `amux-search --corefleet …`. Widen only when core has nothing "
+                "relevant: once to `--mainfleet` (%s), then %s.%s"
+                % (", ".join(g["core"]), ", ".join(g["main"]), allt, topic),
+                "core fleet: " + ", ".join(g["core"]), "core")
+    if sc == "main":
+        return ("the main boxes (%s): `amux-search --mainfleet …`. Widen to %s only when they have "
+                "nothing relevant.%s" % (", ".join(g["main"]), allt, topic),
+                "main fleet: " + ", ".join(g["main"]), "main")
+    return ("every box: `amux-search --fleetall …` (this one plus %s)." % (", ".join(rest) or "no remotes"),
+            "whole fleet", "all")
+
+
 def main(argv):
     if "_REMOTE_REQ" in globals():  # remote side (see search_remote): JSON on stdout
-        res = search_local(json.loads(globals()["_REMOTE_REQ"]))
+        req = json.loads(globals()["_REMOTE_REQ"])
+        res = show_local(req) if req.get("mode") == "show" else search_local(req)
         res["home"] = HOME
         json.dump(res, sys.stdout)
         return 0
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `amux search … | head` ends quietly
 
-    fleet = prompt = cs = word = agentic = raw = cont = local = False
+    prompt = cs = word = agentic = raw = cont = local = every = show = False
     orphans = True
-    provs = kinds = None
-    budget = 90
+    provs = kinds = since = None
+    scope = None
+    budget = BOX_BUDGET
+    nshow = 20
+    terms = []
     single = None  # --provider (singular): the agent in --agentic mode, else an alias of --providers
     ag = {"model": None, "effort": None, "account": None}
     pos = []
@@ -965,8 +1658,12 @@ def main(argv):
         if a in ("-h", "--help"):
             print(__doc__.strip())
             return 0
-        elif a in ("--fleet", "-A", "--all"):
-            fleet = True
+        elif a in ("--fleet", "-A", "--all", "--fleetall"):
+            scope = "all"
+        elif a == "--corefleet":
+            scope = "core"
+        elif a == "--mainfleet":
+            scope = "main"
         elif a == "--prompt":
             prompt = True
         elif a in ("-s", "--case-sensitive"):
@@ -983,6 +1680,25 @@ def main(argv):
             local = True
         elif a == "--raw":
             raw = True
+        elif a == "--and":
+            every = True
+        elif a == "--show":
+            show = True
+        elif a == "-e" or a.startswith("--term="):
+            v = a.split("=", 1)[1] if "=" in a else next(it, None)
+            if not v:
+                die("-e needs a term")
+            terms.append(v)
+        elif a == "--since" or a.startswith("--since="):
+            v = a.split("=", 1)[1] if "=" in a else next(it, None)
+            if not v:
+                die("--since needs 30d, 12h, 2w or YYYY-MM-DD")
+            since = parse_since(v)
+        elif a == "-n":
+            try:
+                nshow = int(next(it, ""))
+            except ValueError:
+                die("-n needs a number")
         elif a == "--provider" or a.startswith("--provider="):
             single = a.split("=", 1)[1] if "=" in a else next(it, None)
             if not single:
@@ -1021,30 +1737,60 @@ def main(argv):
         else:
             pos.append(a)
 
-    if cont and not pos:
-        prompt = True
-    if prompt:
+    if show:
+        if agentic or scope or prompt:
+            die("--show reads one session: amux search --show [box] <row|dir> [-e term …]")
+        if len(pos) not in (1, 2):
+            die("usage: amux search --show [box] <row|dir> [-e term …]")
+        box, target = (pos[0], pos[1]) if len(pos) == 2 else ("local", pos[0])
+        tg = resolve_boxes(box, False)
+        if len(tg) != 1:
+            die("--show takes one box, got %r" % box)
+        req = {"mode": "show", "target": target, "terms": terms, "n": nshow,
+               "case_sensitive": cs, "word": word}
+        label, ladder = tg[0]
+        res = show_local(req) if ladder is None else search_remote(label, ladder, req, max(budget, 60))
+        res["host"] = label
+        render_show(res)
+        return 0
+
+    boxes = None
+    if terms:
+        if agentic or prompt:
+            die("-e is for literal searches; --agentic takes a question")
         if len(pos) > 1:
-            die("with --prompt give at most a box list, got: %s" % " ".join(pos))
+            die("with -e, the only other argument is the box list, got: %s" % " ".join(pos))
         boxes = pos[0] if pos else None
-        try:
-            with open("/dev/tty") as tty:
-                sys.stderr.write("reply: " if cont else "search for: ")
-                sys.stderr.flush()
-                q = tty.readline().rstrip("\n")
-        except OSError:
-            die("--prompt needs a terminal")
+        q = " + ".join(terms)
     else:
-        if not pos:
-            die('give the text to search for: amux search [boxes|--fleet] "text"  (or --prompt)')
-        if len(pos) > 2:
-            die('too many arguments — quote the search text: amux search desk "two words"')
-        q = pos[-1]
-        boxes = pos[0] if len(pos) == 2 else None
-    if not q.strip():
-        die("empty search text")
-    if fleet and boxes:
-        die("use either a box list or --fleet, not both")
+        if cont and not pos:
+            prompt = True
+        if prompt:
+            if len(pos) > 1:
+                die("with --prompt give at most a box list, got: %s" % " ".join(pos))
+            boxes = pos[0] if pos else None
+            try:
+                with open("/dev/tty") as tty:
+                    sys.stderr.write("reply: " if cont else "search for: ")
+                    sys.stderr.flush()
+                    q = tty.readline().rstrip("\n")
+            except OSError:
+                die("--prompt needs a terminal")
+        else:
+            if not pos:
+                die('give the text to search for: amux search [boxes|--corefleet|--fleetall] "text"  '
+                    '(or -e term …, or --prompt)')
+            if len(pos) > 2:
+                die('too many arguments — quote the search text: amux search desk "two words"')
+            q = pos[-1]
+            boxes = pos[0] if len(pos) == 2 else None
+        if not q.strip():
+            die("empty search text")
+        terms = [q]
+    if scope and boxes:
+        die("use either a box list or --corefleet/--mainfleet/--fleetall, not both")
+    if scope and local:
+        die("--local and --%s contradict each other" % SCOPE_FLAG[scope][2:])
 
     if single and not agentic:
         # pre-agentic spelling: --provider was an alias of --providers
@@ -1054,14 +1800,18 @@ def main(argv):
             die("unknown provider %s (known: %s)" % (",".join(bad), ",".join(PROVIDERS)))
     if (any(ag.values()) or local) and not agentic:
         die("--model/--effort/--account/--local only apply with --agentic")
+    base = {"case_sensitive": cs, "word": word, "kinds": kinds, "providers": provs,
+            "orphans": orphans, "since": since, "every": every,
+            "exclude": sorted(excluded_ids())}
     if agentic:
         if os.environ.get("AMUX_SEARCH_INNER"):
             die("--agentic cannot nest inside an agentic run")
         last = load_last() if cont else None
         if cont and not last:
             die("nothing to continue: no earlier agentic search on this box (%s)" % tilde(LAST))
-        if cont and (single or any(ag.values()) or boxes or fleet or local):
+        if cont and (single or any(ag.values()) or boxes or scope or local):
             die("-c continues the last run as it was; start a new search to change provider/model/scope")
+        evidence = ""
         if cont:
             run = {kk: last[kk] for kk in ("agent", "model", "effort", "account", "prefix", "scope", "label")}
         else:
@@ -1077,20 +1827,9 @@ def main(argv):
                 die("unknown account %r (valid: personal, team, team2 — or P / T / X)" % ag["account"])
             if ag["account"] and agent != "claude":
                 print("note: --account only applies to claude; ignored for %s" % agent, file=sys.stderr)
-            # agentic scope is the FLEET unless narrowed: --local, or a box list
             if boxes:
                 resolve_boxes(boxes, False)  # fail early on a bad box list
-                scope = "only `%s` (the user chose these boxes): `amux-search %s …`" % (boxes, boxes)
-                label = boxes
-            elif local:
-                scope = "this box only: `amux-search …` with no box argument"
-                label = "this box"
-            else:
-                names = sorted(remotes()) if os.path.isdir(REMOTES) else []
-                scope = ("every box by default: `amux-search --fleet …`. Boxes: this one plus %s. "
-                         "When the question names boxes, search just those: `amux-search box1,box2 …`."
-                         % (", ".join(names) or "no remotes"))
-                label = "whole fleet (a box named in the question narrows it)"
+            scope_txt, label, qscope = agent_scope(boxes, local, scope)
             prefix = ["amux-search"]
             if provs:
                 prefix.append("--providers " + ",".join(provs))
@@ -1098,38 +1837,40 @@ def main(argv):
                 prefix.append("--in " + ",".join(kinds))
             if not orphans:
                 prefix.append("--no-orphans")
-            if budget != 90:
+            if budget != BOX_BUDGET:
                 prefix.append("-t %d" % budget)
+            if since:
+                prefix.append("--since " + time.strftime("%Y-%m-%d", time.localtime(since)))
             run = {"agent": agent, "model": model, "effort": effort, "account": account,
-                   "prefix": " ".join(prefix), "scope": scope, "label": label}
-        res, can_reply = agentic_search(q, run, last["session"] if cont else None)
-        render_agentic(res, q, can_reply)
+                   "prefix": " ".join(prefix), "scope": scope_txt, "label": label}
+            # the quick look: the question's keywords, one literal pass, seconds
+            kw = keywords(q)
+            if kw:
+                k = colors()
+                tg = targets_for(boxes, None if qscope == "local" else qscope) if not local else \
+                    resolve_boxes(None, False)
+                print("%squick look (literal %s on %s):%s" % (k["B"], " + ".join(kw),
+                      ", ".join(t[0] for t in tg), k["X"]))
+                qreq = dict(base, terms=kw, query=kw[0], kinds=kinds or ["chat", "name"])
+                t0 = time.time()
+                res0, n0 = fanout(tg, qreq, budget, True, kw, limit=3)
+                render_footer(res0, " + ".join(kw), n0, hint=False)
+                print("%s(%.1fs) — the agent takes it from here%s\n" % (k["D"], time.time() - t0, k["X"]))
+                sys.stdout.flush()
+                evidence = evidence_text(res0, kw)
+        res, can_reply, note = agentic_search(q, run, last["session"] if cont else None, evidence)
+        render_agentic(res, q, can_reply, note)
         if not raw:
             return 0
         print()
 
-    req = {"query": q, "case_sensitive": cs, "word": word, "kinds": kinds, "providers": provs,
-           "orphans": orphans}
-    targets = resolve_boxes(boxes, fleet)
-    local_label = socket.gethostname().split(".")[0]
+    req = dict(base, query=terms[0], terms=terms)
+    targets = targets_for(boxes, scope)
     if len(targets) > 1:
-        print("%ssearching %d boxes for %r…%s" % (colors()["D"], len(targets), q, colors()["X"]),
-              file=sys.stderr)
-
-    def run(t):
-        label, ladder = t
-        if ladder is None:
-            try:
-                return search_local(req) | {"host": label}
-            except Exception as e:  # noqa: BLE001 — one box failing must not sink the rest
-                return {"host": label, "error": "%s: %s" % (type(e).__name__, e)}
-        return search_remote(label, ladder, req, budget)
-
-    with cf.ThreadPoolExecutor(max_workers=min(16, len(targets))) as ex:
-        results = list(ex.map(run, targets))
-    # boxes with hits first (most hits first), then empty, then errors
-    results.sort(key=lambda r: (bool(r.get("error")), -len(r.get("hits") or []), r["host"]))
-    render(results, local_label, q)
+        print("%ssearching %d boxes for %r…%s" % (colors(sys.stderr)["D"], len(targets), q,
+              colors(sys.stderr)["X"]), file=sys.stderr)
+    results, total = fanout(targets, req, budget, True, terms)
+    render_footer(results, q, total)
     if not os.environ.get("AMUX_SEARCH_INNER"):  # a person is reading, not the agentic run's agent
         k = colors()
         hl = "\033[1;30;43m" if k["X"] else ""  # bold black on yellow
@@ -1137,7 +1878,7 @@ def main(argv):
         asked = q.rstrip().endswith("?") or len(q.split()) > 3 or \
             re.match(r"(?i)(which|what|where|who|when|why|how|did|do|does|is|are|was|were|find|show|list)\b", q.strip())
         ex = q if asked else "which sessions worked on %s, and what did they do?" % q
-        print("%s tip: an agent can search every machine and rank the sessions: %s %samux search --agentic %s%s"
+        print("%s tip: an agent can search your machines and rank the sessions: %s %samux search --agentic %s%s"
               % (hl, k["X"], k["B"], shlex.quote(ex), k["X"]))
     return 0
 

@@ -4,7 +4,7 @@ A ready-to-use build of [**amux**](https://github.com/mixpeek/amux) — the sess
 
 This is the setup its maintainer uses every day, with the personal parts taken out: no machine names, accounts, addresses or credentials ship in it. You bring your own.
 
-**Version 0.4.0** — bundles a modified **amux 0.9.14** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
+**Version 0.5.0** — bundles a modified **amux 0.9.14** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
 
 Works on **macOS and Linux**, and on **Windows** through WSL (driving other machines from MSYS2 or Git Bash is untested; see [docs/windows.md](docs/windows.md)).
 
@@ -100,12 +100,20 @@ It backs up `~/.claude/settings.json` and will not replace a status line you alr
 Which session was it where you fixed that bug? `amux search` looks through every session's conversations, the files in its folder, and its name, and prints the matches with their `amux ls` row numbers, so `amux <row>` opens the one you want:
 
 ```sh
-amux search "login bug"               # this machine
-amux search --fleet "login bug"       # every machine you drive (see "More than one computer")
+amux search "login bug"                    # this machine
+amux search --fleetall "login bug"         # every machine you drive (see "More than one computer")
+amux search -e login -e oauth -e redirect  # several words: sessions that use them together come first
+amux search --show 3 -e oauth              # what session 3 said about it, with dates
 amux search --agentic "which session set up the login page, and is it finished?"
 ```
 
-With `--agentic`, a coding agent (Claude by default) runs several searches for you, reads the matching conversations, and ranks the sessions with a reason for each. It takes a minute or two. `amux search -c "follow-up"` continues the same conversation. Every plain search ends with a one-line tip showing the `--agentic` version of what you typed. All options: `amux-search -h`.
+**Groups of machines.** Put `CORE="laptop desk"` and `MAIN="laptop desk server"` in `~/.amux/search-groups.conf` (machine names or ssh aliases), then search them with `--corefleet` or `--mainfleet`. MAIN always includes CORE. `--fleetall` (or `--fleet`) means every machine. Results print machine by machine as each one answers.
+
+**Several words.** Repeat `-e`. Sessions are ranked by how often they use the words together, then by how recent they are: `login×40 oauth×12 · all in 2` means two of the session's conversations mention both. `--and` keeps only sessions that mention every word. `--since 30d` (or `12h`, `2w`, `2026-10-01`) keeps recent sessions only.
+
+**Fast after the first time.** The first search on a machine saves the text of each conversation in `~/.amux/cache/search`, which takes about half a minute for a few GB of history and uses about a tenth of its size. After that, only new or changed conversations are re-read, so a search takes a few seconds per machine.
+
+**`--agentic`.** A quick literal search of the question's main words prints first. Then a coding agent (Claude by default) runs more searches, reads what the best sessions said, and ranks them with a reason for each. Each step it takes prints as it happens. It searches your CORE group, or this machine if you have none, and looks wider only when that finds nothing. It stops after 10 minutes and shows what it found by then. The agent is read-only and only searches conversations; it doesn't run commands on your machines. `amux search -c "follow-up"` continues the same conversation. Every plain search ends with a one-line tip showing the `--agentic` version of what you typed. All options: `amux-search -h`.
 
 ## Commands
 

@@ -2,6 +2,17 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.5.0 — 2026-11-03
+
+- **Faster `amux search`.** Each machine now keeps the text of its conversations in `~/.amux/cache/search`. The first search builds it (about half a minute for a few GB of history); after that, a search takes a few seconds per machine. Counts are exact. Very long conversations, previously skipped, are now searched too.
+- **Several words at once**: `amux search -e login -e oauth`. Sessions that use the words together rank first, then newer ones. `--and` keeps only sessions with every word; `--since 30d` keeps recent ones.
+- **`amux search --show [machine] <row|folder> -e word`**: one session's conversations, newest first, with their opening prompts and dated excerpts around the words.
+- **Machine groups**: `--corefleet` and `--mainfleet` search the `CORE` and `MAIN` lists in `~/.amux/search-groups.conf`. `--fleetall` is every machine, and `--fleet` still works. Results print as each machine answers.
+- **`--agentic` is faster and never comes back empty-handed.** It starts with a quick search of the question's main words, prints each step as it goes, searches your CORE group first (this machine if you have no groups), and stops after 10 minutes with what it found by then. It is told to search conversations only, never to run commands on your machines, and more write commands are blocked.
+- File names listed in `~/.config/amux/search-exclude.txt` (one per line) are never searched.
+- `amux search … | head` no longer ends in a Python error. A search started from inside a Claude Code session doesn't list that session as a match.
+- See "Finding a session" in the [README](README.md).
+
 ## 0.4.0 — 2026-10-31
 
 - **`amux search`**: find which sessions talked about something. It matches conversations (Claude Code, Codex, OpenCode, Antigravity), the files in each session's folder, and session names, and prints `amux ls` row numbers so `amux <row>` opens the match. Search this machine, a list of machines, or all of them with `--fleet`. Project folders with no session yet are listed too.
