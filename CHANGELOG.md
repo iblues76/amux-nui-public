@@ -2,6 +2,12 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.6.1 — 2026-11-14
+
+- **`amux models` is current again.** The Claude list now shows the `fable` alias, Claude Fable 5.2 and Claude Haiku 5.5. It had stopped at Fable 5.1 and had no `fable` alias, although `--model fable` already worked.
+- `amux help flags` names `fable` among the Claude aliases for `--model`.
+- Nothing else changes: any full Claude model ID still works with `--model`, whether it is listed or not.
+
 ## 0.6.0 — 2026-11-14
 
 - **One color per session**: `amux color`. The session's iTerm2 tab and the square in its status line now share a color, and amux paints the tab every time you attach, however you opened it, not only from `amux-tabs`.

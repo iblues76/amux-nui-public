@@ -4,7 +4,7 @@ A ready-to-use build of [**amux**](https://github.com/mixpeek/amux) — the sess
 
 This is the setup its maintainer uses every day, with the personal parts taken out: no machine names, accounts, addresses or credentials ship in it. You bring your own.
 
-**Version 0.6.0** — bundles a modified **amux 0.9.15** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
+**Version 0.6.1** — bundles a modified **amux 0.9.15** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
 
 Works on **macOS and Linux**, and on **Windows** through WSL (driving other machines from MSYS2 or Git Bash is untested; see [docs/windows.md](docs/windows.md)).
 

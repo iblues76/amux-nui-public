@@ -14,7 +14,7 @@
 #   5. security properties hold — secret-safe HTTP, validated names, exact tmux targets
 #      and mode-600 config; remote exec/provider and numeric rename resolution work
 #   6. the renderer produces the same output for local and remote given the same data
-#   7. the bundled amux: version, help, server syntax, register/ls/account/rm on a
+#   7. the bundled amux: version, help, models, server syntax, register/ls/account/rm on a
 #      dummy session (never launched), completion generation
 #   7b. the status line renders, sheds, and installs without clobbering settings
 #   7c. amux search finds a project by content and ends with the --agentic tip;
@@ -527,6 +527,9 @@ if has "amux v$want" "$o"; then ok "installed amux reports v$want"; else bad "am
 
 o=$(out_of "$BINDIR/amux" --help)
 if has "Accounts" "$o" || has "--account" "$o"; then ok "amux --help renders"; else bad "amux --help" "$(printf '%s' "$o" | head -5)"; fi
+
+o=$(out_of "$BINDIR/amux" models claude)
+if has "alias: newest Fable" "$o" && has "claude-fable-5-2" "$o"; then ok "amux models lists the fable alias and Fable 5.2"; else bad "amux models claude" "$(printf '%s' "$o" | head -8)"; fi
 
 if cmp -s bin/amux-server.py "$BINDIR/amux-server.py"; then
   ok "amux-server.py installed as a copy beside amux"

@@ -3279,9 +3279,11 @@ def row(model, note, default=False):
 
 def claude():
     head("claude", "amux --provider claude --model <m>   (iterm2 too)")
-    rows = [("opus", "alias: newest Opus"), ("sonnet", "alias: newest Sonnet"), ("haiku", "alias: newest Haiku"),
-            ("claude-fable-5-1", "Fable 5.1"), ("claude-opus-5-5", "Opus 5.5"),
-            ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-haiku-4-5-20251001", "Haiku 4.5")]
+    rows = [("fable", "alias: newest Fable"), ("opus", "alias: newest Opus"),
+            ("sonnet", "alias: newest Sonnet"), ("haiku", "alias: newest Haiku"),
+            ("claude-fable-5-2", "Fable 5.2"), ("claude-fable-5-1", "Fable 5.1"),
+            ("claude-opus-5-5", "Opus 5.5"), ("claude-sonnet-5-5", "Sonnet 5.5"),
+            ("claude-haiku-5-5", "Haiku 5.5"), ("claude-haiku-4-5-20251001", "Haiku 4.5")]
     names = [r[0] for r in rows]
     for m, n in rows:
         row(m, n, m == claude_default)
@@ -3609,7 +3611,7 @@ EOF
     ;;
     flags) cat <<EOF
 ${BOLD}Agent flags (on register/exec):${RESET}
-  --model <model>              Model for the agent: claude opus|sonnet|haiku|full ID;
+  --model <model>              Model for the agent: claude fable|opus|sonnet|haiku|full ID;
                                codex e.g. gpt-6.1-sol; opencode <local-provider>/<model>.
                                See every accepted model: amux models [provider]
   --full-access                Provider-neutral full-access mode (preferred)
