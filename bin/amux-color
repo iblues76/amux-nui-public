@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""amux-color — one color per amux session: the iTerm2 tab and the status-line square.
+
+  amux color                       every session with its color (same as: amux color ls)
+  amux color palette               the 20 named colors
+  amux color <name>                show one session's color
+  amux color <name> <color>        pin a color: a palette name, #rrggbb, or 16-255 (xterm index)
+  amux color <name> next           pin the next color no running session uses
+  amux color <name> auto           unpin: back to the automatic choice
+  amux color <name> none           no tab color for this session
+  amux color <name> --reroll       automatic, but pick a different one than it has now
+  amux color --mode [hash|distinct|row|random]   show or set how automatic colors are chosen
+  amux recolor [<name> ...]        repaint the open tab(s) of running sessions (default: all)
+
+One-shot, this launch only:  amux start <name> --color <color>   (also attach, up, exec, amux-tabs)
+
+Order of precedence: --color on the command line > a pinned color > the automatic mode.
+Automatic modes: distinct (default) gives each session a color no RUNNING session has and
+remembers it; hash derives it from the name; row follows the `amux ls` row; random picks a
+new one at every start.
+
+Environment: AMUX_TABCOLOR=0 never paints a tab, =1 paints even when the terminal is not
+recognised as iTerm2. The color store is ~/.amux/colors.json.
+
+Plumbing (used by amux, amux-remote and the status line):
+  amux-color ensure <name> [--color C]     resolve and record, paint nothing
+  amux-color emit <name> [--color C] [--force]   ensure, then paint this terminal's tab
+  amux-color osc <name> [--color C]        print the raw escape sequence (no checks)
+  amux-color reset [--force]               clear this terminal's tab color
+  amux-color get <name>                    "<palette-name-or-hex> <xterm-index> <r> <g> <b>"
+  amux-color rename <old> <new> | forget <name>
+"""
+import fcntl, json, os, random, re, subprocess, sys, tempfile, time, zlib
+
+# 20 colors, ordered so any prefix is as distinguishable as possible: the first ten
+# are saturated hues spread round the wheel, the second ten are their deep/pale
+# neighbours. Each is an xterm-256 index so the status-line square can draw the same
+# color the tab gets.
+PALETTE = [
+    ("red", 196), ("blue", 33), ("yellow", 226), ("green", 40), ("magenta", 201),
+    ("orange", 208), ("cyan", 51), ("purple", 93), ("lime", 154), ("pink", 205),
+    ("teal", 30), ("brown", 130), ("indigo", 62), ("olive", 100), ("crimson", 125),
+    ("forest", 28), ("sky", 117), ("salmon", 216), ("lavender", 183), ("silver", 250),
+]
+NAMES = [n for n, _ in PALETTE]
+MODES = ("hash", "distinct", "row", "random")
+DEFAULT_MODE = "distinct"
+HOME = os.environ.get("CC_HOME") or os.path.join(os.path.expanduser("~"), ".amux")
+STORE = os.path.join(HOME, "colors.json")
+SESSIONS = os.path.join(HOME, "sessions")
+
+
+def xrgb(i):
+    if i < 16:
+        return [(0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128),
+                (0, 128, 128), (192, 192, 192), (128, 128, 128), (255, 0, 0), (0, 255, 0),
+                (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)][i]
+    if i < 232:
+        j = i - 16
+        s = [0, 95, 135, 175, 215, 255]
+        return (s[j // 36], s[(j // 6) % 6], s[j % 6])
+    v = 8 + 10 * (i - 232)
+    return (v, v, v)
+
+
+def nearest_index(rgb):
+    best, bd = 16, None
+    for i in range(16, 256):
+        r, g, b = xrgb(i)
+        d = (r - rgb[0]) ** 2 + (g - rgb[1]) ** 2 + (b - rgb[2]) ** 2
+        if bd is None or d < bd:
+            best, bd = i, d
+    return best
+
+
+def luminance(rgb):
+    def lin(c):
+        c = c / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+
+
+def parse_color(spec):
+    """-> dict(color, idx, rgb) or None for 'none'. Raises ValueError on junk."""
+    s = spec.strip().lower()
+    if s in ("none", "off"):
+        return None
+    if s in NAMES:
+        idx = dict(PALETTE)[s]
+        return {"color": s, "idx": idx, "rgb": list(xrgb(idx))}
+    m = re.fullmatch(r"#?([0-9a-f]{6})", s)
+    if m:
+        h = m.group(1)
+        rgb = [int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)]
+        return {"color": "#" + h, "idx": nearest_index(rgb), "rgb": rgb}
+    m = re.fullmatch(r"#?([0-9a-f]{3})", s)
+    if m and not s.isdigit():
+        rgb = [int(c * 2, 16) for c in m.group(1)]
+        return {"color": "#%02x%02x%02x" % tuple(rgb), "idx": nearest_index(rgb), "rgb": rgb}
+    if s.isdigit() and 16 <= int(s) <= 255:
+        idx = int(s)
+        return {"color": str(idx), "idx": idx, "rgb": list(xrgb(idx))}
+    raise ValueError(spec)
+
+
+def die(msg):
+    sys.stderr.write("amux color: %s\n" % msg)
+    sys.exit(1)
+
+
+def color_or_die(spec):
+    try:
+        return parse_color(spec)
+    except ValueError:
+        die("unknown color '%s' — use one of: %s; or #rrggbb, 16-255, next, auto, none"
+            % (spec, ", ".join(NAMES)))
+
+
+# ── store ────────────────────────────────────────────────────────────────────
+class Store:
+    """colors.json under an exclusive lock: {"_mode": m, "sessions": {name: entry}}.
+    entry: color/idx/rgb (the remembered choice; color None = no tab color),
+    pinned (chosen by the user), live_idx (what the running session shows — the status
+    line draws this), oneshot + oneshot_for (a --color launch and the tmux session it was for)."""
+
+    def __init__(self, write=True):
+        self.write = write
+        self.data = {"sessions": {}}
+        self.lock = None
+
+    def __enter__(self):
+        try:
+            os.makedirs(HOME, mode=0o700, exist_ok=True)
+            if self.write:
+                self.lock = open(STORE + ".lock", "w")
+                fcntl.flock(self.lock, fcntl.LOCK_EX)
+            with open(STORE) as f:
+                d = json.load(f)
+            if isinstance(d, dict) and isinstance(d.get("sessions"), dict):
+                self.data = d
+        except (OSError, ValueError):
+            pass
+        self.before = json.dumps(self.data, sort_keys=True)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self.write and exc[0] is None and json.dumps(self.data, sort_keys=True) != self.before:
+                fd, tmp = tempfile.mkstemp(dir=HOME, prefix=".colors.")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self.data, f, indent=1, sort_keys=True)
+                    f.write("\n")
+                os.replace(tmp, STORE)
+        except OSError:
+            pass
+        finally:
+            if self.lock:
+                self.lock.close()
+        return False
+
+    @property
+    def sessions(self):
+        return self.data["sessions"]
+
+    @property
+    def mode(self):
+        m = self.data.get("_mode")
+        return m if m in MODES else DEFAULT_MODE
+
+
+def registered():
+    try:
+        names = [f[:-4] for f in os.listdir(SESSIONS) if f.endswith(".env")]
+    except OSError:
+        names = []
+    return sorted(names, key=lambda n: (n.upper(), n))      # amux ls order (sort -f)
+
+
+def tmux(*args):
+    try:
+        r = subprocess.run(("tmux",) + args, capture_output=True, text=True, timeout=3)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def running():
+    """{amux name: tmux session_created} for running amux sessions."""
+    out = {}
+    for line in tmux("list-sessions", "-F", "#{session_name} #{session_created}").splitlines():
+        n, _, c = line.partition(" ")
+        if n.startswith("amux-"):
+            out[n[5:]] = c
+    return out
+
+
+def entry_idx(e):
+    """The palette/xterm index an entry currently stands for, or None."""
+    if not e:
+        return None
+    return e.get("idx") if e.get("color") else None
+
+
+def pick_distinct(store, name, run, avoid=None):
+    """A palette color no other RUNNING session shows; among those, the one the
+    fewest registered sessions remember; palette order breaks ties."""
+    live, remembered = set(), {}
+    for n, e in store.sessions.items():
+        if n == name:
+            continue
+        i = e.get("live_idx") if n in run else None
+        if n in run and i is None:
+            i = entry_idx(e)
+        if i is not None and n in run:
+            live.add(i)
+        j = entry_idx(e)
+        if j is not None:
+            remembered[j] = remembered.get(j, 0) + 1
+    cands = [(n, i) for n, i in PALETTE if i not in live and i != avoid] \
+        or [(n, i) for n, i in PALETTE if i != avoid] or PALETTE
+    cands.sort(key=lambda p: remembered.get(p[1], 0))        # stable: palette order on ties
+    return parse_color(cands[0][0])
+
+
+LAST_SRC = [None]      # how the most recent resolve() chose: oneshot | pinned | <mode>
+
+
+def resolve(store, name, oneshot=None, run=None, record=True):
+    """-> dict(color, idx, rgb) or None (no tab color). Records the outcome."""
+    run = running() if run is None else run
+    e = store.sessions.get(name)
+    created = run.get(name, "")
+    chosen = src = None
+
+    if oneshot is not None:                                   # --color on this launch
+        spec = oneshot.strip().lower()
+        if spec == "auto":
+            oneshot = None
+        else:
+            chosen = pick_distinct(store, name, run) if spec == "next" else color_or_die(oneshot)
+            src = "oneshot"
+            if record:
+                e = store.sessions.setdefault(name, {})
+                e["oneshot"] = chosen["color"] if chosen else "none"
+                e["oneshot_for"] = created
+    if src is None and e and e.get("oneshot") is not None:
+        if created and e.get("oneshot_for") in (created, ""):  # still the same tmux session
+            chosen = None if e["oneshot"] == "none" else parse_color(e["oneshot"])
+            src = "oneshot"
+            if record:
+                e["oneshot_for"] = created
+        elif record:
+            e.pop("oneshot", None)
+            e.pop("oneshot_for", None)
+    if src is None and e and e.get("pinned"):
+        chosen = parse_color(e["color"]) if e.get("color") else None
+        src = "pinned"
+    if src is None:
+        mode = store.mode
+        src = mode
+        if mode == "hash":
+            chosen = parse_color(NAMES[zlib.crc32(name.encode()) % len(NAMES)])
+        elif mode == "row":
+            reg = registered()
+            chosen = parse_color(NAMES[(reg.index(name) if name in reg else 0) % len(NAMES)])
+        elif mode == "random":
+            fresh = not (e and e.get("random_for") == created and created and e.get("color"))
+            chosen = parse_color(random.choice(NAMES)) if fresh else parse_color(e["color"])
+            if record:
+                e = store.sessions.setdefault(name, {})
+                e.update(chosen)
+                e["pinned"] = False
+                e["random_for"] = created
+        else:                                                  # distinct
+            cur = entry_idx(e)
+            clash = cur is not None and any(
+                n != name and n in run and (o.get("live_idx", entry_idx(o)) == cur)
+                for n, o in store.sessions.items())
+            free = any(i not in {o.get("live_idx", entry_idx(o)) for n, o in store.sessions.items()
+                                 if n != name and n in run} for _, i in PALETTE)
+            if cur is None or (clash and free):
+                chosen = pick_distinct(store, name, run)
+                if record:
+                    e = store.sessions.setdefault(name, {})
+                    e.update(chosen)
+                    e["pinned"] = False
+            else:
+                chosen = {"color": e["color"], "idx": e["idx"], "rgb": e.get("rgb") or list(xrgb(e["idx"]))}
+    LAST_SRC[0] = src
+    if record:
+        e = store.sessions.setdefault(name, {})
+        e["live_idx"] = chosen["idx"] if chosen else None
+    return chosen
+
+
+# ── painting ─────────────────────────────────────────────────────────────────
+def osc(chosen):
+    if not chosen:
+        return "\033]6;1;bg;*;default\007"
+    r, g, b = chosen["rgb"]
+    return ("\033]6;1;bg;red;brightness;%d\007\033]6;1;bg;green;brightness;%d\007"
+            "\033]6;1;bg;blue;brightness;%d\007" % (r, g, b))
+
+
+def is_iterm():
+    env = os.environ
+    return (env.get("LC_TERMINAL") == "iTerm2" or env.get("TERM_PROGRAM") == "iTerm.app"
+            or bool(env.get("ITERM_SESSION_ID")))
+
+
+def write_tty(path, data):
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, data.encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def paint_here(data, force=False):
+    """Paint the tab of the terminal this command runs in. Inside tmux the pane would
+    swallow the sequence, so it goes to the tmux client's own tty instead."""
+    sw = os.environ.get("AMUX_TABCOLOR", "")
+    if sw in ("0", "off", "no"):
+        return False
+    force = force or sw in ("1", "on", "yes", "force")
+    if os.environ.get("TMUX"):
+        tty = tmux("display-message", "-p", "#{client_tty}").strip()
+        return bool(tty) and write_tty(tty, data)
+    if not (force or is_iterm()):
+        return False
+    try:
+        if not os.isatty(1):
+            return False
+        os.write(1, data.encode())
+        return True
+    except OSError:
+        return False
+
+
+def paint_clients(name, data):
+    n = 0
+    for tty in tmux("list-clients", "-t", "=amux-" + name, "-F", "#{client_tty}").split():
+        n += write_tty(tty, data)
+    return n
+
+
+# ── display ──────────────────────────────────────────────────────────────────
+def swatch(chosen, text=None):
+    if not chosen:
+        return "  --  " if text is None else text
+    fg = "16" if luminance(chosen["rgb"]) > 0.179 else "231"
+    label = (" %s " % (text if text is not None else "    "))
+    return "\033[48;5;%d;38;5;%sm%s\033[0m" % (chosen["idx"], fg, label)
+
+
+def describe():
+    """Words for how the most recent resolve() chose."""
+    return {"oneshot": "this launch only (--color)", "pinned": "pinned"}.get(LAST_SRC[0], "auto")
+
+
+def cmd_ls(store):
+    run = running()
+    reg = registered()
+    width = max([len(n) for n in reg] + [4])
+    print("mode: %s   (%d colors; * = running)" % (store.mode, len(PALETTE)))
+    for i, n in enumerate(reg, 1):
+        e = store.sessions.get(n)
+        if store.mode in ("distinct", "random") and not (e and (e.get("pinned") or e.get("color"))):
+            print("%3d%s %s %-*s  %-9s %s" % (i, "*" if n in run else " ", "  ..  ", width, n, "-",
+                                               "auto (chosen at its next start)"))
+            continue
+        chosen = resolve(store, n, run=run, record=False)
+        label = chosen["color"] if chosen else "none"
+        print("%3d%s %s %-*s  %-9s %s" % (i, "*" if n in run else " ", swatch(chosen, "%2d" % i),
+                                           width, n, label, describe()))
+
+
+def cmd_palette():
+    for k, (n, i) in enumerate(PALETTE, 1):
+        c = parse_color(n)
+        print("%2d %s %-9s xterm %-3d #%02x%02x%02x" % ((k, swatch(c, "%-8s" % n), n, i) + tuple(c["rgb"])))
+
+
+def main(argv):
+    if not argv or argv[0] in ("ls", "list"):
+        with Store(write=False) as s:
+            cmd_ls(s)
+        return 0
+    cmd = argv[0]
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if cmd == "palette":
+        cmd_palette()
+        return 0
+    if cmd == "--mode" or cmd == "mode":
+        with Store() as s:
+            if len(argv) > 1:
+                if argv[1] not in MODES:
+                    die("unknown mode '%s' — one of: %s" % (argv[1], ", ".join(MODES)))
+                s.data["_mode"] = argv[1]
+            print("mode: %s" % s.mode)
+        return 0
+
+    def opt(flag):
+        """pop `--flag VALUE` / `--flag=VALUE` from argv; None if absent."""
+        for i, a in enumerate(argv):
+            if a == flag:
+                if i + 1 >= len(argv):
+                    die("%s needs a value" % flag)
+                v = argv[i + 1]
+                del argv[i:i + 2]
+                return v
+            if a.startswith(flag + "="):
+                del argv[i]
+                return a[len(flag) + 1:]
+        return None
+
+    def flag(f):
+        if f in argv:
+            argv.remove(f)
+            return True
+        return False
+
+    if cmd in ("ensure", "emit", "osc", "get"):
+        one, force = opt("--color"), flag("--force")
+        if len(argv) < 2:
+            die("usage: amux-color %s <name>" % cmd)
+        name = argv[1]
+        with Store(write=cmd != "get") as s:
+            chosen = resolve(s, name, oneshot=one, record=cmd != "get")
+        if cmd == "emit":
+            if chosen is not None or one is not None:
+                paint_here(osc(chosen), force)
+        elif cmd == "osc":
+            sys.stdout.write(osc(chosen) if chosen else "")
+        elif cmd == "get":
+            print("%s %d %d %d %d" % ((chosen["color"], chosen["idx"]) + tuple(chosen["rgb"]))
+                  if chosen else "none")
+        return 0
+    if cmd == "reset":
+        paint_here(osc(None), flag("--force"))
+        return 0
+    if cmd == "rename":
+        if len(argv) != 3:
+            die("usage: amux-color rename <old> <new>")
+        with Store() as s:
+            if argv[1] in s.sessions:
+                s.sessions[argv[2]] = s.sessions.pop(argv[1])
+        return 0
+    if cmd == "forget":
+        with Store() as s:
+            for n in argv[1:]:
+                s.sessions.pop(n, None)
+        return 0
+    if cmd == "recolor":
+        run = running()
+        names = argv[1:] or sorted(run)
+        with Store() as s:
+            for n in names:
+                if n not in run:
+                    print("%s: not running" % n)
+                    continue
+                chosen = resolve(s, n, run=run)
+                k = paint_clients(n, osc(chosen))
+                print("%s %s -> %s (%d attached terminal%s)"
+                      % (swatch(chosen), n, chosen["color"] if chosen else "none", k, "" if k == 1 else "s"))
+        return 0
+
+    # amux color <name> [<color>|next|auto|none|--reroll]
+    name = cmd
+    reroll = flag("--reroll")
+    if not os.path.isfile(os.path.join(SESSIONS, name + ".env")):
+        die("no session '%s' (see: amux ls)" % name)
+    val = argv[1] if len(argv) > 1 else None
+    run = running()
+    with Store() as s:
+        e = s.sessions.setdefault(name, {})
+        if reroll:
+            e.pop("oneshot", None)
+            e.pop("oneshot_for", None)
+            chosen = pick_distinct(s, name, run, avoid=entry_idx(e))
+            e.update(chosen)
+            e["pinned"] = False
+            e.pop("random_for", None)
+        elif val is None:
+            chosen = resolve(s, name, run=run, record=False)
+            print("%s %s: %s (%s)" % (swatch(chosen), name, chosen["color"] if chosen else "none", describe()))
+            if not s.sessions.get(name):
+                s.sessions.pop(name, None)
+            return 0
+        else:
+            e.pop("oneshot", None)
+            e.pop("oneshot_for", None)
+            v = val.strip().lower()
+            if v == "auto":
+                for k in ("color", "idx", "rgb", "random_for"):
+                    e.pop(k, None)
+                e["pinned"] = False
+            elif v == "next":
+                e.update(pick_distinct(s, name, run))
+                e["pinned"] = True
+            else:
+                c = color_or_die(val)
+                if c is None:
+                    e.update({"color": None, "idx": None, "rgb": None})
+                else:
+                    e.update(c)
+                e["pinned"] = True
+        chosen = resolve(s, name, run=run)
+        note = ""
+        if name in run:
+            k = paint_clients(name, osc(chosen))
+            note = " — repainted %d open tab%s" % (k, "" if k == 1 else "s") if k else ""
+        print("%s %s: %s (%s)%s" % (swatch(chosen), name, chosen["color"] if chosen else "none",
+                                     describe(), note))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

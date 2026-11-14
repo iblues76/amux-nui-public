@@ -34,6 +34,12 @@ PASS-THROUGH  (the "at the end" part)
     amux-tabs futhci --model opus --continue  # applied to each
   Use `--` first if a value might look like a name:  amux-tabs futhci -- --continue
 
+TAB COLORS
+  Each tab takes its session's color (`amux color` lists them, `amux color <name> <color>`
+  pins one). To choose for this launch only, pass --color after the names:
+    amux-tabs futhci graphms --color next     # each gets the next color nobody is using
+    amux-tabs futhci --color orange           # a palette name or #rrggbb
+
 OPTIONS (amux-tabs's own — put them BEFORE the names)
   -w, --window     put the tabs in a NEW iTerm window instead of the current one.
   -H, --host BOX   run each session on a REMOTE box: the tab does `ssh -t BOX 'amux start <name>'`,
@@ -73,35 +79,17 @@ fi
 NAMES=$(printf '%s\n' $NAMES | sed '/^$/d')
 [ -n "$NAMES" ] || { echo "no session names given (and --all found none)"; exit 1; }
 
-# Per-session iTerm2 tab color: a deep jewel tone chosen by a stable crc32 hash of the
-# session name — the SAME palette as the Claude statusline square, so the tab color and
-# the status-bar square match. Emitted BEFORE tmux starts (direct OSC 6 to iTerm, no
-# passthrough needed); iTerm keeps the tab color for the life of the tab. Prints a
-# `printf '…' ; ` prefix to prepend to the tab command. No-op if python3 is missing.
-tabcolor_prefix() {
-  command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$1" <<'PY'
-import sys, zlib
-name = sys.argv[1]
-SQUARE = [160,130,94,58,28,22,23,25,26,27,57,91,127,162,125,161]
-def rgb(i):
-    j = i - 16; s = [0,95,135,175,215,255]
-    return (s[j//36], s[(j//6)%6], s[j%6])
-r, g, b = rgb(SQUARE[zlib.crc32(name.encode()) % 16])
-esc = ("\\033]6;1;bg;red;brightness;%d\\007"
-       "\\033]6;1;bg;green;brightness;%d\\007"
-       "\\033]6;1;bg;blue;brightness;%d\\007") % (r, g, b)
-sys.stdout.write("printf '" + esc + "' ; ")
-PY
-}
+# Per-session iTerm2 tab color: `amux start` paints the tab itself (see `amux color`),
+# from the session's pinned or automatic color. These tabs are iTerm2 by construction,
+# so AMUX_TABCOLOR=1 tells amux to paint without having to recognise the terminal —
+# which matters for the remote form, where the terminal's name may not cross ssh.
 
 first=1
 printf '%s\n' "$NAMES" | while IFS= read -r n; do
   [ -n "$n" ] || continue
   box="$HOST"
   case "$n" in *:*) box="${n%%:*}"; n="${n#*:}" ;; esac   # per-name box:name overrides --host
-  if [ -n "$box" ]; then cmd="ssh -t $box 'amux start $n${PASS:+ $PASS}'"; lbl="$box:$n"; else cmd="amux start $n${PASS:+ $PASS}"; lbl="$n"; fi
-  cmd="$(tabcolor_prefix "$n")$cmd"   # colour the iTerm tab (deep palette) before the session starts
+  if [ -n "$box" ]; then cmd="ssh -t $box 'AMUX_TABCOLOR=1 amux start $n${PASS:+ $PASS}'"; lbl="$box:$n"; else cmd="AMUX_TABCOLOR=1 amux start $n${PASS:+ $PASS}"; lbl="$n"; fi
   if [ "$NEWWIN" = 1 ] && [ "$first" = 1 ]; then
     osascript - "$cmd" "$lbl" <<'OSA'
 on run argv

@@ -2,6 +2,20 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.6.0 — 2026-11-14
+
+- **One color per session**: `amux color`. The session's iTerm2 tab and the square in its status line now share a color, and amux paints the tab every time you attach, however you opened it, not only from `amux-tabs`.
+- **20 named colors** instead of 16 similar ones. `amux color palette` lists them.
+- **Pick your own**: `amux color <name> orange` (a name or `#rrggbb`) pins it; `next` takes the next color nobody is using; `auto` hands the choice back; `none` turns it off; `--reroll` picks a different automatic one.
+- **For one launch**: `--color <c>` on `amux start`, `attach`, `up` and `amux-tabs`. On `amux exec` and `register` it pins the color at creation.
+- **Automatic colors no longer collide.** The default mode, `distinct`, gives each session a color no running session has. `amux color --mode hash|row|random` selects the other ways.
+- `amux recolor` repaints tabs that are already open. Remote attach colors the tab over ssh and mosh.
+- **Tab titles fit the window.** With the status line installed, a window of 110 columns or more is titled `name@machine (O hi)`; a narrower one, such as a laptop screen, gets the session name alone. `title-wide <columns>` in `~/.config/amux/statusline.conf` moves the cut-off.
+- **No `[mosh]` in front of the tab title** when you attach with `--mosh`.
+- **Tips for a clean iTerm2 tab title**: how to drop `(tmux)`, `(mosh-client)` and the tab numbers. See [docs/statusline.md](docs/statusline.md#tab-titles).
+- Upgrading: tab and square colors change once, because the palette is new. Sessions keep the color they get from then on.
+- See [docs/colors.md](docs/colors.md).
+
 ## 0.5.0 — 2026-11-03
 
 - **Faster `amux search`.** Each machine now keeps the text of its conversations in `~/.amux/cache/search`. The first search builds it (about half a minute for a few GB of history); after that, a search takes a few seconds per machine. Counts are exact. Very long conversations, previously skipped, are now searched too.

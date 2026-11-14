@@ -24,12 +24,14 @@
 #
 # Narrow panes shed segments in a fixed order (branch, then the directory, Σ, 7d, 5h, in, ctx);
 # the session square and machine name always stay. Also renames the tmux window to
-# "name (O hi)" so iTerm2 and other tab titles show model and effort.
+# "name@machine (O hi)" so iTerm2 and other tab titles show machine, model and effort; in a
+# window under 110 columns (a laptop screen) the title is the session name alone.
 #
 # Optional settings, one per line, in ~/.config/amux/statusline.conf:
 #   color <name-substring> <0-255>   fix a machine's color (default: picked from its name)
 #   strip-prefix <text>              drop a common hostname prefix ("lab-desk01" -> "desk01")
 #   quota-log on                     append quota readings to ~/.claude/quota.log
+#   title-wide <columns>             window width from which the tab title adds machine and model (default 110)
 #
 # Needs python3; git for the branch segment. Works in any terminal with 256 colors and a
 # Unicode font (built on iTerm2, also used in Linux terminals).
@@ -112,14 +114,17 @@ def _tmux_w():
             return ""
     return ""
 _raw_w = _tmux_w()
-def _strip_sfx(s):   # drop a trailing " (…)" so our own "name (M eff)" round-trips to the clean name
-    return s[:s.rfind(" (")].rstrip() if (s.endswith(")") and " (" in s) else s
+def _strip_sfx(s):   # drop a trailing " (…)" and "@machine" so our own "name@machine (M eff)" round-trips to the clean name
+    s = s[:s.rfind(" (")].rstrip() if (s.endswith(")") and " (" in s) else s
+    return s[:s.rfind("@")] if "@" in s else s
 proj = os.environ.get("AMUX_NAME") or _strip_sfx(_raw_w) or os.path.basename((g("workspace","project_dir") or cwd).rstrip("/")) or cwd
 # Optional config: ~/.config/amux/statusline.conf (or $AMUX_STATUSLINE_CONF), one setting per line:
 #   color <name-substring> <0-255>   machine-name color; first match wins (default: picked from the name)
 #   strip-prefix <text>              drop a common hostname prefix ("lab-" makes lab-desk01 read desk01)
 #   quota-log on                     append 5h/7d quota readings to ~/.claude/quota.log (default off)
-CONF = {"color": [], "strip-prefix": "", "quota-log": False}
+#   title-wide <columns>             window width from which the tab title adds machine and model (default 110;
+#                                    0 = always the long title)
+CONF = {"color": [], "strip-prefix": "", "quota-log": False, "title-wide": 110}
 try:
     for _ln in open(os.environ.get("AMUX_STATUSLINE_CONF") or os.path.expanduser("~/.config/amux/statusline.conf")):
         _f = _ln.split("#", 1)[0].split()
@@ -129,6 +134,8 @@ try:
             CONF["strip-prefix"] = _f[1]
         elif len(_f) == 2 and _f[0] == "quota-log":
             CONF["quota-log"] = _f[1].lower() in ("on", "yes", "true", "1")
+        elif len(_f) == 2 and _f[0] == "title-wide" and _f[1].isdigit():
+            CONF["title-wide"] = int(_f[1])
 except Exception:
     pass
 node = os.uname().nodename.split(".")[0]
@@ -146,8 +153,15 @@ mc = host_color(node)
 # the session name, drawn as a leading solid square. Pure color block (no text on it)
 # so it is always readable; the machine:session text keeps the machine color -> the line
 # carries BOTH box identity (text color) and session identity (square color).
-SQUARE = [160,130,94,58,28,22,23,25,26,27,57,91,127,162,125,161]   # deep jewel tones -> uniform WHITE number, contrast >=4.7
+SQUARE = [196,33,226,40,201,208,51,93,154,205,30,130,62,100,125,28,117,216,183,250]   # the 20 amux colors (amux color palette); text color below adapts
 sq = SQUARE[zlib.crc32(proj.encode()) % len(SQUARE)]
+try:   # the color amux gave this session (pinned, automatic or --color) = its iTerm2 tab color
+    import json as _cj
+    _ce = _cj.load(open(os.path.join(os.environ.get("CC_HOME") or os.path.expanduser("~/.amux"), "colors.json")))["sessions"].get(proj) or {}
+    _ci = _ce["live_idx"] if "live_idx" in _ce else _ce.get("idx")
+    if isinstance(_ci, int) and 0 <= _ci <= 255: sq = _ci
+except Exception:
+    pass
 # Auto-contrast text color for the number sitting INSIDE the colored square: black on
 # light squares, white on dark ones, so the number always reads no matter which color.
 def xlum(i):
@@ -465,14 +479,18 @@ me = f"{_ta} {_ea}".strip() if (tier or effort) else ""
 # is never shed on its own -- the label shrinks to the bare machine first.
 _mevis = f" {me}" if me else ""; _mecol = (" " + col(AMBER, me)) if me else ""
 segs[0][1] += _mevis; segs[0][2] += _mecol
-# Drive the iTerm tab title (via tmux set-titles = #W): "name (M eff!)" — model initial + short effort,
-# ! marks Fable. Live (recomputed each render), tracks /model & /effort. Rename only when it changed.
+# Drive the iTerm tab title (via tmux set-titles = #W): "name@machine (M eff!)" — model initial + short
+# effort, ! marks Fable — in a wide window, the session name alone in a narrow one (a laptop screen has
+# no room for more). Live (recomputed each render), tracks /model & /effort. Rename only when it changed.
 if _raw_w and os.environ.get("TMUX_PANE"):
     _es = {"xhigh":"xh","high":"hi","medium":"md","low":"lo","max":"mx","minimal":"mn","ultra":"ul"}.get(effort.lower(), effort[:2])
     _mi = tier[:1].upper() if tier else ""
     _fab = "fable" in model.lower() or tier.lower().startswith("fable")
     _lab = (f"{_mi} {_es}".strip() + ("!" if _fab else "")).strip()
-    _want = f"{proj} ({_lab})" if _lab else proj
+    try: _tc = int(os.environ.get("COLUMNS", "0"))
+    except ValueError: _tc = 0
+    _wide = _tc == 0 or _tc >= CONF["title-wide"]
+    _want = (f"{proj}@{host}" + (f" ({_lab})" if _lab else "")) if _wide else proj
     if _want != _raw_w:
         try: subprocess.run(["tmux","rename-window","-t",os.environ["TMUX_PANE"],_want],capture_output=True,timeout=1)
         except Exception: pass

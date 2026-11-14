@@ -33,7 +33,7 @@
 #   amux-remote <box> pick [--sessionid N]  pick one of <box>'s sessions and attach (via ccjump);
 #                                       --sessionid N = row N of `ls -c`: attach, or start + attach
 #   amux-remote <box> box               print the configured box name this spelling resolves to
-#   amux-remote <box> attach <name> [--cc|--plain|--mosh]   SSH in and attach (native iTerm2 tabs in -CC mode;
+#   amux-remote <box> attach <name> [--cc|--plain|--mosh] [--color <c>]   SSH in and attach (native iTerm2 tabs in -CC mode;
 #                                       --mosh = plain tmux over mosh: instant local echo on
 #                                       laggy links, survives network changes/sleep)
 #   amux-remote <box> peek <name> [lines]    print a session's recent output (default 80)
@@ -527,11 +527,14 @@ cmd_start() {
   validate_remote_name "$name"
   # Split amux-level options from one-shot launch flags. --no-attach and the
   # attach-lane flags (--cc/--plain/--mosh) are OURS, never forwarded to the server.
-  local no_attach=0 attach_flags=() fwd=() _a
+  local no_attach=0 attach_flags=() fwd=() _a _color_next=0
   for _a in "$@"; do
+    if (( _color_next )); then attach_flags+=("$_a"); _color_next=0; continue; fi
     case "$_a" in
       --no-attach)  no_attach=1; continue ;;
       --cc|--plain|--mosh) attach_flags+=("$_a"); continue ;;
+      --color)      attach_flags+=("$_a"); _color_next=1; continue ;;   # painted at attach
+      --color=*)    attach_flags+=("$_a"); continue ;;
     esac
     # exec/register-only options must not ride a start (2026-07-30: `start …
     # --dir …` reached claude's argv → `error: unknown option '--dir'`).
@@ -1052,26 +1055,49 @@ _origin_mark() { # $1 = session name (already validated), $2 = lane
     "$h" "$u" "$2" "$t" "$at" "$1" "$1" "$u" "$h"
 }
 
+# Tab color (see `amux color` on the box). The session's color lives on the BOX, the
+# tab is HERE, so: the ssh lane has the box paint through the ssh pty; the mosh lane
+# (mosh does not carry the sequence) asks the box for it first and paints locally.
+# The -CC lane is skipped: iTerm2 makes its own tabs there.
+_tabcolor_here() { # is this terminal one whose tab we can color?
+  case "${AMUX_TABCOLOR:-}" in 0|off|no) return 1 ;; 1|on|yes|force) return 0 ;; esac
+  [[ -t 1 ]] || return 1
+  [[ "${LC_TERMINAL:-}" == iTerm2 || "${TERM_PROGRAM:-}" == iTerm.app || -n "${ITERM_SESSION_ID:-}" ]]
+}
+_tabcolor_remote() { # $1 = verb (emit|osc), $2 = session name, $3 = one-shot color or ""
+  printf '(c=$HOME/.local/bin/amux-color; [ -x "$c" ] && "$c" %s %s%s%s) 2>/dev/null; ' \
+    "$1" "$2" "${3:+ --color $3}" "$( [[ "$1" == emit ]] && echo ' --force' )"
+}
+
 cmd_attach() {
   require_config
   # Flags may appear before or after the name; they override AMUX_CC / AMUX_MOSH /
   # auto-detect. --cc means "the iTerm2 SSH lane", so it also cancels mosh.
-  local name="" use_mosh=0
+  local name="" use_mosh=0 color=""
   case "${AMUX_MOSH:-0}" in 1|yes|true|on) use_mosh=1 ;; esac
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --cc)    AMUX_CC=1; use_mosh=0 ;;
       --plain) AMUX_CC=0 ;;
       --mosh)  use_mosh=1 ;;
-      --*)     die "unknown attach option: $1 (try --cc, --plain or --mosh)" ;;
+      --color) [[ -n "${2:-}" ]] || die "--color needs a value (a palette name, #rrggbb, next, auto or none)"
+               color="$2"; shift ;;
+      --color=*) color="${1#--color=}" ;;
+      --*)     die "unknown attach option: $1 (try --cc, --plain, --mosh or --color)" ;;
       *)       [[ -n "$name" ]] && die "unexpected argument: $1"; name="$1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX attach <name> [--cc|--plain|--mosh]"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX attach <name> [--cc|--plain|--mosh] [--color <c>]"
   # SECURITY: name is spliced into a remotely-parsed shell string below — the
   # whitelist is what prevents `attach "x'; rm -rf ~ #"` from escaping the quotes.
   validate_remote_name "$name"
+  # SECURITY: color is spliced into the same remotely-parsed string — same whitelist idea.
+  if [[ -n "$color" ]]; then
+    [[ "$color" =~ ^#?[A-Za-z0-9]+$ ]] || die "invalid --color '$color' (a palette name, #rrggbb, next, auto or none)"
+    color="${color/#\#/\\#}"
+  fi
+  local paint=0; _tabcolor_here && paint=1
   local host; host=$(_ssh_host)
   local user="${AMUX_SSH_USER:-$USER}"
   local tname="amux-${name}"
@@ -1087,7 +1113,11 @@ cmd_attach() {
     else
       echo "${DIM}→ mosh ${user}@${host} — tmux attach-session -t =${tname}${RESET} ${DIM}(plain, over mosh)${RESET}"
       _termprobe before "${BOX}:${name}"
-      exec mosh --server="$MOSH_SERVER_CMD" "${user}@${host}" -- \
+      if (( paint )); then
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "${user}@${host}" "$(_tabcolor_remote osc "$name" "$color")" 2>/dev/null || true
+      fi
+      # no "[mosh] " in front of the tab title: the status line already marks a mosh attach
+      MOSH_TITLE_NOPREFIX=1 exec mosh --server="$MOSH_SERVER_CMD" "${user}@${host}" -- \
         sh -c "$(_origin_mark "$name" mosh)tmux attach-session -t '=${tname}' || ${missing}"
     fi
     AMUX_CC=0   # the fallback keeps the plain look the caller asked for
@@ -1100,7 +1130,10 @@ cmd_attach() {
   # probe the tab's live colors on each side of the attach (~/.amux/logs/term-probe.log)
   local rc=0
   _termprobe before "${BOX}:${name}"
-  ssh "${user}@${host}" -t "$(_origin_mark "$name" "$lane")${tmux_cmd} -t '=${tname}' || ${missing}" || rc=$?
+  local paintcmd=""
+  if (( paint )) && [[ "$lane" == ssh ]]; then paintcmd=$(_tabcolor_remote emit "$name" "$color"); else paint=0; fi
+  ssh "${user}@${host}" -t "$(_origin_mark "$name" "$lane")${paintcmd}${tmux_cmd} -t '=${tname}' || ${missing}" || rc=$?
+  (( paint )) && printf '\033]6;1;bg;*;default\007'
   _termprobe after "${BOX}:${name}"
   exit $rc
 }

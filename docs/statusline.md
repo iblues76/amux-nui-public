@@ -27,7 +27,7 @@ Needs `python3`. `git` is used for the branch segment only; without it, the bran
 
 | Part | Example | Meaning |
 |---|---|---|
-| Session square | ` 4 ` | Row number in `amux ls`, so `amux 4` attaches to this session. The color is fixed per session name |
+| Session square | ` 4 ` | Row number in `amux ls`, so `amux 4` attaches to this session. The color is the session's own, the same as its iTerm2 tab: see [colors.md](colors.md) |
 | Mosh mark | ` 4 M ` | Someone is attached to this session over mosh |
 | Machine and directory | `laptop:…/api` | Machine name (one stable color per machine) and the live working directory |
 | Focus view | `○` or `◉` | Claude Code's focus (brief) transcript view: `◉` on, `○` off |
@@ -45,7 +45,7 @@ A few details:
 
 - **Branch from the session root.** The branch comes from the directory the session started in, not wherever a command last `cd`'d to. When the session root holds several repositories but is not one itself, it lists the first one that is off its default branch, plus how many more (`⎇ app:feat/x +1`).
 - **Quotas** appear only on Pro/Max plans, and only after the session's first reply.
-- **Tab titles.** Inside tmux it also renames the window to `name (O hi)` (model initial and effort), so tab titles in iTerm2 and other terminals show them.
+- **Tab titles.** Inside tmux it also renames the window, so tab titles in iTerm2 and other terminals follow the session. In a window of 110 columns or more the title is `name@machine (O hi)` (model initial and effort). In a narrower window, such as a laptop screen, it is the session name alone. See [Tab titles](#tab-titles) below.
 
 ## Narrow panes
 
@@ -62,9 +62,43 @@ color desk 208
 strip-prefix lab-
 # append each 5h / 7d quota reading to ~/.claude/quota.log (at most once a minute per account)
 quota-log on
+# the tab title adds machine and model from this window width (default 110; 0 = always)
+title-wide 140
 ```
 
 Without a `color` line, each machine gets a color picked from its name, the same on every render. `AMUX_STATUSLINE_CONF=<file>` points at a different file.
+
+## Tab titles
+
+The status line names the tmux window, and tmux passes that name to the terminal as the tab title. Two lines in `~/.tmux.conf` turn that on, if you do not have them yet:
+
+```
+set -g set-titles on
+set -g set-titles-string '#W'
+```
+
+The title depends on the width of the window, not on which display it is on:
+
+| Window | Title |
+|---|---|
+| 110 columns or wider | `api@desk01 (O hi)` |
+| Narrower | `api` |
+
+`title-wide <columns>` in the settings file moves the cut-off. `tput cols` prints the width of the window you are in.
+
+### Removing what iTerm2 adds
+
+iTerm2 puts its own text around the title: the running program after it, as in `api (tmux)` or `api (mosh-client)`, and a tab number before it. Three settings leave only the name:
+
+| To remove | Where in iTerm2 |
+|---|---|
+| `(tmux)`, `(mosh-client)`, `(-zsh)` after the name | Settings → Profiles → General → Title: open the menu and leave only **Session Name** checked (uncheck **Job**). Repeat for each profile you use. |
+| The tab number (`⌘1`) | Settings → Appearance → Tabs: uncheck **Show tab numbers**. |
+| `[mosh]` before the name | Nothing to do with `amux -H <box> attach --mosh`: amux starts mosh with `MOSH_TITLE_NOPREFIX=1`. For a mosh you start yourself, set that variable: `MOSH_TITLE_NOPREFIX=1 mosh host`. |
+
+If the title does not change at all, check that Settings → Profiles → Terminal → **Terminal may set tab/window title** is on.
+
+These are iTerm2 settings, so they work for any tmux session, with or without amux.
 
 ## Terminals
 

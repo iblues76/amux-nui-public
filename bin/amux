@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-CC_VERSION="0.9.14"
+CC_VERSION="0.9.15"
 _RESUME_TARGET=""
 _RESUME_SKIPPED=""
 
@@ -840,6 +840,27 @@ check_env_value() {
 
 # Parse Claude Code flags from args, split into CC_FLAGS array and remaining args
 # Sets: CC_FLAGS_STR (for storage), CC_DIR, CC_EXTRA_ARGS, CC_PROVIDER_OPT, CC_ACCOUNT_OPT
+# Pull `--color C` / `--color=C` out of an exec/register argument list: it is an
+# amux option (pinned with `amux color`), never an agent flag. Sets _COLOR_PIN and
+# the array _COLOR_REST (the remaining arguments, order kept).
+_split_color_flag() {
+  _COLOR_PIN=""; _COLOR_REST=()
+  local a nxt=0
+  for a in "$@"; do
+    if (( nxt )); then _COLOR_PIN="$a"; nxt=0; continue; fi
+    case "$a" in
+      --color)   nxt=1 ;;
+      --color=*) _COLOR_PIN="${a#--color=}" ;;
+      *)         _COLOR_REST+=("$a") ;;
+    esac
+  done
+  (( nxt )) && die "--color needs a value (a palette name, #rrggbb, next, auto or none — see: amux color palette)"
+  if [[ -n "$_COLOR_PIN" ]]; then
+    [[ "$_COLOR_PIN" =~ ^#?[A-Za-z0-9]+$ ]] || die "invalid --color '$_COLOR_PIN' (see: amux color palette)"
+  fi
+  return 0
+}
+
 parse_claude_flags() {
   CC_FLAGS=()
   CC_DIR=""
@@ -944,6 +965,8 @@ cmd_register() {
   validate_name "$name"
   shift
 
+  _split_color_flag "$@"
+  set -- ${_COLOR_REST[@]+"${_COLOR_REST[@]}"}
   parse_claude_flags "$@"
 
   # Always persist an absolute CC_DIR. If --dir wasn't passed, use $(pwd) which
@@ -983,6 +1006,7 @@ ${account_line}
 EOF
 
   echo "${GREEN}registered${RESET} ${BOLD}$name${RESET} → $resolved_dir ${DIM}(provider: $provider${account:+, account: $account})${RESET}"
+  [[ -z "$_COLOR_PIN" ]] || _tabcolor "$name" "$_COLOR_PIN" >/dev/null
   [[ -n "$CC_FLAGS_STR" ]] && echo "  flags: $CC_FLAGS_STR"
 }
 
@@ -1355,8 +1379,9 @@ cmd_start() {
   # One-shot account (2026-09-05): `amux start <name> --account team` puts THIS
   # launch on the other Claude identity without touching the stored choice.
   local _fresh=0 _oneshot_full_access=0 _ft _acct_override="" _acct_next=0 _noattach=0
-  local _f_rest=() _autoprompt=0
+  local _f_rest=() _autoprompt=0 _color_next=0
   for _ft in "$@"; do
+    if (( _color_next )); then AMUX_COLOR_ONESHOT="$_ft"; _color_next=0; continue; fi
     if (( _acct_next )); then
       _acct_override=$(normalize_account "$_ft"); validate_account "$_acct_override"; _acct_next=0; continue
     fi
@@ -1367,10 +1392,19 @@ cmd_start() {
       --autoprompt) _autoprompt=1 ;;   # one-shot: prompt suggestions on for this launch
       --account) _acct_next=1 ;;
       --account=*) _acct_override=$(normalize_account "${_ft#--account=}"); validate_account "$_acct_override" ;;
+      --color) _color_next=1 ;;        # one-shot tab/square color for this launch (amux color)
+      --color=*) AMUX_COLOR_ONESHOT="${_ft#--color=}" ;;
       *)       _f_rest+=("$_ft") ;;
     esac
   done
   (( _acct_next )) && die "--account needs a value (one of: $AMUX_ACCOUNTS)"
+  (( _color_next )) && die "--color needs a value (a palette name, #rrggbb, next, auto or none — see: amux color palette)"
+  if [[ -n "${AMUX_COLOR_ONESHOT:-}" ]]; then
+    [[ "$AMUX_COLOR_ONESHOT" =~ ^#?[A-Za-z0-9]+$ ]] || die "invalid --color '$AMUX_COLOR_ONESHOT' (see: amux color palette)"
+  fi
+  # Settle this session's color before the agent starts, so the status-line square
+  # and the tab agree from the first frame.
+  _tabcolor ensure "$name" ${AMUX_COLOR_ONESHOT:+--color "$AMUX_COLOR_ONESHOT"}
   set -- ${_f_rest[@]+"${_f_rest[@]}"}
   # --autoprompt stored in CC_FLAGS is an amux marker, never a claude flag: strip it
   # here, before any launch builder reads CC_FLAGS, and remember it.
@@ -2022,6 +2056,8 @@ cmd_exec() {
   validate_name "$name"
   shift
 
+  _split_color_flag "$@"
+  set -- ${_COLOR_REST[@]+"${_COLOR_REST[@]}"}
   parse_claude_flags "$@"
 
   local resolved_dir="${CC_DIR:-$(pwd)}"
@@ -2054,6 +2090,8 @@ CC_PROVIDER="$provider"
 ${account_line}
 EOF
 
+  [[ -z "$_COLOR_PIN" ]] || _tabcolor "$name" "$_COLOR_PIN" >/dev/null
+
   # Start
   cmd_start "$name" "${CC_EXTRA_ARGS[@]+"${CC_EXTRA_ARGS[@]}"}"
 }
@@ -2065,6 +2103,14 @@ _termprobe() {
   [[ -x "$p" ]] || p="$(command -v amux-termprobe 2>/dev/null || true)"
   [[ -n "$p" && -t 1 ]] || return 0
   "$p" "$@" || true
+}
+# Per-session color (tab + status-line square) lives in the amux-color companion:
+# `_tabcolor ensure|emit|reset|rename|forget …`. Never fatal, silent when absent.
+_tabcolor() {
+  local p="$HOME/.local/bin/amux-color"
+  [[ -x "$p" ]] || p="$(command -v amux-color 2>/dev/null || true)"
+  [[ -n "$p" ]] || return 0
+  "$p" "$@" 2>/dev/null || true
 }
 # Origin record (2026-10-29): which box, user and lane a session was last attached
 # FROM, so the agent inside can act on the machine you are sitting at (open a file
@@ -2144,7 +2190,9 @@ _attach_probed() { # $1 = tmux session name, $2 = amux session name
   local rc=0
   _origin_local "$2"
   _termprobe before "local:$2"
+  _tabcolor emit "$2" ${AMUX_COLOR_ONESHOT:+--color "$AMUX_COLOR_ONESHOT"}
   tmux attach-session -t "=$1" || rc=$?
+  _tabcolor reset
   _termprobe after "local:$2"
   return $rc
 }
@@ -2157,6 +2205,13 @@ cmd_attach() {
     -t?*)        set -- "${1#-t}" "${@:2}" ;;
   esac
   name=$(resolve_session "${1:-}")
+  case "${2:-}" in
+    --color)   [[ -n "${3:-}" ]] || die "--color needs a value (see: amux color palette)"; AMUX_COLOR_ONESHOT="$3" ;;
+    --color=*) AMUX_COLOR_ONESHOT="${2#--color=}" ;;
+  esac
+  if [[ -n "${AMUX_COLOR_ONESHOT:-}" ]]; then
+    [[ "$AMUX_COLOR_ONESHOT" =~ ^#?[A-Za-z0-9]+$ ]] || die "invalid --color '$AMUX_COLOR_ONESHOT' (see: amux color palette)"
+  fi
   # iTerm2-provider session: "attach" = reveal its tab (there is no tmux).
   local _sid
   _sid=$(_iterm2_id "$name")
@@ -2292,6 +2347,7 @@ cmd_rm() {
   local _sid
   _sid=$(_iterm2_id "$name")
   rm -f "$CC_SESSIONS/$name.env"
+  _tabcolor forget "$name"
   echo "${RED}removed${RESET} $name"
   [[ -z "$_sid" ]] || echo "  ${DIM}(its iTerm2 tab, if still open, is now unmanaged — close it by hand)${RESET}"
 }
@@ -2377,6 +2433,7 @@ cmd_rename() {
   tmux has-session -t "=$otn" 2>/dev/null && { tmux kill-session -t "=$otn" 2>/dev/null || true; }
   # move + relabel the registration
   sed "s|^CC_NAME=.*|CC_NAME=\"$new\"|" "$of" > "$nf" && rm -f "$of"
+  _tabcolor rename "$old" "$new"
   echo "${GREEN}renamed${RESET} ${BOLD}$old${RESET} -> ${BOLD}$new${RESET} ${DIM}(same dir; restarting, auto-resumes)${RESET}"
   cmd_start "$new"
 }
@@ -2505,6 +2562,7 @@ for m in re.finditer(r"(?:^|\s)(\d+) [\u25cf\u25cb] (\S+)", sys.stdin.read()):
   if [[ "$box" == local && -n "${TMUX:-}" ]]; then
     cmd_start "$name" --no-attach  # inside tmux an attach would nest: start, then switch
     _termprobe switch "local:$name"
+    _tabcolor emit "$name"
     exec tmux switch-client -t "=$(tmux_name "$name")"
   elif [[ "$box" == local ]]; then
     cmd_start "$name"            # attaches if running, else starts (auto-resume) + attaches
@@ -3349,7 +3407,7 @@ ${BOLD}Key commands:${RESET}
   amux exec <name> --provider <p> [--dir <path> | --pwd] [--full-access] [--autoprompt]
                                  Register + start in one step (--provider REQUIRED for a new session:
                                  claude|codex|gemini|opencode|iterm2|agy)
-  amux start <name> [--fresh] [--full-access] [--autoprompt] [--no-attach]
+  amux start <name> [--fresh] [--full-access] [--autoprompt] [--no-attach] [--color <c>]
                                  Start a registered session (flags apply to this launch only)
   amux attach <name>             Attach to a running session (detach: Ctrl-b d); amux 3 = session #3 from ls
   amux up [<box>] <name> [flags] Start if needed, THEN attach (== amux-up; also amux -H <box> up <name>)
@@ -3374,6 +3432,11 @@ ${BOLD}Sessions:${RESET}
   amux rename <old> <new>        Rename (keeps its dir; restarts + auto-resumes)
   amux provider <name> [<p>]     Show or change which agent a session runs
   amux account <name> [P|T|X]    Show or change which Claude subscription it bills to
+  amux color [<name> [<color>|next|auto|none|--reroll]]
+                                 Tab + status-line color per session: list, show, or pin one (20 named
+                                 colors, #rrggbb); --color <c> on start/attach/exec = this launch only;
+                                 amux color palette | --mode hash|distinct|row|random; amux recolor repaints
+                                 open tabs; all options: amux-color -h
   amux start-all | stop-all      Start every registered / stop every running session
   amux start|attach|peek|stop <name> --find
                                  Not on this box? Look on the other boxes and act there after a yes
@@ -3723,6 +3786,8 @@ _amux() {
     'rename:rename a session'
     'provider:show or change the agent a session runs'
     'account:show or change the subscription a session bills to'
+    'color:show or pin a session tab + status-line color'
+    'recolor:repaint the open tabs of running sessions'
     'info:session details'
     'origin:where the session was last attached from'
     'models:models each agent accepts'
@@ -3781,8 +3846,9 @@ _amux() {
     fi
   }
   case $cmd in
-    start)             _amux_name_then --fresh --full-access --account --no-attach --find --mosh --cc --plain ;;
-    attach|a)          _amux_name_then --find --mosh --cc --plain ;;
+    start)             _amux_name_then --fresh --full-access --account --no-attach --color --find --mosh --cc --plain ;;
+    attach|a)          _amux_name_then --color --find --mosh --cc --plain ;;
+    color|recolor)     _amux_name_then --reroll ;;
     up)                _amux_name_then --fresh --full-access --account --mosh --cc --plain ;;
     peek|p)            _amux_name_then --find --raw ;;
     stop|kill)         _amux_name_then --find ;;
@@ -3863,7 +3929,7 @@ _amux_companion_complete() {
 _amux_complete() {
   local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
   local i=1 remote=0 rbox="" cmd pos
-  local cmds="start stop attach up peek send ls pick register exec rm rmnum search rename provider account info origin models defaults start-all stop-all serve board help version completion"
+  local cmds="start stop attach up peek send ls pick register exec rm rmnum search rename provider account color recolor info origin models defaults start-all stop-all serve board help version completion"
   local providers="claude codex gemini opencode iterm2 agy" accounts="P T X personal team team2"
   COMPREPLY=()
 
@@ -3905,8 +3971,9 @@ _amux_complete() {
 
   local words=""
   case $cmd in
-    start)             words="--fresh --full-access --account --no-attach --find --mosh --cc --plain" ;;
-    attach|a)          words="--find --mosh --cc --plain" ;;
+    start)             words="--fresh --full-access --account --no-attach --color --find --mosh --cc --plain" ;;
+    attach|a)          words="--color --find --mosh --cc --plain" ;;
+    color|recolor)     words="--reroll" ;;
     up)                words="--fresh --full-access --account --mosh --cc --plain" ;;
     peek|p)            words="--find --raw" ;;
     stop|kill)         words="--find" ;;
@@ -4050,6 +4117,15 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     rename|mv)        shift; cmd_rename "$@" ;;
     provider)         shift; cmd_provider "$@" ;;
     account|acct)     shift; cmd_account "$@" ;;
+    color|colors|colour)
+                      shift
+                      command -v amux-color >/dev/null 2>&1 \
+                        || die "color needs amux-color, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
+                      exec amux-color "$@" ;;
+    recolor)          shift
+                      command -v amux-color >/dev/null 2>&1 \
+                        || die "recolor needs amux-color, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
+                      exec amux-color recolor "$@" ;;
     ls|list)          shift; cmd_ls "$@" ;;
     pick|choose)      shift; cmd_pick "$@" ;;
     info)             shift; cmd_info "$@" ;;

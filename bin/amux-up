@@ -86,10 +86,14 @@ fi
 if command -v amux-remote >/dev/null 2>&1 && [ -f "$remdir/$box.env" ]; then
   # Route flags: --cc/--plain/--mosh belong to `attach`; everything else (--continue,
   # --provider …) is a one-shot launch flag for `start`.
-  start_flags=(); attach_flags=()
+  # --color <c> (this launch's tab color) is painted at attach, so it goes there too.
+  start_flags=(); attach_flags=(); color_next=0
   for a in "$@"; do
+    if [ "$color_next" = 1 ]; then attach_flags+=("$a"); color_next=0; continue; fi
     case "$a" in
       --cc|--plain|--mosh) attach_flags+=("$a") ;;
+      --color)      attach_flags+=("$a"); color_next=1 ;;
+      --color=*)    attach_flags+=("$a") ;;
       *)            start_flags+=("$a") ;;
     esac
   done

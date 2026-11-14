@@ -19,6 +19,7 @@
 #   7b. the status line renders, sheds, and installs without clobbering settings
 #   7c. amux search finds a project by content and ends with the --agentic tip;
 #       -e ranks by co-occurrence, skips injected text, --show, groups, | head
+#   7d. amux color: pin, hex, automatic, the tab sequence, the status line square
 #   8. the audit catches a planted secret
 #
 # Usage:
@@ -581,6 +582,19 @@ else
 fi
 o=$(printf '%s' "$SLJSON" | COLUMNS=70 "$SL" 2>&1 | plain)
 if has "ctx 82%" "$o" && ! has "Σ" "$o"; then ok "narrow pane sheds Σ and keeps ctx"; else bad "narrow shedding" "$o"; fi
+# tab title: a stand-in tmux reports the window name and records what it is renamed to
+mkdir -p "$SANDBOX/stubbin"
+printf '%s\n' '#!/bin/sh' 'case "$1" in display-message) cat "$SL_TITLE.name" ;; rename-window) for a; do :; done; printf "%s" "$a" > "$SL_TITLE" ;; esac' > "$SANDBOX/stubbin/tmux"
+chmod +x "$SANDBOX/stubbin/tmux"
+sl_title() { rm -f "$SANDBOX/title.txt"; printf '%s\n' "${2-demo}" > "$SANDBOX/title.txt.name"; printf '%s' "$SLJSON" | env -u AMUX_NAME SL_TITLE="$SANDBOX/title.txt" TMUX=stub TMUX_PANE=%0 PATH="$SANDBOX/stubbin:$PATH" COLUMNS="$1" "$SL" >/dev/null 2>&1; cat "$SANDBOX/title.txt" 2>/dev/null; }
+o=$(sl_title 200)
+if has "demo@" "$o" && has "(O hi)" "$o"; then ok "a wide window is titled name@machine (model effort)"; else bad "wide tab title" "$o"; fi
+o=$(sl_title 89 "demo@box (O hi)")
+[ "$o" = "demo" ] && ok "a narrow window is titled with the session name alone" || bad "narrow tab title" "$o"
+mkdir -p "$HOME/.config/amux"; printf 'title-wide 80\n' > "$HOME/.config/amux/statusline.conf"
+o=$(sl_title 89)
+has "demo@" "$o" && ok "title-wide moves the cut-off" || bad "title-wide ignored" "$o"
+rm -f "$HOME/.config/amux/statusline.conf"
 n=$(awk '/^exec python3 -c /{on=1;next} on' "$REPO/bin/amux-statusline" | tr -cd "'" | wc -c | tr -d ' ')
 [ "$n" = 1 ] && ok "python body has no stray apostrophe" || bad "python body has $((n-1)) stray apostrophe(s)"
 printf '%s' "$SLJSON" | COLUMNS=200 "$SL" >/dev/null 2>&1
@@ -648,6 +662,32 @@ rm -f "$HOME/.amux/search-groups.conf"
 o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux-search" zebrafinch42 2>&1 | head -1; echo "rc=${PIPESTATUS[0]}")
 ! has "BrokenPipe" "$o" && ! has "rc=120" "$o" && ok "piping into head ends quietly" || bad "| head raised" "$o"
 rm -rf "$HOME/claudecode" "$HOME/.claude" "$HOME/.amux/cache"
+
+# ── 7d. amux color ───────────────────────────────────────────────────────────
+sect "7d. amux color"
+mkdir -p "$SANDBOX/cproj"
+run "$BINDIR/amux" register cone --provider claude --dir "$SANDBOX/cproj" --color teal
+run "$BINDIR/amux" register ctwo --provider claude --dir "$SANDBOX/cproj"
+o=$(PATH="$BINDIR:$PATH" "$BINDIR/amux" color cone 2>&1 | plain)
+has "teal (pinned)" "$o" && ok "register --color pins the color" || bad "register --color did not pin" "$o"
+! grep -q -- "--color" "$CC_HOME/sessions/cone.env" && ok "--color is not stored as an agent flag" || bad "--color leaked into the session flags"
+o=$(PATH="$BINDIR:$PATH" "$BINDIR/amux" color ctwo '#ff8800' 2>&1 | plain)
+has "#ff8800 (pinned)" "$o" && ok "a #rrggbb color can be pinned" || bad "hex pin failed" "$o"
+PATH="$BINDIR:$PATH" "$BINDIR/amux" color ctwo auto >/dev/null 2>&1
+"$BINDIR/amux-color" ensure cone; "$BINDIR/amux-color" ensure ctwo
+a=$("$BINDIR/amux-color" get cone); b=$("$BINDIR/amux-color" get ctwo)
+[ -n "$b" ] && [ "${a%% *}" != "${b%% *}" ] && ok "an automatic color differs from the pinned one" || bad "automatic color clashed" "$a / $b"
+o=$("$BINDIR/amux-color" osc cone | od -c | head -1)
+has "] 6 ; 1 ; b g ; r e d" "$(printf '%s' "$o" | tr -s ' ')" && ok "the tab sequence is produced" || bad "no tab sequence" "$o"
+o=$(PATH="$BINDIR:$PATH" "$BINDIR/amux" color cone notacolor 2>&1 | plain)
+has "unknown color" "$o" && ok "an unknown color is refused" || bad "unknown color accepted" "$o"
+o=$(PATH="$BINDIR:$PATH" "$BINDIR/amux" start cone --color 'x;y' 2>&1 | plain)
+has "invalid --color" "$o" && ok "start refuses an unsafe --color value" || bad "unsafe --color not refused" "$o"
+o=$(printf '{"workspace":{"current_dir":"%s"}}' "$SANDBOX/cproj" | AMUX_NAME=cone "$BINDIR/amux-statusline" 2>&1)
+has "5;30" "$o" && ok "the status line square uses the session's color" || bad "status line ignored the color" "$o"
+printf 'y\n' | run "$BINDIR/amux" rm cone; printf 'y\n' | run "$BINDIR/amux" rm ctwo
+o=$(python3 -c 'import json,sys; print(sorted(json.load(open(sys.argv[1]))["sessions"]))' "$CC_HOME/colors.json" 2>&1)
+[ "$o" = "[]" ] && ok "rm forgets the color" || bad "color left behind after rm" "$o"
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"

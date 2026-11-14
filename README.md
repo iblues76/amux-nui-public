@@ -4,7 +4,7 @@ A ready-to-use build of [**amux**](https://github.com/mixpeek/amux) — the sess
 
 This is the setup its maintainer uses every day, with the personal parts taken out: no machine names, accounts, addresses or credentials ship in it. You bring your own.
 
-**Version 0.5.0** — bundles a modified **amux 0.9.14** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
+**Version 0.6.0** — bundles a modified **amux 0.9.15** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
 
 Works on **macOS and Linux**, and on **Windows** through WSL (driving other machines from MSYS2 or Git Bash is untested; see [docs/windows.md](docs/windows.md)).
 
@@ -95,6 +95,18 @@ The colored square holds the session's `amux ls` row, so `amux 4` attaches to ex
 
 It backs up `~/.claude/settings.json` and will not replace a status line you already have unless you add `--force`. Every segment, the color settings and removal: **[docs/statusline.md](docs/statusline.md)**.
 
+## Colors
+
+Every session has a color, shown on its iTerm2 tab and in the status line square, so you can tell a dozen open tabs apart at a glance.
+
+```sh
+amux color                     # every session and its color
+amux color api orange          # pin one (20 named colors, or '#rrggbb')
+amux start api --color teal    # for this launch only
+```
+
+Left alone, amux gives each session a color that no running session has. Details: **[docs/colors.md](docs/colors.md)**.
+
 ## Finding a session
 
 Which session was it where you fixed that bug? `amux search` looks through every session's conversations, the files in its folder, and its name, and prints the matches with their `amux ls` row numbers, so `amux <row>` opens the one you want:
@@ -136,6 +148,7 @@ amux search --agentic "which session set up the login page, and is it finished?"
 | [`amux-rm-stopped`](bin/amux-rm-stopped) | Remove every stopped session from the list (asks first) |
 | [`amux-statusline`](bin/amux-statusline) | The Claude Code status line above; `--install` / `--uninstall` |
 | [`amux-tabs`](bin/amux-tabs) | One iTerm2 tab per session (macOS) |
+| [`amux-color`](bin/amux-color) | One color per session for its iTerm2 tab and status line square (what `amux color` runs) |
 | [`amux-termprobe`](bin/amux-termprobe) | Logs the terminal's real colors around each attach (debugging aid; `AMUX_TERMPROBE=0` disables) |
 
 Every command answers `-h`.
@@ -146,6 +159,7 @@ Every command answers `-h`.
 - [**auth.md**](docs/auth.md) — `/login` vs long-lived tokens, browser control, the both-at-once trap
 - [**remote.md**](docs/remote.md) — connecting machines; tokens and rotation
 - [**statusline.md**](docs/statusline.md) — the status line: every segment, settings, install and removal
+- [**colors.md**](docs/colors.md) — one color per session: pinning, the palette, automatic modes
 - [**windows.md**](docs/windows.md) — WSL vs MSYS2 vs Git Bash
 - [**troubleshooting.md**](docs/troubleshooting.md) — symptoms, causes, fixes
 - [**CHANGELOG.md**](CHANGELOG.md) — what changed in each release
