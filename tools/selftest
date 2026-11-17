@@ -682,6 +682,10 @@ a=$("$BINDIR/amux-color" get cone); b=$("$BINDIR/amux-color" get ctwo)
 [ -n "$b" ] && [ "${a%% *}" != "${b%% *}" ] && ok "an automatic color differs from the pinned one" || bad "automatic color clashed" "$a / $b"
 o=$("$BINDIR/amux-color" osc cone | od -c | head -1)
 has "] 6 ; 1 ; b g ; r e d" "$(printf '%s' "$o" | tr -s ' ')" && ok "the tab sequence is produced" || bad "no tab sequence" "$o"
+o=$(python3 -c 'import importlib.machinery as m, importlib.util as u, os, sys
+l = m.SourceFileLoader("ac", sys.argv[1]); s = u.spec_from_loader("ac", l); c = u.module_from_spec(s); l.exec_module(c)
+print(c.mosh_relay(os.getpid(), c.osc(None)), c._ssh_alias_for("192.0.2.77"))' "$BINDIR/amux-color" 2>&1)
+[ "$o" = "False 192.0.2.77" ] && ok "the mosh relay stays idle outside mosh" || bad "mosh relay misfired" "$o"
 o=$(PATH="$BINDIR:$PATH" "$BINDIR/amux" color cone notacolor 2>&1 | plain)
 has "unknown color" "$o" && ok "an unknown color is refused" || bad "unknown color accepted" "$o"
 o=$(PATH="$BINDIR:$PATH" "$BINDIR/amux" start cone --color 'x;y' 2>&1 | plain)

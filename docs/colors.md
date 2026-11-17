@@ -52,6 +52,6 @@ Tab colors need iTerm2. amux recognizes it on its own; in other terminals nothin
 Two limits:
 
 - With iTerm2's tmux integration (`--cc`), iTerm2 creates the tabs itself and they are not colored.
-- Over mosh the color is set when you attach. A color you change later shows at the next attach, because mosh does not pass the sequence along.
+- mosh does not pass the color sequence along. amux works around it: when the session runs behind a mosh connection, it also connects back over ssh to the machine the mosh came from and paints that tab directly. This works whether you used `amux -H <box> attach --mosh` or ran `mosh <box>` yourself and then `amux attach` there, but only if the remote machine can ssh back to yours without a password (key login). Otherwise the tab keeps the color set at attach, if any. `AMUX_MOSH_RELAY=0` turns the connect-back off.
 
 Colors are stored in `~/.amux/colors.json` on the machine that runs the session.

@@ -2,6 +2,10 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.6.2 — 2026-11-17
+
+- **Tab colors over mosh.** mosh does not pass iTerm2's tab-color sequence along, so a session reached by `mosh <box>` and then `amux attach` kept an uncolored tab. When a session runs behind mosh, amux now also connects back over ssh to the machine the mosh came from and paints that tab directly. This needs key-based ssh from the remote machine back to yours; `AMUX_MOSH_RELAY=0` turns it off. See [docs/colors.md](docs/colors.md).
+
 ## 0.6.1 — 2026-11-14
 
 - **`amux models` is current again.** The Claude list now shows the `fable` alias, Claude Fable 5.2 and Claude Haiku 5.5. It had stopped at Fable 5.1 and had no `fable` alias, although `--model fable` already worked.

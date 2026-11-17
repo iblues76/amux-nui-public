@@ -322,6 +322,123 @@ def write_tty(path, data):
         os.close(fd)
 
 
+# ── mosh relay ───────────────────────────────────────────────────────────────
+# mosh-server keeps its own screen and forwards only titles and the clipboard, so
+# the tab-color sequence written into a mosh pty never reaches iTerm. When the
+# terminal we paint hangs off a mosh-server, also ssh back to the machine the mosh
+# came from and write the sequence to the tty of its matching mosh-client (matched
+# by the "| <server-ip> <port>" that mosh-client shows in its command line).
+def _ps(pid, fields):
+    try:
+        return subprocess.run(["ps", "-o", fields + "=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=3).stdout.strip()
+    except Exception:
+        return ""
+
+
+def mosh_server_of(pid):
+    """pid of the mosh-server above pid (8 levels at most), or None."""
+    for _ in range(8):
+        pid = str(pid).strip()
+        if not pid.isdigit() or int(pid) <= 1:
+            return None
+        if os.path.basename(_ps(pid, "comm")).startswith("mosh-server"):
+            return int(pid)
+        pid = _ps(pid, "ppid")
+    return None
+
+
+def _mosh_endpoint(spid):
+    """(server_ip, udp_port, client_ip) of mosh-server spid, or None."""
+    ip = port = None
+    try:
+        out = subprocess.run(["ss", "-Hulpn"], capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if "pid=%d," % spid in line:
+                ip, _, port = line.split()[3].rpartition(":")
+                break
+    except Exception:
+        pass
+    if not port:
+        try:
+            out = subprocess.run(["lsof", "-nP", "-a", "-p", str(spid), "-iUDP"], capture_output=True,
+                                 text=True, timeout=3).stdout
+            m = re.search(r"UDP (\S+):(\d+)", out)
+            if m:
+                ip, port = m.group(1), m.group(2)
+        except Exception:
+            pass
+    env = ""
+    try:
+        env = open("/proc/%d/environ" % spid, "rb").read().decode(errors="replace").replace("\0", "\n")
+    except OSError:
+        try:
+            env = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(spid)], capture_output=True,
+                                 text=True, timeout=3).stdout.replace(" ", "\n")
+        except Exception:
+            pass
+    m = re.search(r"^SSH_CONNECTION=(\S+)", env, re.M)
+    if not (ip and port and m):
+        return None
+    return ip.strip("[]"), port, m.group(1)
+
+
+def _ssh_alias_for(ip):
+    """the ssh config alias whose HostName is ip (so its User/key apply), else ip."""
+    files = [os.path.expanduser("~/.ssh/config")]
+    d = os.path.expanduser("~/.ssh/config.d")
+    if os.path.isdir(d):
+        files += [os.path.join(d, f) for f in sorted(os.listdir(d))]
+    for f in files:
+        try:
+            hosts = []
+            for line in open(f, errors="replace"):
+                w = line.split()
+                if len(w) >= 2 and w[0].lower() == "host":
+                    hosts = [h for h in w[1:] if not any(c in h for c in "*?!")]
+                elif len(w) >= 2 and w[0].lower() == "hostname" and w[1] == ip and hosts:
+                    return hosts[0]
+        except OSError:
+            pass
+    return ip
+
+
+def mosh_relay(pid, data):
+    """Paint the tab behind a mosh session that pid runs under. Runs in a detached
+    child so an attach never waits on the ssh. True if a relay was started."""
+    if os.environ.get("AMUX_MOSH_RELAY", "1") in ("0", "off", "no"):
+        return False
+    spid = mosh_server_of(pid)
+    if not spid:
+        return False
+    ep = _mosh_endpoint(spid)
+    if not ep:
+        return False
+    sip, port, cip = ep
+    key = "| %s %s" % (sip, port)
+    if not re.match(r"^[0-9A-Fa-f.:]+$", sip + port + cip):
+        return False
+    octal = "".join("\\%03o" % b for b in data.encode())
+    script = ("t=$(ps -axo tty=,command= | awk -v k='%s' "
+              "'index($2, \"mosh-client\") && substr($0, length($0)-length(k)+1) == k {print $1; exit}'); "
+              "case \"$t\" in ''|'?'*) exit 1 ;; esac; printf '%s' > \"/dev/$t\"" % (key, octal))
+    try:
+        if os.fork():
+            return True
+    except OSError:
+        return False
+    try:  # child: detach from the caller's terminal and pipes, then ssh
+        os.setsid()
+        nul = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(nul, fd)
+        subprocess.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+                        _ssh_alias_for(cip), script], timeout=15)
+    except Exception:
+        pass
+    os._exit(0)
+
+
 def paint_here(data, force=False):
     """Paint the tab of the terminal this command runs in. Inside tmux the pane would
     swallow the sequence, so it goes to the tmux client's own tty instead."""
@@ -330,7 +447,9 @@ def paint_here(data, force=False):
         return False
     force = force or sw in ("1", "on", "yes", "force")
     if os.environ.get("TMUX"):
-        tty = tmux("display-message", "-p", "#{client_tty}").strip()
+        tty, _, cpid = tmux("display-message", "-p", "#{client_tty} #{client_pid}").strip().partition(" ")
+        if cpid.isdigit():
+            mosh_relay(int(cpid), data)
         return bool(tty) and write_tty(tty, data)
     if not (force or is_iterm()):
         return False
@@ -338,6 +457,7 @@ def paint_here(data, force=False):
         if not os.isatty(1):
             return False
         os.write(1, data.encode())
+        mosh_relay(os.getpid(), data)
         return True
     except OSError:
         return False
@@ -345,7 +465,10 @@ def paint_here(data, force=False):
 
 def paint_clients(name, data):
     n = 0
-    for tty in tmux("list-clients", "-t", "=amux-" + name, "-F", "#{client_tty}").split():
+    for line in tmux("list-clients", "-t", "=amux-" + name, "-F", "#{client_tty} #{client_pid}").splitlines():
+        tty, _, cpid = line.partition(" ")
+        if cpid.isdigit():
+            mosh_relay(int(cpid), data)
         n += write_tty(tty, data)
     return n
 
