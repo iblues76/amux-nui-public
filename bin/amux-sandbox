@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""amux-sandbox — turn amux's --net-sandbox / --full-sandbox into each agent's own controls.
+
+  amux-sandbox launch <provider> <net|full> <dir>   print two lines: PREFIX <words> and ARGS <words>
+  amux-sandbox check  <provider> <net|full>         exit 0 if this box can run that sandbox, else say why
+  amux-sandbox explain                              what each mode allows, per provider
+
+Both modes confine an agent's commands to the session folder: they can read and write
+inside it, read the system (/usr, /etc, ...) and the toolchain folders in your home
+(KEEP below), and nothing else in any home folder. --net-sandbox lets commands use the
+network; --full-sandbox gives them none. The agent's own connection to its model, and
+its provider-side web search, are not commands and keep working in both.
+
+How each agent gets there:
+  claude    its own sandbox (bubblewrap on Linux, Seatbelt on macOS) for shell commands,
+            plus permissions.block{Reads,Writes}OutsideWorkingDirectories for its file tools;
+            in its usual permission mode (for example auto): sandboxed commands run without
+            prompts; with --net-sandbox each new host is approved per command by auto mode.
+  codex     a generated permission profile (~/.codex/amux-sbx-*.config.toml), -a never.
+  agy       wrapped like opencode (its own --sandbox refuses every command on some Linux
+            boxes in 1.5.14), with only Google's endpoints reachable under --full-sandbox.
+  opencode  no sandbox of its own, so the whole agent is wrapped (and runs --auto inside it): bubblewrap (Linux) or
+            Seatbelt (macOS) for --net-sandbox; srt (Anthropic's sandbox-runtime) for
+            --full-sandbox, with only the model endpoints in opencode.json reachable.
+Windows: run amux inside WSL2 (it is Linux there). Native Windows is not supported.
+Refuses to start (exit 1) whenever the sandbox can't be applied — never runs unconfined.
+"""
+import hashlib, json, os, platform, re, shlex, shutil, subprocess, sys
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, ".amux", "sandbox")
+# Home entries a confined command may still READ: toolchains and the agents' own programs.
+KEEP = [".local", ".cargo", ".rustup", ".nvm", ".bun", ".deno", "go", ".pyenv", ".rbenv",
+        ".sdkman", "miniconda3", "anaconda3", "miniforge3", ".gitconfig", ".opencode"]
+MAC = platform.system() == "Darwin"
+
+
+def die(msg):
+    sys.stderr.write("amux-sandbox: %s\n" % msg)
+    sys.exit(1)
+
+
+def tag(d):
+    return hashlib.sha256(d.encode()).hexdigest()[:10]
+
+
+def state_file(name, text):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    p = os.path.join(STATE, name)
+    with open(p + ".tmp", "w") as f:
+        f.write(text)
+    os.chmod(p + ".tmp", 0o600)
+    os.replace(p + ".tmp", p)
+    return p
+
+
+def deny_siblings(d, extra=()):
+    """Paths to hide so only d (and KEEP) stay visible: every entry next to the path from
+    the parent of $HOME down to d, minus the path itself and the toolchains."""
+    out, top = [], os.path.dirname(HOME)
+    d = os.path.realpath(d)
+    if not (d + "/").startswith(top + "/"):
+        # outside the home tree: hide every home folder (the path to d is not in it)
+        return [os.path.join(top, e) for e in sorted(os.listdir(top))]
+    cur = top
+    rel = os.path.relpath(d, top).split(os.sep)
+    for i, part in enumerate(rel):
+        try:
+            entries = sorted(os.listdir(cur))
+        except OSError:
+            break
+        for e in entries:
+            if e == part:
+                continue
+            if cur == HOME and (e in KEEP or e in extra):
+                continue
+            out.append(os.path.join(cur, e))
+        cur = os.path.join(cur, part)
+    return out
+
+
+def ancestors(d):
+    """d's parent folders, so a confined program can stat its way down to d."""
+    out, cur = [], os.path.dirname(d)
+    while cur and cur != "/":
+        out.append(cur)
+        cur = os.path.dirname(cur)
+    return out + ["/"]
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def bwrap_works():
+    try:
+        return subprocess.run(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "true"],
+                              capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def find_srt():
+    for c in (shutil.which("srt"), os.path.join(STATE, "node_modules", ".bin", "srt")):
+        if c and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def check(provider, mode):
+    """None if OK, else the reason this box can't run it."""
+    if platform.system() not in ("Linux", "Darwin"):
+        return "sandboxes need Linux, WSL2 or macOS"
+    if MAC:
+        if not os.path.exists("/usr/bin/sandbox-exec"):
+            return "macOS sandbox-exec is missing"
+    else:
+        if not have("bwrap"):
+            return "bubblewrap (bwrap) is not installed — install the bubblewrap package"
+        if not bwrap_works():
+            return "bubblewrap cannot start here (user namespaces disabled?)"
+        if provider == "claude" and not have("socat"):
+            return "Claude's sandbox needs socat on Linux — install the socat package"
+    if mode == "full" and provider in ("opencode", "agy"):
+        if not find_srt():
+            return ("%s --full-sandbox needs srt: npm install --prefix ~/.amux/sandbox "
+                    "@anthropic-ai/sandbox-runtime" % provider)
+        if not MAC and not have("socat"):
+            return "srt needs socat on Linux — install the socat package"
+    if provider not in ("claude", "codex", "agy", "opencode"):
+        return "no sandbox for provider '%s'" % provider
+    return None
+
+
+# ── per provider ──────────────────────────────────────────────────────────────
+def claude(mode, d):
+    top = os.path.dirname(HOME)
+    s = {"permissions": {"blockReadsOutsideWorkingDirectories": True,
+                         "blockWritesOutsideWorkingDirectories": True},
+         "sandbox": {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+                     "autoAllowBashIfSandboxed": True,
+                     "filesystem": {"denyRead": [top],
+                                    "allowRead": [d] + [os.path.join(HOME, k) for k in KEEP],
+                                    "allowWrite": [d]},
+                     "network": {}}}
+    if mode == "full":
+        s["sandbox"]["network"] = {"strictAllowlist": True, "allowedDomains": []}
+    p = state_file("claude-%s-%s.json" % (mode, tag(d)), json.dumps(s, indent=2) + "\n")
+    return [], ["--settings", p]
+
+
+def codex(mode, d):
+    codex_home = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+    name = "amux-sbx-%s-%s" % (mode, tag(d))
+    q = lambda s: '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+    lines = ["# GENERATED by amux-sandbox for %s (--%s-sandbox). Regenerated at every start." % (d, mode),
+             'default_permissions = %s' % q(name), 'approval_policy = "never"', "",
+             "[permissions.%s]" % q(name), 'extends = ":workspace"', "",
+             "[permissions.%s.network]" % q(name), "enabled = %s" % ("true" if mode == "net" else "false"), "",
+             "[permissions.%s.filesystem]" % q(name)]
+    for p in deny_siblings(d, extra=(os.path.basename(codex_home),) if os.path.dirname(codex_home) == HOME else ()):
+        lines.append("%s = \"deny\"" % q(p))
+    lines.append('%s = "deny"' % q(os.path.join(codex_home, "auth.json")))
+    lines.append('":workspace_roots" = "write"')
+    os.makedirs(codex_home, exist_ok=True)
+    path = os.path.join(codex_home, name + ".config.toml")
+    with open(path + ".tmp", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path + ".tmp", 0o600)
+    os.replace(path + ".tmp", path)
+    return [], ["-p", name, "-a", "never"]
+
+
+def agy(mode, d):
+    # agy has a terminal sandbox of its own (--sandbox), but 1.5.14 refuses every command on
+    # some Linux boxes ("readwrite ./**: globs not supported", a rule it adds itself) and no
+    # Mac had a signed-in agy to verify it on, so amux wraps the whole agent instead — the
+    # same, tested mechanism as opencode — with only Google's endpoints under --full-sandbox.
+    sl = os.path.join(HOME, "scripts", "agy-statusline.py")    # its status line command
+    return wrap("agy", mode, d, [os.path.join(HOME, ".gemini")], [sl] if os.path.exists(sl) else [],
+                AGY_HOSTS, ["--dangerously-skip-permissions"])
+
+
+def opencode_hosts():
+    """Hosts opencode needs for --full-sandbox: every baseURL in its config, the default
+    endpoint of each named provider it knows, and its model catalogue."""
+    known = {"deepinfra": "api.deepinfra.com", "anthropic": "api.anthropic.com",
+             "openai": "api.openai.com", "openrouter": "openrouter.ai", "google": "generativelanguage.googleapis.com",
+             "groq": "api.groq.com", "mistral": "api.mistral.ai", "xai": "api.x.ai", "opencode": "opencode.ai"}
+    hosts = {"models.dev", "opencode.ai"}
+    for p in (os.path.join(HOME, ".config", "opencode", "opencode.json"),
+              os.path.join(HOME, ".config", "opencode", "opencode.jsonc")):
+        try:
+            text = open(p).read()
+        except OSError:
+            continue
+        for m in re.finditer(r'"base[Uu][Rr][Ll]"\s*:\s*"([a-z]+)://([^/"]+)', text):
+            hosts.add(m.group(2))
+        for name, h in known.items():
+            if re.search(r'"%s"\s*:\s*\{' % name, text):
+                hosts.add(h)
+    # providers you logged into (`opencode auth login`): only the provider NAMES are read
+    try:
+        names = json.load(open(os.path.join(HOME, ".local", "share", "opencode", "auth.json"))).keys()
+    except Exception:
+        names = []
+    for n in names:
+        if n in known:
+            hosts.add(known[n])
+    return sorted(hosts)
+
+
+def opencode_file_refs():
+    """Files opencode.json pulls in with {file:...} (API keys): opencode itself must read them."""
+    out = []
+    for p in (os.path.join(HOME, ".config", "opencode", "opencode.json"),
+              os.path.join(HOME, ".config", "opencode", "opencode.jsonc")):
+        try:
+            text = open(p).read()
+        except OSError:
+            continue
+        for m in re.finditer(r"\{file:([^}]+)\}", text):
+            f = os.path.expanduser(m.group(1).strip())
+            if not os.path.isabs(f):
+                f = os.path.join(os.path.dirname(p), f)
+            if os.path.exists(f):
+                out.append(f)
+    return out
+
+
+def wrap(name, mode, d, data, extra_read, hosts, inner_args):
+    """Confine a WHOLE agent (no sandbox of its own, or a broken one): --net-sandbox with
+    bubblewrap (Linux) or Seatbelt (macOS); --full-sandbox with srt, only `hosts` reachable
+    (the agent's own model endpoints). `data` = the agent's own state folders (writable)."""
+    for p in data:
+        os.makedirs(p, exist_ok=True)
+    readable = [d] + [os.path.join(HOME, k) for k in KEEP] + data + extra_read
+    if mode == "full":
+        srt = find_srt()
+        os.makedirs("/tmp/claude", exist_ok=True)   # srt points TMPDIR here and expects it to exist
+        # srt mounts allowRead entries read-only over nested allowWrite ones, so ~/.local is
+        # listed by its program folders, not whole (share/<agent> may have to stay writable)
+        rd = [r for r in readable if r != os.path.join(HOME, ".local")]
+        rd += [os.path.join(HOME, ".local", x) for x in ("bin", "lib")]
+        s = {"network": {"allowedDomains": hosts, "deniedDomains": []},
+             "filesystem": {"denyRead": [os.path.dirname(HOME)],
+                            "allowRead": rd + [STATE], "allowWrite": [d] + data, "denyWrite": []}}
+        p = state_file("%s-full-%s.json" % (name, tag(d)), json.dumps(s, indent=2) + "\n")
+        return [srt, "--settings", p, "--"], inner_args
+    if MAC:
+        lit = lambda s: '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+        prof = ["(version 1)", "(allow default)",
+                "(deny file-read* (subpath %s))" % lit(os.path.dirname(HOME)),
+                "(allow file-read* %s)" % " ".join("(literal %s)" % lit(a) for a in ancestors(d))]
+        prof.append("(allow file-read* %s)" % " ".join("(subpath %s)" % lit(r) for r in readable))
+        prof.append("(deny file-write* (subpath %s))" % lit(os.path.dirname(HOME)))
+        prof.append("(allow file-write* %s)" % " ".join("(subpath %s)" % lit(w) for w in [d] + data))
+        p = state_file("%s-net-%s.sb" % (name, tag(d)), "\n".join(prof) + "\n")
+        return ["/usr/bin/sandbox-exec", "-f", p], inner_args
+    top = os.path.dirname(HOME)
+    w = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+         "--tmpfs", "/tmp", "--tmpfs", top]
+    for r in readable[1:]:
+        if os.path.exists(r):
+            w += ["--ro-bind", r, r]
+    for r in data:
+        w += ["--bind", r, r]
+    w += ["--bind", d, d, "--remount-ro", top, "--chdir", d, "--"]
+    return w, inner_args
+
+
+def opencode(mode, d):
+    data = [os.path.join(HOME, ".local", "share", "opencode"), os.path.join(HOME, ".local", "state", "opencode"),
+            os.path.join(HOME, ".cache", "opencode"), os.path.join(HOME, ".config", "opencode")]
+    return wrap("opencode", mode, d, data, opencode_file_refs(), opencode_hosts(), ["--auto"])
+
+
+# agy's model and sign-in traffic (measured under srt, agy 1.5.14)
+AGY_HOSTS = ["*.googleapis.com", "googleapis.com", "*.google.com", "google.com",
+             "antigravity.google", "*.antigravity.google", "*.gstatic.com"]
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "explain":
+        print(__doc__.split("\n\n", 1)[1].strip())
+        return 0
+    if argv[0] == "check" and len(argv) == 3:
+        why = check(argv[1], argv[2])
+        if why:
+            die(why)
+        return 0
+    if argv[0] != "launch" or len(argv) != 4:
+        die("usage: amux-sandbox launch <provider> <net|full> <dir>")
+    provider, mode, d = argv[1], argv[2], os.path.realpath(os.path.expanduser(argv[3]))
+    if mode not in ("net", "full"):
+        die("mode must be net or full")
+    if not os.path.isdir(d):
+        die("no such folder: %s" % d)
+    if os.path.realpath(d) == os.path.realpath(HOME):
+        die("refusing to sandbox to your whole home folder — give the session its own folder")
+    why = check(provider, mode)
+    if why:
+        die(why)
+    prefix, args = {"claude": claude, "codex": codex, "agy": agy, "opencode": opencode}[provider](mode, d)
+    print("PREFIX " + " ".join(shlex.quote(x) for x in prefix))
+    print("ARGS " + " ".join(shlex.quote(x) for x in args))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

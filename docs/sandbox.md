@@ -1,0 +1,56 @@
+# Sandboxes
+
+Two flags keep an agent's commands inside the session folder:
+
+| Flag | Files the agent's commands can use | Network for those commands |
+|---|---|---|
+| `--net-sandbox` | read and write the session folder; read the system and your home toolchains | yes |
+| `--full-sandbox` | the same | no |
+
+In both modes, every other folder in your home (and every other user's) is hidden from the commands the agent runs. The agent's own connection to its model, and its provider-side web search, are not commands and keep working.
+
+Without a flag, codex, agy and opencode run with full access, and claude keeps the permission mode from your Claude Code settings.
+
+## Using it
+
+```sh
+amux exec review --provider codex --dir ~/Dev/myapp --full-sandbox   # remembered for every start
+amux register api --provider claude --net-sandbox                     # same, without starting
+amux start review --net-sandbox                                       # this launch only
+amux -H otherbox exec job --provider opencode --dir '~/x' --full-sandbox
+```
+
+A one-shot `--full-access` on `amux start` drops a remembered sandbox for that launch. A sandbox flag cannot be combined with `--full-access`, and the two sandboxes cannot be combined with each other.
+
+If a sandbox cannot be applied on the machine, the launch is refused with the reason. It never falls back to running unconfined.
+
+## How each agent is confined
+
+| Agent | Mechanism |
+|---|---|
+| claude | Claude Code's own sandbox for shell commands (bubblewrap on Linux, Seatbelt on macOS), plus `permissions.blockReadsOutsideWorkingDirectories` and `blockWritesOutsideWorkingDirectories` for its file tools. It stays in your usual permission mode. |
+| codex | A permission profile generated for the folder (`~/.codex/amux-sbx-*.config.toml`) with `-a never`. |
+| agy | The whole agent is wrapped. |
+| opencode | The whole agent is wrapped, and runs with `--auto` inside the wrapper. |
+
+Wrapping uses bubblewrap on Linux and Seatbelt on macOS for `--net-sandbox`. For `--full-sandbox` it uses [srt](https://github.com/anthropic-experimental/sandbox-runtime) (Anthropic's sandbox runtime), which lets only the agent's own model endpoints through: for opencode, the hosts in `opencode.json` and of the providers you signed in to; for agy, Google's API hosts.
+
+The generated settings live in `~/.amux/sandbox/` and are rewritten at every start. `amux-sandbox explain` prints this summary on any machine.
+
+## Requirements
+
+| System | Needs |
+|---|---|
+| Linux, WSL2 | `bwrap` (package `bubblewrap`) and `socat` |
+| macOS | nothing extra (`/usr/bin/sandbox-exec` is built in) |
+| `--full-sandbox` for agy or opencode | srt: `npm install --prefix ~/.amux/sandbox @anthropic-ai/sandbox-runtime` |
+
+Native Windows is not supported. Run amux inside WSL2.
+
+## Limits
+
+- **MCP servers run outside the sandbox** for claude and codex. Those agents start them as their own processes, so an MCP server keeps its normal file and network access. For agy and opencode the MCP servers run inside the wrapper.
+- **A wrapped agent can read its own configuration**, including the API keys it needs (`~/.config/opencode`, `~/.gemini`), because the agent and its commands share one sandbox.
+- **Claude with `--net-sandbox`:** in auto mode, a command has to name the host it needs, and auto mode approves it. Claude does this when it is told a command was blocked.
+- **Writes outside the folder** fail, or land in a temporary layer that is thrown away when the command ends. Nothing reaches your real home folder.
+- `--net-sandbox` and `--full-sandbox` are not available for `iterm2` sessions.

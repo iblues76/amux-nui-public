@@ -696,6 +696,33 @@ printf 'y\n' | run "$BINDIR/amux" rm cone; printf 'y\n' | run "$BINDIR/amux" rm 
 o=$(python3 -c 'import json,sys; print(sorted(json.load(open(sys.argv[1]))["sessions"]))' "$CC_HOME/colors.json" 2>&1)
 [ "$o" = "[]" ] && ok "rm forgets the color" || bad "color left behind after rm" "$o"
 
+# ── 7d. sandboxes ───────────────────────────────────────────────────────────
+sect "7d. Sandboxes (--net-sandbox / --full-sandbox)"
+mkdir -p "$SANDBOX/sbx/proj"
+o=$("$BINDIR/amux" register sbxa --provider codex --dir "$SANDBOX/sbx/proj" --net-sandbox --full-sandbox 2>&1)
+has "mutually exclusive" "$o" && ok "the two sandboxes cannot be combined" || bad "net + full sandbox accepted" "$o"
+o=$("$BINDIR/amux" register sbxb --provider codex --dir "$SANDBOX/sbx/proj" --full-access --full-sandbox 2>&1)
+has "cannot be combined" "$o" && ok "--full-access cannot be combined with a sandbox" || bad "full access + sandbox accepted" "$o"
+o=$(cd "$SANDBOX/sbx/proj" && "$BINDIR/amux-sandbox" launch gemini full . 2>&1)
+has "no sandbox for provider" "$o" || has "sandboxes need" "$o" || has "bubblewrap" "$o" && ok "a provider without a sandbox is refused" || bad "gemini sandbox not refused" "$o"
+if "$BINDIR/amux-sandbox" check codex full 2>/dev/null; then
+  o=$(cd "$SANDBOX/sbx/proj" && CODEX_HOME="$SANDBOX/sbx/codex" "$BINDIR/amux-sandbox" launch codex full . 2>&1)
+  has "ARGS -p amux-sbx-full-" "$o" && ok "codex gets a generated permission profile" || bad "no codex profile" "$o"
+  f=$(ls "$SANDBOX/sbx/codex"/amux-sbx-full-*.config.toml 2>/dev/null | head -1)
+  grep -q 'enabled = false' "$f" 2>/dev/null && grep -q '":workspace_roots" = "write"' "$f" \
+    && ok "the full profile has no network and a writable folder" || bad "codex profile wrong" "$(cat "$f" 2>&1 | head -12)"
+  o=$(cd "$SANDBOX/sbx/proj" && "$BINDIR/amux-sandbox" launch claude full . 2>&1)
+  sf=$(printf '%s\n' "$o" | sed -n 's/^ARGS --settings //p')
+  python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); b=s["sandbox"]; assert b["enabled"] and b["failIfUnavailable"] and not b["allowUnsandboxedCommands"] and b["network"]["strictAllowlist"] and s["permissions"]["blockWritesOutsideWorkingDirectories"]' "$sf" 2>/dev/null \
+    && ok "claude's full sandbox fails closed and has no network" || bad "claude sandbox settings wrong" "$o"
+  o=$(cd "$SANDBOX/sbx/proj" && "$BINDIR/amux-sandbox" launch opencode net . 2>&1)
+  has "ARGS --auto" "$o" && { has "PREFIX bwrap" "$o" || has "PREFIX /usr/bin/sandbox-exec" "$o"; } \
+    && ok "opencode is wrapped whole for --net-sandbox" || bad "opencode wrapper missing" "$o"
+else
+  o=$("$BINDIR/amux-sandbox" check codex full 2>&1)
+  [ -n "$o" ] && ok "no sandbox support here, and amux-sandbox says why ($o)" || bad "check failed silently"
+fi
+
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"
 planted="$REPO/.selftest-planted.md"

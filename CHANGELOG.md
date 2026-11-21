@@ -2,6 +2,12 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.0 — 2026-11-21
+
+- **Sandboxes: `--net-sandbox` and `--full-sandbox`.** The agent's commands can read and write only the session folder, plus read the system and your home toolchains. Every other home folder is hidden from them. `--full-sandbox` also takes away their network. The agent's connection to its model and its web search keep working. Remember a sandbox with `amux register` or `amux exec`, or use it for one launch with `amux start`. claude and codex use their own sandboxes; agy and opencode are wrapped whole (bubblewrap or srt on Linux, Seatbelt or srt on macOS). A launch that cannot be sandboxed is refused. See [docs/sandbox.md](docs/sandbox.md).
+- **codex, agy and opencode now default to full access** (no approvals). Before, they ran in their own restricted modes unless you passed `--full-access`. Use a sandbox flag to keep them confined. claude is unchanged.
+- `amux -H <machine> exec … --full-sandbox` works too: the server hands a sandboxed start to the command-line `amux`.
+
 ## 0.6.2 — 2026-11-17
 
 - **Tab colors over mosh.** mosh does not pass iTerm2's tab-color sequence along, so a session reached by `mosh <box>` and then `amux attach` kept an uncolored tab. When a session runs behind mosh, amux now also connects back over ssh to the machine the mosh came from and paints that tab directly. This needs key-based ssh from the remote machine back to yours; `AMUX_MOSH_RELAY=0` turns it off. See [docs/colors.md](docs/colors.md).

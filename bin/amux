@@ -879,6 +879,13 @@ parse_claude_flags() {
         CC_FLAGS+=("--autoprompt")
         shift
         ;;
+      # Sandboxes (2026-11-21): --net-sandbox / --full-sandbox confine the agent's commands
+      # to the session folder (no network for --full-sandbox). Persisted as marker tokens
+      # in CC_FLAGS; cmd_start turns them into each agent's own controls via amux-sandbox.
+      --net-sandbox|--full-sandbox)
+        CC_FLAGS+=("$1")
+        shift
+        ;;
       # --pwd (2026-10-14): explicit "use the directory I am sitting in". Same result as
       # omitting --dir, but says so on purpose. Local-only — amux-remote refuses it.
       --pwd)
@@ -955,6 +962,16 @@ parse_claude_flags() {
     esac
   done
   CC_FLAGS_STR="${CC_FLAGS[*]:-}"
+  local _sb=0 _fa=0 _t
+  for _t in ${CC_FLAGS[@]+"${CC_FLAGS[@]}"}; do
+    case "$_t" in
+      --net-sandbox|--full-sandbox) _sb=$((_sb+1)) ;;
+      --dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox) _fa=1 ;;
+    esac
+  done
+  (( _sb > 1 )) && die "--net-sandbox and --full-sandbox are mutually exclusive"
+  (( _sb && _fa )) && die "--full-access cannot be combined with --net-sandbox or --full-sandbox"
+  return 0
 }
 
 # ── Commands ─────────────────────────────────────────────────────────────────
@@ -1378,7 +1395,7 @@ cmd_start() {
   # anywhere in the args and stripped so it never reaches the agent binary.
   # One-shot account (2026-09-05): `amux start <name> --account team` puts THIS
   # launch on the other Claude identity without touching the stored choice.
-  local _fresh=0 _oneshot_full_access=0 _ft _acct_override="" _acct_next=0 _noattach=0
+  local _fresh=0 _oneshot_full_access=0 _oneshot_sandbox="" _ft _acct_override="" _acct_next=0 _noattach=0
   local _f_rest=() _autoprompt=0 _color_next=0
   for _ft in "$@"; do
     if (( _color_next )); then AMUX_COLOR_ONESHOT="$_ft"; _color_next=0; continue; fi
@@ -1389,6 +1406,8 @@ cmd_start() {
       --fresh) _fresh=1 ;;
       --no-attach|--detach) _noattach=1 ;;   # start (or leave running) without attaching
       --full-access|--yolo) _oneshot_full_access=1 ;;
+      --net-sandbox)  _oneshot_sandbox=net ;;    # one-shot: confine THIS launch (amux-sandbox)
+      --full-sandbox) _oneshot_sandbox=full ;;
       --autoprompt) _autoprompt=1 ;;   # one-shot: prompt suggestions on for this launch
       --account) _acct_next=1 ;;
       --account=*) _acct_override=$(normalize_account "${_ft#--account=}"); validate_account "$_acct_override" ;;
@@ -1414,6 +1433,33 @@ cmd_start() {
     _apf="${_apf// --autoprompt / }"; _apf="${_apf# }"; CC_FLAGS="${_apf% }"
   fi
   AMUX_AUTOPROMPT=$_autoprompt
+  # Sandbox (2026-11-21): one-shot --net-sandbox/--full-sandbox > one-shot --full-access >
+  # the stored marker. The markers never reach an agent; a sandbox drops every stored
+  # full-access spelling, and a one-shot --full-access drops a stored sandbox.
+  (( _oneshot_full_access )) && [[ -n "$_oneshot_sandbox" ]] && die "--full-access cannot be combined with --net-sandbox or --full-sandbox"
+  local _sbx="" _sbf=" ${CC_FLAGS:-} "
+  [[ "$_sbf" == *" --net-sandbox "* ]] && _sbx=net
+  [[ "$_sbf" == *" --full-sandbox "* ]] && _sbx=full
+  _sbf="${_sbf// --net-sandbox / }"; _sbf="${_sbf// --full-sandbox / }"
+  if [[ -n "$_oneshot_sandbox" ]]; then _sbx="$_oneshot_sandbox"
+  elif (( _oneshot_full_access )); then _sbx=""
+  fi
+  if [[ -n "$_sbx" ]]; then
+    local _fa_word
+    for _fa_word in --dangerously-skip-permissions --dangerously-bypass-approvals-and-sandbox --full-access --yolo --auto; do
+      _sbf="${_sbf// $_fa_word / }"
+    done
+  fi
+  _sbf="${_sbf# }"; CC_FLAGS="${_sbf% }"
+  # codex, agy and opencode default to full access (2026-11-21) unless sandboxed;
+  # claude keeps its own default (the fleet's settings put it in auto mode).
+  case "${CC_PROVIDER:-claude}" in
+    codex|agy|opencode) [[ -z "$_sbx" ]] && _oneshot_full_access=1 ;;
+  esac
+  if [[ -n "$_sbx" ]]; then
+    command -v amux-sandbox >/dev/null 2>&1 || [[ -x "$HOME/.local/bin/amux-sandbox" ]] \
+      || die "--${_sbx}-sandbox needs the amux-sandbox companion on PATH"
+  fi
   if (( _autoprompt )) && [[ "${CC_PROVIDER:-claude}" != "claude" && "${CC_PROVIDER:-}" != "iterm2" ]]; then
     echo "${YELLOW}note:${RESET} --autoprompt is ignored for provider '${CC_PROVIDER}' (prompt suggestions are a Claude Code feature)"
   fi
@@ -1922,6 +1968,16 @@ PYEOF
     full_access_flag=$(provider_full_access_flag "$provider")
     [[ "$cmd" == *"$full_access_flag"* ]] || cmd="$cmd $full_access_flag"
   fi
+  if [[ -n "$_sbx" ]]; then
+    local _sbbin _sbout _sbpre _sbargs
+    _sbbin=$(command -v amux-sandbox 2>/dev/null || echo "$HOME/.local/bin/amux-sandbox")
+    _sbout=$("$_sbbin" launch "$provider" "$_sbx" "$dir") || die "--${_sbx}-sandbox: not started (see the line above); nothing ran unconfined"
+    _sbpre=$(printf '%s\n' "$_sbout" | sed -n 's/^PREFIX //p')
+    _sbargs=$(printf '%s\n' "$_sbout" | sed -n 's/^ARGS //p')
+    [[ -n "$_sbargs" ]] && cmd="$cmd $_sbargs"
+    [[ -n "$_sbpre" ]] && cmd="$_sbpre $cmd"
+    echo "  ${DIM}sandbox: --${_sbx}-sandbox (commands confined to ${dir}$([[ $_sbx == full ]] && echo ', no network'))${RESET}"
+  fi
 
   # Provider-specific defaults
   if [[ "$provider" == "codex" ]]; then
@@ -1938,7 +1994,7 @@ PYEOF
     if [[ -f "$HOME/.codex/amux-default.config.toml" && "$cmd" != *"--dangerously-bypass-approvals-and-sandbox"* && "$cmd" != *" -p "* && "$cmd" != *" --profile "* ]]; then
       cmd="$cmd -p amux-default"
     fi
-    if [[ "$cmd" != *"--add-dir"* ]]; then
+    if [[ -z "$_sbx" && "$cmd" != *"--add-dir"* ]]; then
       local git_root
       git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || true
       if [[ -n "$git_root" && "$git_root" != "$dir" ]]; then
@@ -1954,7 +2010,7 @@ PYEOF
     # No --model default: agy picks its own (Gemini 3.7 Flash today) and the
     # catalog moves, so pinning a name here would go stale silently. Widen the
     # workspace to the git root the way the codex lane does.
-    if [[ "$cmd" != *"--add-dir"* ]]; then
+    if [[ -z "$_sbx" && "$cmd" != *"--add-dir"* ]]; then
       local agy_root
       agy_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || true
       if [[ -n "$agy_root" && "$agy_root" != "$dir" ]]; then
@@ -3406,10 +3462,10 @@ ${BOLD}amux${RESET} — phone-friendly Claude Code session manager ${DIM}v${CC_V
 ${BOLD}Key commands:${RESET}
   amux                           Interactive dashboard (phone-friendly)
   amux ls [-c]                   List sessions with status + preview (-c: compact grid)
-  amux exec <name> --provider <p> [--dir <path> | --pwd] [--full-access] [--autoprompt]
+  amux exec <name> --provider <p> [--dir <path> | --pwd] [--full-access | --net-sandbox | --full-sandbox] [--autoprompt]
                                  Register + start in one step (--provider REQUIRED for a new session:
                                  claude|codex|gemini|opencode|iterm2|agy)
-  amux start <name> [--fresh] [--full-access] [--autoprompt] [--no-attach] [--color <c>]
+  amux start <name> [--fresh] [--full-access | --net-sandbox | --full-sandbox] [--autoprompt] [--no-attach] [--color <c>]
                                  Start a registered session (flags apply to this launch only)
   amux attach <name>             Attach to a running session (detach: Ctrl-b d); amux 3 = session #3 from ls
   amux up [<box>] <name> [flags] Start if needed, THEN attach (== amux-up; also amux -H <box> up <name>)
@@ -3599,10 +3655,20 @@ ${BOLD}Access modes — full access and fresh start:${RESET}
   ${DIM}--yolo / --auto / --dangerously-bypass-approvals-and-sandbox still work as
   compatibility spellings and mean the same thing.${RESET}
 
-  ${BOLD}Default (no --full-access):${RESET} each provider runs in its own restricted mode —
-  claude asks for permission, codex gets ${BOLD}-a never${RESET} plus the ${BOLD}amux-default${RESET} permission
-  profile when ~/.codex/amux-default.config.toml exists (broad filesystem access,
-  credentials denied), opencode/agy use their own defaults.
+  ${BOLD}Default (no flag):${RESET} codex, agy and opencode run with full access; claude
+  keeps its own permission mode (from your Claude Code settings).
+
+  ${BOLD}Sandboxes:${RESET} confine the agent's commands to the session folder. They can read
+  and write inside it, read the system and the toolchain folders in your home, and
+  nothing else in any home folder.
+    ${BOLD}--net-sandbox${RESET}    commands may use the network
+    ${BOLD}--full-sandbox${RESET}   commands get no network
+  The agent's own connection to its model and its web search keep working in both.
+    persisted        amux register|exec <name> --provider <p> ${BOLD}--full-sandbox${RESET}
+    one launch only  amux start <name> ${BOLD}--net-sandbox${RESET}
+  claude and codex use their own sandboxes; agy and opencode are wrapped whole
+  (bubblewrap or srt on Linux, Seatbelt or srt on macOS; WSL2 counts as Linux). A
+  launch that cannot be sandboxed is refused, never run unconfined. Details: amux-sandbox explain
 
   ${BOLD}Fresh start:${RESET} ${BOLD}amux start <name> --fresh${RESET} skips ALL auto-resume
   and cold-starts a new conversation (one-shot; all providers; gemini/opencode
@@ -3616,6 +3682,8 @@ ${BOLD}Agent flags (on register/exec):${RESET}
                                See every accepted model: amux models [provider]
   --full-access                Provider-neutral full-access mode (preferred)
   --yolo                       Compatibility alias for --full-access
+  --net-sandbox                Commands confined to the session folder, network allowed
+  --full-sandbox               Commands confined to the session folder, no network
   --dangerously-skip-permissions  Bypass all permission checks
   --allow-dangerously-skip-permissions  Enable skip-permissions as option
   --permission-mode <mode>     acceptEdits, bypassPermissions, default, plan, etc.
@@ -3848,10 +3916,10 @@ _amux() {
     fi
   }
   case $cmd in
-    start)             _amux_name_then --fresh --full-access --account --no-attach --color --find --mosh --cc --plain ;;
+    start)             _amux_name_then --fresh --full-access --net-sandbox --full-sandbox --account --no-attach --color --find --mosh --cc --plain ;;
     attach|a)          _amux_name_then --color --find --mosh --cc --plain ;;
     color|recolor)     _amux_name_then --reroll ;;
-    up)                _amux_name_then --fresh --full-access --account --mosh --cc --plain ;;
+    up)                _amux_name_then --fresh --full-access --net-sandbox --full-sandbox --account --mosh --cc --plain ;;
     peek|p)            _amux_name_then --find --raw ;;
     stop|kill)         _amux_name_then --find ;;
     send)              _amux_name_then --keys ;;
@@ -3861,7 +3929,7 @@ _amux() {
     provider)          (( pos == 2 )) && _amux_opts claude codex gemini opencode iterm2 agy || _amux_name_then ;;
     account|acct)      (( pos == 2 )) && _amux_opts P T X personal team team2 || _amux_name_then ;;
     register|reg|exec|run)
-      _amux_name_then --provider --account --model --full-access --yolo --dir --pwd --autoprompt --effort \
+      _amux_name_then --provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --effort \
         --permission-mode --system-prompt --append-system-prompt --mcp-config \
         --allowedTools --disallowedTools --verbose --chrome --no-chrome --desc --no-attach ;;
     ls|list)           _amux_opts -c --bare ;;
@@ -3973,10 +4041,10 @@ _amux_complete() {
 
   local words=""
   case $cmd in
-    start)             words="--fresh --full-access --account --no-attach --color --find --mosh --cc --plain" ;;
+    start)             words="--fresh --full-access --net-sandbox --full-sandbox --account --no-attach --color --find --mosh --cc --plain" ;;
     attach|a)          words="--color --find --mosh --cc --plain" ;;
     color|recolor)     words="--reroll" ;;
-    up)                words="--fresh --full-access --account --mosh --cc --plain" ;;
+    up)                words="--fresh --full-access --net-sandbox --full-sandbox --account --mosh --cc --plain" ;;
     peek|p)            words="--find --raw" ;;
     stop|kill)         words="--find" ;;
     send)              words="--keys" ;;
@@ -3986,7 +4054,7 @@ _amux_complete() {
     provider)          (( pos == 2 )) && { COMPREPLY=( $(compgen -W "$providers" -- "$cur") ); return; } ;;
     account|acct)      (( pos == 2 )) && { COMPREPLY=( $(compgen -W "$accounts" -- "$cur") ); return; } ;;
     register|reg|exec|run)
-      words="--provider --account --model --full-access --yolo --dir --pwd --autoprompt --effort --permission-mode --system-prompt --append-system-prompt --mcp-config --allowedTools --disallowedTools --verbose --chrome --no-chrome --desc --no-attach" ;;
+      words="--provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --effort --permission-mode --system-prompt --append-system-prompt --mcp-config --allowedTools --disallowedTools --verbose --chrome --no-chrome --desc --no-attach" ;;
     ls|list)           COMPREPLY=( $(compgen -W "-c --bare" -- "$cur") ); return ;;
     pick|choose)       COMPREPLY=( $(compgen -W "-A -R --machines --sessionid --no-attach --preview --list --feed $(_amux_box_names)" -- "$cur") ); return ;;
     models|model)      (( pos == 1 )) && COMPREPLY=( $(compgen -W "$providers" -- "$cur") ); return ;;

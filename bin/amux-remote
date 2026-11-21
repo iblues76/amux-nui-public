@@ -664,7 +664,7 @@ cmd_exec() {
   local name="${1:-}"; shift || true
   [[ -n "$name" ]] || die "usage: amux-remote $BOX exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--autoprompt] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
   validate_remote_name "$name"
-  local dir="" model="" desc="" provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0
+  local dir="" model="" desc="" provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0 sandbox=""
   local attach_flags=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -708,7 +708,10 @@ cmd_exec() {
       # Provider-neutral full access, persisted into the session's flags at
       # creation (the server re-spells it per provider). --yolo = same thing.
       --full-access|--yolo) full_access=1; shift ;;
-      -*)         die "unknown exec option: $1 (try --dir, --model, --provider, --account, --full-access, --autoprompt, --desc, --worktree, --no-attach, --cc, --plain, --mosh)" ;;
+      # Sandboxes: confine the agent's commands to the session folder.
+      --net-sandbox)  sandbox=net;  shift ;;
+      --full-sandbox) sandbox=full; shift ;;
+      -*)         die "unknown exec option: $1 (try --dir, --model, --provider, --account, --full-access, --net-sandbox, --full-sandbox, --autoprompt, --desc, --worktree, --no-attach, --cc, --plain, --mosh)" ;;
       *)          die "unexpected argument: $1 (name comes first)" ;;
     esac
   done
@@ -736,7 +739,7 @@ cmd_exec() {
   local payload resp created ok msg
   payload=$(python3 -c '
 import json,sys
-name, d, desc, wt, prov, fa, acct, ap = sys.argv[1:9]
+name, d, desc, wt, prov, fa, acct, ap, sbx = sys.argv[1:10]
 body = {"name": name}
 if d:         body["dir"]      = d
 if desc:      body["desc"]     = desc
@@ -745,7 +748,8 @@ if prov:      body["provider"] = prov
 if fa == "1": body["full_access"] = True
 if acct:      body["account"]  = acct
 if ap == "1": body["autoprompt"] = True
-print(json.dumps(body))' "$name" "$dir" "$desc" "$worktree" "$provider" "$full_access" "$account" "$autoprompt")
+if sbx:       body["sandbox"]  = sbx
+print(json.dumps(body))' "$name" "$dir" "$desc" "$worktree" "$provider" "$full_access" "$account" "$autoprompt" "$sandbox")
 
   resp=$(api POST /api/sessions -H 'Content-Type: application/json' -d "$payload")
   created=$(printf '%s' "$resp" | python3 -c '

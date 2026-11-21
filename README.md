@@ -4,7 +4,7 @@ A ready-to-use build of [**amux**](https://github.com/mixpeek/amux) — the sess
 
 This is the setup its maintainer uses every day, with the personal parts taken out: no machine names, accounts, addresses or credentials ship in it. You bring your own.
 
-**Version 0.6.2** — bundles a modified **amux 0.9.15** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
+**Version 0.7.0** — bundles a modified **amux 0.9.15** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
 
 Works on **macOS and Linux**, and on **Windows** through WSL (driving other machines from MSYS2 or Git Bash is untested; see [docs/windows.md](docs/windows.md)).
 
@@ -41,7 +41,7 @@ amux stop api            # the conversation is kept; `amux start api` resumes it
 amux --help              # everything else
 ```
 
-`--provider` is required for a new session: `claude`, `codex`, `gemini`, `opencode` (local models only — amux refuses cloud providers for it) or `agy`. `--model`, `--full-access` and any other agent flags ride along and are remembered.
+`--provider` is required for a new session: `claude`, `codex`, `gemini`, `opencode` (local models only — amux refuses cloud providers for it) or `agy`. `--model`, `--full-access` and any other agent flags ride along and are remembered. codex, agy and opencode run with full access unless you add `--net-sandbox` or `--full-sandbox`, which keep the agent's commands inside the session folder (with or without network); see [docs/sandbox.md](docs/sandbox.md).
 
 Optional web dashboard (also usable from a phone on your private network): `amux serve`, then open `https://localhost:8822`.
 
@@ -149,6 +149,7 @@ amux search --agentic "which session set up the login page, and is it finished?"
 | [`amux-statusline`](bin/amux-statusline) | The Claude Code status line above; `--install` / `--uninstall` |
 | [`amux-tabs`](bin/amux-tabs) | One iTerm2 tab per session (macOS) |
 | [`amux-color`](bin/amux-color) | One color per session for its iTerm2 tab and status line square (what `amux color` runs) |
+| [`amux-sandbox`](bin/amux-sandbox) | Turns `--net-sandbox` / `--full-sandbox` into each agent's own controls ([docs/sandbox.md](docs/sandbox.md)) |
 | [`amux-termprobe`](bin/amux-termprobe) | Logs the terminal's real colors around each attach (debugging aid; `AMUX_TERMPROBE=0` disables) |
 
 Every command answers `-h`.

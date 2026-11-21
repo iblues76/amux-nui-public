@@ -1637,6 +1637,8 @@ def _start_iterm2_session_tab(name: str, cfg: dict, fresh: bool = False,
         # claude sessions; other agents are the tmux providers).
         cmd = "claude"
         flags, _autoprompt = _take_autoprompt(cfg.get("CC_FLAGS", ""))
+        if _SANDBOX_RE.search(flags):
+            return False, "--net-sandbox / --full-sandbox are not available for iterm2 sessions (use a tmux provider)"
         flags = _respell_full_access(flags, "claude")
         if flags:
             cmd += f" {_shell_quote_flags(flags)}"
@@ -8091,6 +8093,17 @@ def _provider_yolo_flag(provider: str) -> str:
     return "--dangerously-skip-permissions"
 
 
+_SANDBOX_RE = re.compile(r'(?:^|\s)--(net|full)-sandbox(?=\s|$)')
+
+
+def _amux_cli() -> str:
+    """The bash CLI, for launches the server hands over (sandboxed sessions)."""
+    for c in (shutil.which("amux"), "/usr/local/bin/amux", str(Path.home() / ".local/bin/amux")):
+        if c and os.access(c, os.X_OK):
+            return c
+    return ""
+
+
 _AUTOPROMPT_RE = re.compile(r'(?:^|\s)--autoprompt(?=\s|$)')
 _AUTOPROMPT_ENV = "export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=true; "
 
@@ -8514,6 +8527,31 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
         cfg = parse_env_file(f)
         if cfg.get("CC_ARCHIVED") == "1":
             return False, "session is archived; wake it first"
+        # SANDBOX (2026-11-21): --net-sandbox / --full-sandbox, stored or one-shot, are
+        # applied by the bash CLI (amux-sandbox builds each agent's own controls), so the
+        # server hands the whole launch over instead of keeping a second copy of that logic.
+        if _SANDBOX_RE.search(cfg.get("CC_FLAGS", "")) or _SANDBOX_RE.search(extra_flags or ""):
+            cli = _amux_cli()
+            if not cli:
+                return False, "sandboxed session, but the amux CLI was not found to launch it"
+            argv = [cli, "start", name, "--no-attach"]
+            if fresh:
+                argv.append("--fresh")
+            if account_override:
+                argv += ["--account", account_override]
+            if provider_override:
+                return False, "a one-shot provider cannot be combined with a sandboxed start"
+            try:
+                argv += shlex.split(extra_flags or "")
+            except ValueError:
+                return False, "could not parse the start flags"
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=180,
+                               env={**os.environ, "AMUX_NO_ATTACH": "1"})
+            out = re.sub(r"\x1b\[[0-9;]*m", "", (r.stdout or "") + (r.stderr or "")).strip()
+            if r.returncode != 0 or not is_running(name):
+                return False, (out.splitlines()[-1] if out else "sandboxed start failed")
+            print(f"[start] {name}: sandboxed launch via the CLI")
+            return True, "started (sandboxed)"
         work_dir = str(Path(cfg.get("CC_DIR", str(Path.home()))).expanduser().resolve())
         # Stamp this session's commits with its name (durable git trailer).
         _install_amux_commit_hook(work_dir)
@@ -8536,6 +8574,12 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
         # lands on the agent's argv and codex/gemini/opencode reject it.
         flags = _respell_full_access(flags, provider)
         extra_flags = _respell_full_access(extra_flags, provider)
+        # codex, agy and opencode run with full access by default (2026-11-21); a sandboxed
+        # session never gets here (handed to the CLI above). claude keeps its own default.
+        if provider in ("codex", "agy", "opencode"):
+            _yf = _provider_yolo_flag(provider)
+            if _yf and _yf not in flags and _yf not in extra_flags:
+                flags = f"{flags} {_yf}".strip()
         _uuid_re = re.compile(r'^[0-9a-fA-F-]{36}$')
         if fresh and provider == "claude":
             # --fresh: cold start under the session's name; no resume, no safety net.
@@ -39291,8 +39335,16 @@ class CCHandler(BaseHTTPRequestHandler):
             # --full-access` — persist the provider's own no-sandbox spelling
             # into CC_FLAGS at creation. One request, no toggle: a toggle would
             # depend on the session's prior state and also flip auto-continue.
+            _sbx = str(body.get("sandbox") or "").strip().lower()
+            if _sbx and _sbx not in ("net", "full"):
+                return self._json({"error": "sandbox must be net or full"}, 400)
+            if _sbx and body.get("full_access"):
+                return self._json({"error": "full_access cannot be combined with a sandbox"}, 400)
             if body.get("full_access"):
                 cfg["CC_FLAGS"] = _provider_yolo_flag(provider)
+            if _sbx:
+                cfg["CC_FLAGS"] = f'--{_sbx}-sandbox'
+
             # autoprompt (2026-10-14): REST mirror of `amux exec <name> --autoprompt` —
             # prompt suggestions on for this session; stored as a CC_FLAGS marker that
             # start_session strips and turns into CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=true.
