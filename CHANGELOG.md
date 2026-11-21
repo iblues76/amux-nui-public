@@ -2,6 +2,12 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.1 — 2026-11-21
+
+- **Sandboxes keep less of your home readable.** Only program and toolchain folders stay readable (`~/.local/bin`, `~/.local/lib`, `~/.cargo/bin`, `~/.rustup`, `~/.nvm` and the like). The rest of `~/.local/share`, where other programs keep their data and keys, and `~/.cargo`'s credentials are now hidden too.
+- **agy and opencode in `--full-sandbox` work on macOS.** Their terminal interface failed to start there (`setRawMode failed`).
+- [docs/sandbox.md](docs/sandbox.md) lists the folders that stay readable and two more limits: codex can read a home file created after the session started, and package caches in your home are not writable.
+
 ## 0.7.0 — 2026-11-21
 
 - **Sandboxes: `--net-sandbox` and `--full-sandbox`.** The agent's commands can read and write only the session folder, plus read the system and your home toolchains. Every other home folder is hidden from them. `--full-sandbox` also takes away their network. The agent's connection to its model and its web search keep working. Remember a sandbox with `amux register` or `amux exec`, or use it for one launch with `amux start`. claude and codex use their own sandboxes; agy and opencode are wrapped whole (bubblewrap or srt on Linux, Seatbelt or srt on macOS). A launch that cannot be sandboxed is refused. See [docs/sandbox.md](docs/sandbox.md).

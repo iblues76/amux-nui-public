@@ -711,6 +711,12 @@ if "$BINDIR/amux-sandbox" check codex full 2>/dev/null; then
   f=$(ls "$SANDBOX/sbx/codex"/amux-sbx-full-*.config.toml 2>/dev/null | head -1)
   grep -q 'enabled = false' "$f" 2>/dev/null && grep -q '":workspace_roots" = "write"' "$f" \
     && ok "the full profile has no network and a writable folder" || bad "codex profile wrong" "$(cat "$f" 2>&1 | head -12)"
+  mkdir -p "$HOME/.local/bin" "$HOME/.local/share/someapp"
+  o=$(cd "$SANDBOX/sbx/proj" && CODEX_HOME="$SANDBOX/sbx/codex" "$BINDIR/amux-sandbox" launch codex net . 2>&1)
+  f=$(ls "$SANDBOX/sbx/codex"/amux-sbx-net-*.config.toml 2>/dev/null | head -1)
+  { grep -q "\"$HOME/.local/share/someapp\" = \"deny\"" "$f" 2>/dev/null || grep -q "\"$HOME/.local/share\" = \"deny\"" "$f" 2>/dev/null; } \
+    && ! grep -q "\"$HOME/.local/bin\" = \"deny\"" "$f" \
+    && ok "app data in ~/.local/share is hidden, ~/.local/bin stays readable" || bad "readable home list wrong" "$(grep local "$f" 2>&1 | head -6)"
   o=$(cd "$SANDBOX/sbx/proj" && "$BINDIR/amux-sandbox" launch claude full . 2>&1)
   sf=$(printf '%s\n' "$o" | sed -n 's/^ARGS --settings //p')
   python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); b=s["sandbox"]; assert b["enabled"] and b["failIfUnavailable"] and not b["allowUnsandboxedCommands"] and b["network"]["strictAllowlist"] and s["permissions"]["blockWritesOutsideWorkingDirectories"]' "$sf" 2>/dev/null \

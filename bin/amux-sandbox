@@ -22,6 +22,13 @@ How each agent gets there:
   opencode  no sandbox of its own, so the whole agent is wrapped (and runs --auto inside it): bubblewrap (Linux) or
             Seatbelt (macOS) for --net-sandbox; srt (Anthropic's sandbox-runtime) for
             --full-sandbox, with only the model endpoints in opencode.json reachable.
+Limits:
+  - MCP servers of claude and codex run outside the sandbox (the agents start them themselves).
+  - codex: its profile lists the home entries that exist at start, so a file or folder created
+    in a home folder after the session started is readable to its commands until the next start.
+  - package managers that write caches in your home (~/.npm, ~/.cache/pip, ~/.cargo/registry)
+    can't: point them at the folder (npm --cache ./.npm, CARGO_HOME=./.cargo, ...).
+  - a wrapped agent (agy, opencode) can read its own configuration and keys.
 Windows: run amux inside WSL2 (it is Linux there). Native Windows is not supported.
 Refuses to start (exit 1) whenever the sandbox can't be applied — never runs unconfined.
 """
@@ -29,9 +36,16 @@ import hashlib, json, os, platform, re, shlex, shutil, subprocess, sys
 
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".amux", "sandbox")
-# Home entries a confined command may still READ: toolchains and the agents' own programs.
-KEEP = [".local", ".cargo", ".rustup", ".nvm", ".bun", ".deno", "go", ".pyenv", ".rbenv",
-        ".sdkman", "miniconda3", "anaconda3", "miniforge3", ".gitconfig", ".opencode"]
+# Home paths a confined command may still READ: program and toolchain folders only — not app
+# data (~/.local/share holds other programs' keys and state) and not ~/.cargo's credentials.
+KEEP = [".local/bin", ".local/lib", ".local/share/uv", ".local/share/pipx", ".cargo/bin", ".rustup",
+        ".nvm", ".bun/bin", ".deno/bin", "go/bin", ".pyenv", ".rbenv", ".sdkman", "miniconda3",
+        "anaconda3", "miniforge3", ".gitconfig", ".opencode/bin"]
+
+
+def keep_paths(extra=()):
+    """KEEP (+ extra) as absolute paths that exist."""
+    return [p for p in (os.path.join(HOME, k) for k in list(KEEP) + list(extra)) if os.path.exists(p)]
 MAC = platform.system() == "Darwin"
 
 
@@ -54,28 +68,28 @@ def state_file(name, text):
     return p
 
 
-def deny_siblings(d, extra=()):
-    """Paths to hide so only d (and KEEP) stay visible: every entry next to the path from
-    the parent of $HOME down to d, minus the path itself and the toolchains."""
-    out, top = [], os.path.dirname(HOME)
-    d = os.path.realpath(d)
-    if not (d + "/").startswith(top + "/"):
-        # outside the home tree: hide every home folder (the path to d is not in it)
-        return [os.path.join(top, e) for e in sorted(os.listdir(top))]
-    cur = top
-    rel = os.path.relpath(d, top).split(os.sep)
-    for i, part in enumerate(rel):
+def hide_list(d, extra=()):
+    """Paths to hide so that only d and the KEEP paths (+ extra) stay visible: every entry of the
+    home tree (other users' homes included) that is neither one of those paths nor on the way
+    to one. Only what exists NOW can be listed — see the codex note in explain."""
+    visible = keep_paths(extra) + [os.path.realpath(d)]
+    out = []
+
+    def walk(cur):
         try:
             entries = sorted(os.listdir(cur))
         except OSError:
-            break
+            return
         for e in entries:
-            if e == part:
+            pth = os.path.join(cur, e)
+            if pth in visible:
                 continue
-            if cur == HOME and (e in KEEP or e in extra):
+            if any(v.startswith(pth + os.sep) for v in visible):
+                walk(pth)
                 continue
-            out.append(os.path.join(cur, e))
-        cur = os.path.join(cur, part)
+            out.append(pth)
+
+    walk(os.path.dirname(HOME))
     return out
 
 
@@ -140,7 +154,7 @@ def claude(mode, d):
          "sandbox": {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
                      "autoAllowBashIfSandboxed": True,
                      "filesystem": {"denyRead": [top],
-                                    "allowRead": [d] + [os.path.join(HOME, k) for k in KEEP],
+                                    "allowRead": [d] + keep_paths(),
                                     "allowWrite": [d]},
                      "network": {}}}
     if mode == "full":
@@ -158,9 +172,11 @@ def codex(mode, d):
              "[permissions.%s]" % q(name), 'extends = ":workspace"', "",
              "[permissions.%s.network]" % q(name), "enabled = %s" % ("true" if mode == "net" else "false"), "",
              "[permissions.%s.filesystem]" % q(name)]
-    for p in deny_siblings(d, extra=(os.path.basename(codex_home),) if os.path.dirname(codex_home) == HOME else ()):
+    extra = ()
+    if os.path.dirname(codex_home) == HOME:          # codex re-executes itself from here
+        extra = (os.path.join(os.path.basename(codex_home), "packages"),)
+    for p in hide_list(d, extra):
         lines.append("%s = \"deny\"" % q(p))
-    lines.append('%s = "deny"' % q(os.path.join(codex_home, "auth.json")))
     lines.append('":workspace_roots" = "write"')
     os.makedirs(codex_home, exist_ok=True)
     path = os.path.join(codex_home, name + ".config.toml")
@@ -234,24 +250,26 @@ def wrap(name, mode, d, data, extra_read, hosts, inner_args):
     (the agent's own model endpoints). `data` = the agent's own state folders (writable)."""
     for p in data:
         os.makedirs(p, exist_ok=True)
-    readable = [d] + [os.path.join(HOME, k) for k in KEEP] + data + extra_read
+    readable = [d] + keep_paths() + data + extra_read
     if mode == "full":
         srt = find_srt()
         os.makedirs("/tmp/claude", exist_ok=True)   # srt points TMPDIR here and expects it to exist
-        # srt mounts allowRead entries read-only over nested allowWrite ones, so ~/.local is
-        # listed by its program folders, not whole (share/<agent> may have to stay writable)
-        rd = [r for r in readable if r != os.path.join(HOME, ".local")]
-        rd += [os.path.join(HOME, ".local", x) for x in ("bin", "lib")]
+        rd = readable
         s = {"network": {"allowedDomains": hosts, "deniedDomains": []},
              "filesystem": {"denyRead": [os.path.dirname(HOME)],
                             "allowRead": rd + [STATE], "allowWrite": [d] + data, "denyWrite": []}}
+        if MAC:
+            # the agent's interface puts the terminal in raw mode; srt's macOS profile refuses
+            # that ("setRawMode failed with errno: 1") unless pseudo-terminal operations are allowed
+            s["allowPty"] = True
         p = state_file("%s-full-%s.json" % (name, tag(d)), json.dumps(s, indent=2) + "\n")
         return [srt, "--settings", p, "--"], inner_args
     if MAC:
         lit = lambda s: '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
         prof = ["(version 1)", "(allow default)",
                 "(deny file-read* (subpath %s))" % lit(os.path.dirname(HOME)),
-                "(allow file-read* %s)" % " ".join("(literal %s)" % lit(a) for a in ancestors(d))]
+                "(allow file-read* %s)" % " ".join("(literal %s)" % lit(a) for a in
+                                                    sorted({x for r in readable for x in ancestors(r)}))]
         prof.append("(allow file-read* %s)" % " ".join("(subpath %s)" % lit(r) for r in readable))
         prof.append("(deny file-write* (subpath %s))" % lit(os.path.dirname(HOME)))
         prof.append("(allow file-write* %s)" % " ".join("(subpath %s)" % lit(w) for w in [d] + data))
@@ -272,7 +290,9 @@ def wrap(name, mode, d, data, extra_read, hosts, inner_args):
 def opencode(mode, d):
     data = [os.path.join(HOME, ".local", "share", "opencode"), os.path.join(HOME, ".local", "state", "opencode"),
             os.path.join(HOME, ".cache", "opencode"), os.path.join(HOME, ".config", "opencode")]
-    return wrap("opencode", mode, d, data, opencode_file_refs(), opencode_hosts(), ["--auto"])
+    own = os.path.join(HOME, ".opencode")   # its install folder: read-only, so commands can't alter opencode
+    return wrap("opencode", mode, d, data, opencode_file_refs() + ([own] if os.path.isdir(own) else []),
+                opencode_hosts(), ["--auto"])
 
 
 # agy's model and sign-in traffic (measured under srt, agy 1.5.14)

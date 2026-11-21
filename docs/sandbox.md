@@ -4,10 +4,10 @@ Two flags keep an agent's commands inside the session folder:
 
 | Flag | Files the agent's commands can use | Network for those commands |
 |---|---|---|
-| `--net-sandbox` | read and write the session folder; read the system and your home toolchains | yes |
+| `--net-sandbox` | read and write the session folder; read the system and the program folders in your home | yes |
 | `--full-sandbox` | the same | no |
 
-In both modes, every other folder in your home (and every other user's) is hidden from the commands the agent runs. The agent's own connection to its model, and its provider-side web search, are not commands and keep working.
+In both modes, every other folder in your home (and every other user's) is hidden from the commands the agent runs. The program folders that stay readable are `~/.local/bin`, `~/.local/lib`, `~/.local/share/uv`, `~/.local/share/pipx`, `~/.cargo/bin`, `~/.rustup`, `~/.nvm`, `~/.pyenv`, `~/.rbenv`, `~/.sdkman`, conda installs, `~/.gitconfig` and similar; app data such as the rest of `~/.local/share` stays hidden. The agent's own connection to its model, and its provider-side web search, are not commands and keep working.
 
 Without a flag, codex, agy and opencode run with full access, and claude keeps the permission mode from your Claude Code settings.
 
@@ -33,7 +33,7 @@ If a sandbox cannot be applied on the machine, the launch is refused with the re
 | agy | The whole agent is wrapped. |
 | opencode | The whole agent is wrapped, and runs with `--auto` inside the wrapper. |
 
-Wrapping uses bubblewrap on Linux and Seatbelt on macOS for `--net-sandbox`. For `--full-sandbox` it uses [srt](https://github.com/anthropic-experimental/sandbox-runtime) (Anthropic's sandbox runtime), which lets only the agent's own model endpoints through: for opencode, the hosts in `opencode.json` and of the providers you signed in to; for agy, Google's API hosts.
+Wrapping uses bubblewrap on Linux and Seatbelt on macOS for `--net-sandbox`. On macOS, srt is also allowed pseudo-terminal operations, which the agents' terminal interfaces need. For `--full-sandbox` it uses [srt](https://github.com/anthropic-experimental/sandbox-runtime) (Anthropic's sandbox runtime), which lets only the agent's own model endpoints through: for opencode, the hosts in `opencode.json` and of the providers you signed in to; for agy, Google's API hosts.
 
 The generated settings live in `~/.amux/sandbox/` and are rewritten at every start. `amux-sandbox explain` prints this summary on any machine.
 
@@ -50,7 +50,10 @@ Native Windows is not supported. Run amux inside WSL2.
 ## Limits
 
 - **MCP servers run outside the sandbox** for claude and codex. Those agents start them as their own processes, so an MCP server keeps its normal file and network access. For agy and opencode the MCP servers run inside the wrapper.
+- **codex: files created later.** codex's profile lists the entries in your home folder when the session starts, so a file or folder created in a home folder after that is readable to its commands until the next start. claude, agy and opencode hide the whole home folder and do not have this gap.
+- **Package caches in your home are not writable** (`~/.npm`, `~/.cache/pip`, `~/.cargo/registry`). Point the tool at the session folder instead, for example `npm --cache ./.npm` or `CARGO_HOME=./.cargo`.
 - **A wrapped agent can read its own configuration**, including the API keys it needs (`~/.config/opencode`, `~/.gemini`), because the agent and its commands share one sandbox.
 - **Claude with `--net-sandbox`:** in auto mode, a command has to name the host it needs, and auto mode approves it. Claude does this when it is told a command was blocked.
 - **Writes outside the folder** fail, or land in a temporary layer that is thrown away when the command ends. Nothing reaches your real home folder.
 - `--net-sandbox` and `--full-sandbox` are not available for `iterm2` sessions.
+- **codex may decline instead of trying.** The codex model reads its permission profile and can refuse a command that touches a denied path rather than run it and be blocked. Either way the path stays closed.
