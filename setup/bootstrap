@@ -53,8 +53,9 @@ if [ "$PKGMGR" = none ]; then
   amux_warn "but you will have to run the installs yourself."
   case "$PLATFORM" in
     macos) printf '  Get Homebrew:  https://brew.sh\n' ;;
-    msys)  printf '  Get MSYS2 (gives you pacman AND a real tmux):  https://www.msys2.org\n'
-           printf '  Or Scoop (no admin rights needed):            https://scoop.sh\n' ;;
+    msys)  printf '  To run sessions on Windows, use WSL2 with Ubuntu 26.04 LTS (docs/windows.md).\n'
+           printf '  Untested here: MSYS2 (pacman AND a real tmux):  https://www.msys2.org\n'
+           printf '  Untested here: Scoop (no admin rights needed):  https://scoop.sh\n' ;;
   esac
   printf '\n'
 fi
@@ -103,14 +104,14 @@ if need_install tmux tmux; then
   case "$PLATFORM" in
     msys|cygwin)
       if [ "$PKGMGR" = msys2 ]; then
-        amux_info "MSYS2 detected — it ships a real tmux."
+        amux_info "MSYS2 detected — it ships a real tmux (untested with amux; WSL2 is the supported way, docs/windows.md)."
         ask "  Install tmux with pacman?" && run pacman -S --noconfirm tmux
       else
         amux_hmm "no tmux, and no MSYS2 pacman to install one."
         printf '      Without tmux this machine cannot RUN sessions locally.\n'
-        printf '      It CAN still drive other machines (amux-remote, amux-all, ccjump).\n'
-        printf '      To run sessions here, install MSYS2 (https://www.msys2.org)\n'
-        printf '      and then:  pacman -S tmux\n'
+        printf '      It may still drive other machines (amux-remote, amux-all, ccjump; untested).\n'
+        printf '      To run sessions on Windows, use WSL2 with Ubuntu 26.04 LTS (docs/windows.md).\n'
+        printf '      Untested alternative: MSYS2 (https://www.msys2.org), then  pacman -S tmux\n'
       fi ;;
     *)
       ask "  Install tmux ($(amux_pkg_install_cmd tmux))?" && amux_pkg_install tmux

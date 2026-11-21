@@ -58,7 +58,7 @@ Do not trust `pgrep -f "amux serve"`. The command execs into `python .../amux-se
 
 ## Windows: "tmux is missing calls amux needs"
 
-Your tmux is not the real thing, or not complete enough. See [windows.md](windows.md). The short version: MSYS2's tmux is genuine, psmux is a reimplementation, and Git Bash has none. You should still be able to drive other machines regardless, though that is untested outside WSL.
+Your tmux is not the real thing, or not complete enough. On Windows, run amux inside WSL2 with Ubuntu 26.04 LTS; [windows.md](windows.md) has the steps. Outside WSL, MSYS2's tmux is genuine but untested, psmux is a reimplementation, and Git Bash has none.
 
 ## The grid shows boxes instead of status dots
 

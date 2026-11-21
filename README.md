@@ -4,11 +4,34 @@ A ready-to-use build of [**amux**](https://github.com/mixpeek/amux) — the sess
 
 This is the setup its maintainer uses every day, with the personal parts taken out: no machine names, accounts, addresses or credentials ship in it. You bring your own.
 
-**Version 0.7.1** — bundles a modified **amux 0.9.15** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
+**Version 0.7.2** — bundles a modified **amux 0.9.15** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`).
 
-Works on **macOS and Linux**, and on **Windows** through WSL (driving other machines from MSYS2 or Git Bash is untested; see [docs/windows.md](docs/windows.md)).
+Runs on **macOS** and **Linux**, and on **Windows inside WSL2**. What each system needs is under [What you need](#what-you-need).
 
 I use it every day in **iTerm2 on macOS**, and it works the same in other terminals: it is tested in Linux terminals too. Anything that runs tmux will do; the iTerm2 extras (`amux-tabs`, tab titles) are optional.
+
+## What you need
+
+| | macOS | Linux | Windows 10 or 11 |
+|---|---|---|---|
+| **amux runs** | natively | natively | inside WSL2, with Ubuntu 26.04 LTS |
+| **Required** | tmux, python3, curl, git | tmux, python3, curl, git | WSL2 and Ubuntu 26.04, then the Linux column inside Ubuntu |
+| **How to get it** | [Homebrew](https://brew.sh), then `brew install tmux` | your package manager (examples below) | step by step in [docs/windows.md](docs/windows.md) |
+| **Sandbox flags** | nothing extra | bubblewrap, socat | bubblewrap, socat |
+| **Optional** | fzf, mosh | fzf, mosh | fzf, mosh |
+
+On macOS, python3, curl and git come with the system and with Apple's command-line tools, which the Homebrew installer adds. On Linux:
+
+```sh
+sudo apt install tmux python3 curl git fzf       # Debian, Ubuntu
+sudo dnf install tmux python3 curl git fzf       # Fedora
+```
+
+You also need at least one coding agent (Claude Code, Codex, Gemini CLI, OpenCode or Antigravity), installed on the same system as amux. On Windows that means inside Ubuntu: an agent installed on Windows itself is not visible there. `setup/bootstrap` (below) can install tmux, python3, curl, fzf and Claude Code for you, with Homebrew on macOS or apt, dnf, pacman, zypper or apk on Linux.
+
+**fzf** gives the session pickers and **mosh** attaches over slow links. bubblewrap and socat are needed only for the `--net-sandbox` and `--full-sandbox` flags; agy and opencode in `--full-sandbox` also need srt, see [docs/sandbox.md](docs/sandbox.md#requirements).
+
+**Native Windows** (PowerShell, Command Prompt, Git Bash) **cannot run amux sessions**: amux runs every agent inside tmux, and tmux needs Linux or macOS. [docs/windows.md](docs/windows.md) lists the untested alternatives.
 
 ## Install
 
@@ -23,8 +46,6 @@ setup/bootstrap       # installs whatever amux-doctor says is missing (tmux, pyt
 Add `--statusline` to also set up the amux status line in Claude Code (see [below](#status-line)).
 
 `install.sh` **copies** `amux`, `amux-server.py` and `amux-remote` (the dashboard reloads itself when its file changes, so it must not run from a checkout you `git pull`), and **symlinks** the companions. To update: `git pull && ./install.sh`. It also adds one line to `~/.zshrc` / `~/.bashrc` for tab completion (`AMUX_NO_COMPLETION=1 ./install.sh` to skip). `./install.sh --help` lists every option.
-
-Needs **tmux**, **python3**, **curl**, and at least one coding agent. Optional: **fzf** (pickers), **mosh** (attach over slow links).
 
 If you already have upstream amux installed, make sure `~/.local/bin` comes first on your `PATH`; `amux-doctor` tells you which build it finds.
 
@@ -161,7 +182,8 @@ Every command answers `-h`.
 - [**remote.md**](docs/remote.md) — connecting machines; tokens and rotation
 - [**statusline.md**](docs/statusline.md) — the status line: every segment, settings, install and removal
 - [**colors.md**](docs/colors.md) — one color per session: pinning, the palette, automatic modes
-- [**windows.md**](docs/windows.md) — WSL vs MSYS2 vs Git Bash
+- [**sandbox.md**](docs/sandbox.md) — `--net-sandbox` and `--full-sandbox`: what each allows, how each agent is confined, what each system needs
+- [**windows.md**](docs/windows.md) — amux on Windows: WSL2 with Ubuntu 26.04 LTS, step by step
 - [**troubleshooting.md**](docs/troubleshooting.md) — symptoms, causes, fixes
 - [**CHANGELOG.md**](CHANGELOG.md) — what changed in each release
 

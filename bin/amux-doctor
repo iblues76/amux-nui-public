@@ -91,8 +91,8 @@ if amux_have tmux; then
     bad "tmux is missing calls amux needs: $failures"
     case "$PLATFORM" in
       msys|cygwin)
-        note "On Windows, amux needs MSYS2's real tmux (pacman -S tmux)."
-        note "Reimplementations such as psmux may not support capture-pane." ;;
+        note "On Windows, run amux inside WSL2 with Ubuntu 26.04 LTS (docs/windows.md)."
+        note "MSYS2's real tmux (pacman -S tmux) is untested; psmux may not support capture-pane." ;;
       *) note "This tmux build is unusual — try your package manager's tmux." ;;
     esac
     note "You can still DRIVE other machines from here (amux-remote, amux-all, ccjump)."
@@ -101,9 +101,9 @@ else
   case "$PLATFORM" in
     msys|cygwin)
       caveat "tmux not installed — this machine cannot run sessions LOCALLY"
-      note "That is normal for Git Bash. You can still drive other machines:"
+      note "That is normal for Git Bash. You may still drive other machines (untested):"
       note "  amux-config add <box> --host <address>"
-      note "To run sessions here too, install MSYS2 and: pacman -S tmux" ;;
+      note "To run sessions on Windows, use WSL2 with Ubuntu 26.04 LTS (docs/windows.md)." ;;
     *)
       bad "tmux not installed — amux cannot run sessions here"
       note "install: $(amux_pkg_install_cmd tmux)" ;;

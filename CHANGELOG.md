@@ -2,6 +2,13 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.2 — 2026-11-21
+
+- **What each system needs, in one table.** The README's new "What you need" section covers macOS, Linux and Windows: how amux runs on each, what to install and how, and what the sandbox flags add.
+- **Windows: WSL2 with Ubuntu 26.04 LTS, step by step.** [docs/windows.md](docs/windows.md) is rewritten around the one supported way to run amux on Windows, from `wsl --install` to `amux-doctor`. MSYS2, Git Bash, psmux and Cygwin are in a separate untested section.
+- [docs/sandbox.md](docs/sandbox.md): the install command for each system, Node.js for srt, a note on Ubuntu 24.04's AppArmor restriction, and where the sandboxes have been tested. The README's docs list now includes it.
+- `amux-doctor` and `setup/bootstrap` point Windows users to WSL2 with Ubuntu 26.04 LTS.
+
 ## 0.7.1 — 2026-11-21
 
 - **Sandboxes keep less of your home readable.** Only program and toolchain folders stay readable (`~/.local/bin`, `~/.local/lib`, `~/.cargo/bin`, `~/.rustup`, `~/.nvm` and the like). The rest of `~/.local/share`, where other programs keep their data and keys, and `~/.cargo`'s credentials are now hidden too.

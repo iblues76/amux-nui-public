@@ -39,13 +39,17 @@ The generated settings live in `~/.amux/sandbox/` and are rewritten at every sta
 
 ## Requirements
 
-| System | Needs |
-|---|---|
-| Linux, WSL2 | `bwrap` (package `bubblewrap`) and `socat` |
-| macOS | nothing extra (`/usr/bin/sandbox-exec` is built in) |
-| `--full-sandbox` for agy or opencode | srt: `npm install --prefix ~/.amux/sandbox @anthropic-ai/sandbox-runtime` |
+| System | Needs | Install |
+|---|---|---|
+| macOS | nothing extra (`/usr/bin/sandbox-exec` is built in) | nothing to install |
+| Linux, WSL2 | bubblewrap and socat | `sudo apt install bubblewrap socat` or `sudo dnf install bubblewrap socat` |
+| `--full-sandbox` for agy or opencode, any system | srt, which runs on Node.js | `npm install --prefix ~/.amux/sandbox @anthropic-ai/sandbox-runtime` |
 
-Native Windows is not supported. Run amux inside WSL2.
+Native Windows is not supported. Run amux inside WSL2; [windows.md](windows.md) has the steps.
+
+**Ubuntu 24.04** restricts the user namespaces that bubblewrap relies on (an AppArmor setting), so bubblewrap may not start there. amux then refuses the sandbox and prints why. Ubuntu 26.04 ships an AppArmor profile for bubblewrap.
+
+**Tested so far** on Fedora 44 (all four agents) and macOS (claude, codex and opencode). Ubuntu and WSL2 have not been tested yet.
 
 ## Limits
 
