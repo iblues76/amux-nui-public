@@ -1778,7 +1778,8 @@ def sessions_there(box, wait):
                   key=lambda x: ls_key(x["name"]))
     rows = []
     for i, x in enumerate(data, 1):
-        rows.append({"row": i, "name": x["name"], "tag": ls_tag(x.get("provider"), x.get("account")),
+        # the number that machine's own `amux ls` shows; an older server does not send it
+        rows.append({"row": x.get("row") or i, "name": x["name"], "tag": ls_tag(x.get("provider"), x.get("account")),
                      "running": bool(x.get("running")), "dir": x.get("dir") or "",
                      "flags": x.get("flags") or "", "preview": x.get("preview") or ""})
     return rows, None

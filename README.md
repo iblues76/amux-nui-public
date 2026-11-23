@@ -4,7 +4,7 @@ amux-nui-public is a build of [**amux**](https://github.com/mixpeek/amux) that i
 
 It is the setup that I use every day, with the personal parts taken out. It contains no machine names, accounts, addresses or credentials, so you add your own.
 
-**Version 0.7.3**, which bundles a modified **amux 0.9.16** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
+**Version 0.7.4**, which bundles a modified **amux 0.9.17** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
 
 It runs on **macOS** and **Linux**, and on **Windows inside WSL2**. [What you need](#what-you-need) lists what each system needs.
 
@@ -45,7 +45,7 @@ setup/bootstrap       # installs whatever amux-doctor says is missing (tmux, pyt
 
 Add `--statusline` to also set up the amux status line in Claude Code (see [below](#status-line)).
 
-`install.sh` copies `amux`, `amux-server.py` and `amux-remote`, and it makes symlinks to the companions. It copies those three because the dashboard reloads itself when its file changes, so it must not run from a checkout that you update with `git pull`. To update, run `git pull && ./install.sh`. The installer also adds one line to `~/.zshrc` or `~/.bashrc` for tab completion (run `AMUX_NO_COMPLETION=1 ./install.sh` to skip that). `./install.sh --help` lists every option.
+`install.sh` copies `amux`, `amux-server.py` and `amux-remote`, and it makes symlinks to the companions. It copies those three because the dashboard reloads itself when its file changes, so it must not run from a checkout that you update with `git pull`. To update, run `git pull && ./install.sh`. The installer also adds one line to `~/.zshrc` or `~/.bashrc` for tab completion (run `AMUX_NO_COMPLETION=1 ./install.sh` to skip that). `./install.sh --help` lists every option. On a machine that only drives other machines, `./install.sh --client` installs `amux` and the companions without the dashboard server.
 
 If you already have upstream amux installed, make sure `~/.local/bin` comes first on your `PATH`. `amux-doctor` tells you which build it finds.
 
@@ -218,6 +218,8 @@ One rule holds everywhere: a secret never appears on a command line, in output, 
 - Where a token must be identified, only a short prefix and a length are printed.
 - `setup/serve-install` binds to loopback plus one address you choose, never `0.0.0.0`.
 - On Linux, a request from the same machine skips the token only when it comes from your own user or root. Other people with a login on that machine are asked for the token like anyone else. See [docs/remote.md](docs/remote.md).
+- A web page open in a browser on the same machine cannot use that trust: the server refuses a change asked for by a page of another site.
+- Text typed in the dashboard (a description, tags, a folder, a branch) is stored as text and cannot run as a command.
 - `tools/audit-clean` scans the tree (and `--history`) for credentials, private addresses and personal data before anything is published. `tools/selftest` checks that the checkout works, without touching your real `~/.amux`.
 
 ## License: MIT + Commons Clause (not plain MIT)

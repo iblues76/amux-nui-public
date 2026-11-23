@@ -413,7 +413,11 @@ if compact:
     runs  = [bool(s.get("running")) for s in data]
     pres  = [acct_prefix(s) for s in data]
     maxw  = max(len(p) + len(n) for p, n in zip(pres, names))
-    numw  = max(2, len(str(total)))
+    # The number is the one that machine`s own "amux ls" shows. A server that sends
+    # "row" knows it (a session it hides still has a row there); an older one does
+    # not, and the place in this list is the best there is.
+    rows  = [s.get("row") or i for i, s in enumerate(data, 1)]
+    numw  = max(2, len(str(max(rows))))
     cellw = numw + 1 + 1 + 1 + maxw + 2
     try:
         termw = int(os.environ.get("COLUMNS","") or 0)
@@ -433,7 +437,7 @@ if compact:
             else:
                 mark = f"{DIM}○{R}"; nc = DIM
             pw = maxw - len(pres[idx])
-            line += f"{idx+1:>{numw}} {mark} {acct_col(pres[idx])}{nc}{names[idx]:<{pw}}{R}  "
+            line += f"{rows[idx]:>{numw}} {mark} {acct_col(pres[idx])}{nc}{names[idx]:<{pw}}{R}  "
         print(line)
 else:
     namew = min(max((len(s.get("name","")) for s in data), default=4), 22)

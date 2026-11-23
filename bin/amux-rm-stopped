@@ -22,7 +22,8 @@
 #
 # A persistent keep-list also works: one session name per line in
 #   ~/.amux/rm-stopped.keep      (blank lines and #comments ignored)
-# so sessions you never want auto-culled survive every run.
+# so sessions you never want auto-culled survive every run. A session pinned in
+# the dashboard is kept too, and iTerm2 sessions are never touched (no tmux to test).
 #
 # Exit: 0 = removed (or nothing to do), 1 = error, 2 = bad usage, 3 = aborted.
 set -uo pipefail
@@ -73,7 +74,7 @@ fi
 is_kept() { case "$keep_set" in *" $1 "*) return 0;; *) return 1;; esac; }
 
 # ── partition registered sessions into running / stopped / kept ─────────────
-stopped=(); kept=(); running=0
+stopped=(); kept=(); iterm=(); pinned=(); running=0
 shopt -s nullglob
 for f in "$CC_SESSIONS"/*.env; do
   name="$(basename "$f" .env)"
@@ -82,7 +83,7 @@ for f in "$CC_SESSIONS"/*.env; do
   # the user (2026-08-12). They're never culled here; manage them by hand.
   if grep -q '^CC_PROVIDER="\{0,1\}iterm2' "$f" 2>/dev/null \
      || grep -q '^CC_ITERM2_SESSION_ID=' "$f" 2>/dev/null; then
-    kept+=("$name")
+    iterm+=("$name")
     continue
   fi
   # exact-match target ('=' prefix) — a bare name prefix-matches in tmux, so
@@ -91,17 +92,19 @@ for f in "$CC_SESSIONS"/*.env; do
     running=$((running + 1))
   elif is_kept "$name"; then
     kept+=("$name")
+  elif grep -q '^CC_PINNED="\{0,1\}1' "$f" 2>/dev/null; then
+    pinned+=("$name")   # pinned in the dashboard: `amux rm` refuses these without --force
   else
     stopped+=("$name")
   fi
 done
 shopt -u nullglob
 
-total=$((running + ${#stopped[@]} + ${#kept[@]}))
+total=$((running + ${#stopped[@]} + ${#kept[@]} + ${#iterm[@]} + ${#pinned[@]}))
 [ "$total" -gt 0 ] || die "no registered sessions found in $CC_SESSIONS"
 
 if [ "${#stopped[@]}" -eq 0 ]; then
-  echo "${G}nothing to do${N} — $running running, 0 stopped, ${#kept[@]} kept"
+  echo "${G}nothing to do${N} — $running running, 0 stopped, ${#kept[@]} kept, ${#pinned[@]} pinned, ${#iterm[@]} iTerm2 left alone"
   exit 0
 fi
 
@@ -109,6 +112,12 @@ echo "${B}${#stopped[@]} stopped session(s)${N} to remove ${D}($running running,
 printf '  %s\n' "${stopped[@]}"
 if [ "${#kept[@]}" -gt 0 ]; then
   echo "${D}  keeping (keep-list): ${kept[*]}${N}"
+fi
+if [ "${#pinned[@]}" -gt 0 ]; then
+  echo "${D}  keeping (pinned in the dashboard): ${pinned[*]}${N}"
+fi
+if [ "${#iterm[@]}" -gt 0 ]; then
+  echo "${D}  left alone (iTerm2 sessions, no tmux to test): ${iterm[*]}${N}"
 fi
 
 if [ "$dry" -eq 1 ]; then

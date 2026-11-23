@@ -23,6 +23,8 @@
 #   7e. sessions by name (amux search --sessions) against a fake second machine, and
 #       the command-line fixes of 0.7.3: one row order everywhere, option checks,
 #       re-register keeps a session, rename/rm/start-all, same-user dashboard access
+#   7f. dashboard text cannot run as a command; cross-site requests are told apart;
+#       pinned sessions, one codex resume rule, row numbers, a client-only install
 #   8. the audit catches a planted secret
 #
 # Usage:
@@ -924,6 +926,121 @@ l4=$(printf '%s\n' "$o" | sed -n 4p); l5=$(printf '%s\n' "$o" | sed -n 5p)
   && ok "completion: attach lanes and --desc only after -H; search offers --sessions and --continue" || bad "completion" "$o"
 
 for b in boxa boxb boxdown; do printf 'y\n' | run amux-config remove "$b"; done
+
+# ── 7f. dashboard text stays text; same behavior here and on another machine ──
+sect "7f. Dashboard text stays text; pinned sessions; codex resume; row numbers"
+# The session file is loaded by amux as shell text: no value the server writes may
+# carry a character that still means something inside double quotes.
+o=$(python3 - bin/amux-server.py <<'PYT' 2>&1
+import sys, textwrap, socket
+src = open(sys.argv[1], encoding="utf-8").read()
+ns = {}
+exec(src[src.index("_ENV_UNSAFE = "):src.index("def _write_env(")], ns)
+inert, unsafe = ns["_env_inert"], ns["_env_unsafe"]
+vals = ['plain text', 'x $(touch /tmp/zz) y', 'a "b" c', 'back`tick`', 'C:\\dir', 'l1\nl2']
+print("unsafe", [unsafe(v) for v in vals])
+print("inert", all(not unsafe(inert(v)) for v in vals), inert(vals[0]) == vals[0], inert(vals[2]))
+ns2 = {"socket": socket, "get_lan_ip": lambda: "192.0.2.5"}
+TS = ".ts" + ".net"   # the suffix of a private-network name, written in two parts
+exec(src[src.index("def _host_is_this_machine("):src.index("def _loopback_trusted(")], ns2)
+host = ns2["_host_is_this_machine"]
+print("host", [host(h) for h in ("localhost:8822", "127.0.0.1:8822", "[::1]:8822", "", "evil.example:8822", "evil.example")])
+meth = textwrap.dedent(src[src.index("    def _cross_site(self) -> bool:"):src.index("    def _request_has_valid_token(self) -> bool:")])
+exec(meth, ns2)
+class Req:
+    def __init__(self, **h): self.headers = h
+cs = ns2["_cross_site"]
+print("cross", [cs(Req(Host="127.0.0.1:8822")),                                         # curl, the amux CLI: no Origin
+                cs(Req(Host="127.0.0.1:8822", Origin="http://127.0.0.1:8822")),           # the dashboard itself
+                cs(Req(Host="one.example" + TS + ":8822", Origin="https://two.example" + TS + ":8822")),
+                cs(Req(Host="127.0.0.1:8822", Origin="https://evil.example")),            # a page of another site
+                cs(Req(Host="127.0.0.1:8822", Origin="null")),
+                cs(Req(**{"Host": "127.0.0.1:8822", "Sec-Fetch-Site": "cross-site"}))])
+PYT
+)
+has "unsafe [False, True, True, True, True, True]" "$o" && has "inert True True a 'b' c" "$o" \
+  && ok "a value with \$( ), a quote, a backtick, a backslash or a line break is caught, and written inert" || bad "session-file values" "$o"
+has "host [True, True, True, True, False, False]" "$o" \
+  && ok "the same-machine token skip needs a Host that names this machine (not a foreign name pointed here)" || bad "host-name rule" "$o"
+has "cross [False, False, False, True, True, True]" "$o" \
+  && ok "a change asked for by a page of another site is told apart from the dashboard and from curl" || bad "cross-site rule" "$o"
+n=$(grep -c '_env_unsafe(' bin/amux-server.py); g=$(grep -c 'self._cross_site() and not self._presents_token()' bin/amux-server.py)
+[ "$n" -ge 6 ] && [ "$g" = 1 ] && ok "the server refuses those values by name ($((n-2)) fields) and has the cross-site gate" || bad "server checks missing" "unsafe=$n gate=$g"
+has '"row": _rowof.get(name, 0)' "$(out_of grep -n '"row": _rowof' bin/amux-server.py)" && has 's.get("row") or i' "$(out_of grep -n 'get("row")' bin/amux-remote)" \
+  && has 'x.get("row") or i' "$(out_of grep -n 'get("row")' bin/amux-search)" \
+  && ok "the server sends each session's own row number, and both clients use it" || bad "row field"
+
+# pinned sessions: rm refuses them here as the dashboard does
+A register pin1 --provider codex --dir "$E/d1" >/dev/null
+printf 'CC_PINNED="1"\n' >> "$S/pin1.env"
+o=$(A rm pin1); has "is pinned in the dashboard" "$o" && has "pin1" "$(A ls)" && ok "amux rm refuses a pinned session" || bad "rm pinned" "$o"
+o=$(A rmnum "$(rownum pin1)" -y); has "pinned — left alone" "$o" && has "nothing to remove" "$o" && has "pin1" "$(A ls)" \
+  && ok "amux rmnum leaves a pinned row alone" || bad "rmnum pinned" "$o"
+printf 'CC_NAME="it9"\nCC_DIR="%s"\nCC_FLAGS=""\nCC_PROVIDER="iterm2"\n' "$E/d1" > "$S/it9.env"
+o=$(PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux-rm-stopped" -n 2>&1 | plain)
+has "keeping (pinned in the dashboard):" "$o" && has " pin1" "$(printf '%s\n' "$o" | grep 'keeping (pinned')" && has "left alone (iTerm2 sessions, no tmux to test): it9" "$o" \
+  && ok "amux-rm-stopped keeps pinned sessions and lists iTerm2 sessions on their own line" || bad "amux-rm-stopped" "$o"
+rm -f "$S/it9.env"
+o=$(A rm --force pin1); has "removed pin1" "$o" && ok "amux rm --force removes it" || bad "rm --force" "$o"
+o=$(A rm --bogus x); has "unknown option '--bogus'" "$o" && ok "amux rm refuses an option it does not know" || bad "rm --bogus" "$o"
+
+# --provider for one launch, anywhere among the options
+o=$(A start x --no-attach --provider bogus); has "unknown provider 'bogus'" "$o" && ok "amux start reads --provider after another option" || bad "start --provider late" "$o"
+o=$(A start x --no-attach --provider); has "--provider needs a value" "$o" && ok "…and says so when its value is missing" || bad "start --provider no value" "$o"
+
+# codex: which conversation a start resumes (stand-in codex, made-up conversation files)
+printf '#!/bin/sh\nexit 0\n' > "$E/mock/codex"; chmod +x "$E/mock/codex"
+mkdir -p "$E/cx" "$HOME/.codex/sessions/2026/01/01"; CXD=$(cd "$E/cx" && pwd -P)
+roll() { # roll <id> <messages> <originator> <age in seconds>
+  local f="$HOME/.codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$1.jsonl" i=0
+  printf '{"type":"session_meta","payload":{"id":"%s","session_id":"%s","cwd":"%s","originator":"%s"}}\n' "$1" "$1" "$CXD" "$3" > "$f"
+  while [ "$i" -lt "$2" ]; do printf '{"type":"response_item","payload":{"type":"message"}}\n' >> "$f"; i=$((i+1)); done
+  python3 -c 'import os, sys, time; t = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$f" "$4"
+}
+metaid() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("codex_session_id", "-"))' "$S/$1.meta.json" 2>/dev/null; }
+A register cxr --provider codex --dir "$E/cx" >/dev/null
+roll aaaa-old 4 codex-tui 600; roll bbbb-new 4 codex-tui 300; roll cccc-exec 9 codex_exec 100; roll dddd-short 1 codex-tui 50
+printf '{"codex_session_id":"aaaa-old"}' > "$S/cxr.meta.json"
+o=$(A start cxr --no-attach)
+has "auto-resuming newest codex session bbbb-new" "$o" && [ "$(metaid cxr)" = bbbb-new ] \
+  && ok "codex: the newest interactive conversation for the folder is resumed, and recorded" || bad "codex newest" "$o / $(metaid cxr)"
+rm -f "$HOME/.codex/sessions/2026/01/01/"*bbbb-new.jsonl "$HOME/.codex/sessions/2026/01/01/"*aaaa-old.jsonl
+printf '{"codex_session_id":"dddd-short"}' > "$S/cxr.meta.json"
+o=$(A start cxr --no-attach); has "auto-resuming newest codex session dddd-short" "$o" \
+  && ok "codex: with nothing newer, the conversation kept in the state file" || bad "codex stored id" "$o"
+rm -f "$HOME/.codex/sessions/2026/01/01/"*dddd-short.jsonl
+o=$(A start cxr --no-attach); ! has "auto-resuming" "$o" && [ "$(metaid cxr)" = "-" ] \
+  && ok "codex: a stored id whose file is gone is dropped, not resumed" || bad "codex stale id" "$o / $(metaid cxr)"
+roll eeee-live 5 codex-tui 10; printf '{"codex_session_id":"eeee-live"}' > "$S/cxr.meta.json"
+o=$(A start cxr --no-attach --fresh); ! has "auto-resuming" "$o" && [ "$(metaid cxr)" = "-" ] \
+  && ok "codex: --fresh starts a new conversation and forgets the old id" || bad "codex --fresh" "$o / $(metaid cxr)"
+a=$(sed -n '/def _find_latest_codex_session/,/return best_id/p' bin/amux-server.py | grep -c 'session_id") or payload.get("id"')
+b=$(grep -c 'payload.get("session_id") or payload.get("id")' bin/amux)
+r=$(grep -c 'ONE RULE, the same as' bin/amux bin/amux-server.py | tr '\n' ' ')
+[ "$a" = 1 ] && [ "$b" = 1 ] && ok "codex: the server and amux start read the conversation the same way" || bad "codex rule differs" "$a/$b $r"
+rm -f "$E/mock/codex"; A rm cxr >/dev/null
+
+# board: a title with a quote in it
+cat > "$E/mock/curl" <<'SH'
+#!/usr/bin/env bash
+# stand-in: answer a board POST with the title it received, proving the body was JSON
+body=$(cat)
+python3 -c 'import json, sys; d = json.loads(sys.argv[1]); print(json.dumps({"id": "T-1", "title": d.get("title"), "status": d.get("status")}))' "$body" 2>/dev/null \
+  || printf '{"error":"the body was not JSON"}'
+SH
+chmod +x "$E/mock/curl"
+o=$(A board add 'say "hi" to C:\temp'); has 'Created T-1 → say "hi" to C:\temp' "$o" \
+  && ok "amux board add: a title with a quote and a backslash arrives whole" || bad "board add" "$o"
+rm -f "$E/mock/curl"
+
+# a client-only install has amux itself, without the dashboard server
+CB="$SANDBOX/clientbin"
+if BINDIR="$CB" AMUX_CORE_BINDIR="$CB" run ./install.sh --client && [ -L "$CB/amux" ] && [ -L "$CB/amux-remote" ] && [ ! -e "$CB/amux-server.py" ] \
+   && has "amux v" "$(out_of "$CB/amux" version)"; then
+  ok "install.sh --client links amux and amux-remote, and leaves the server out"
+else
+  bad "install.sh --client" "$(ls "$CB" 2>&1 | tr '\n' ' ')"
+fi
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"

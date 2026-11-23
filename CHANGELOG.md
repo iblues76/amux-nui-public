@@ -2,6 +2,21 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.4 — 2026-11-23
+
+Update the server on every machine that runs one: the first two items are security fixes.
+
+- **Text typed in the dashboard can no longer run as a command.** A session's description, tags, folder and branch are stored in its file, which `amux` reads as shell text. A description containing `$(…)` ran as a command the next time `amux ls` read the session. The server now refuses a double quote, a backslash, a dollar sign, a backtick and a line break in those fields and tells you why, and it writes every other value so that it stays text. Anyone who could use a machine's dashboard could run commands on it this way.
+- **A web page cannot drive the server from your own browser.** A request from the same machine and the same user needs no token, and a browser on that machine counts as such a caller. The server now refuses a change that a page of another site asks for, and it skips the token only when the request asks for the server under a name of this machine. This mattered when the server ran without TLS, or with a certificate the browser trusts for `localhost`. The dashboard, `curl` and the `amux` command are not affected. See [docs/remote.md](docs/remote.md).
+- **A pinned session is not removed by accident.** `amux rm` and `amux rmnum` now refuse a session pinned in the dashboard, as the dashboard and `amux -H <box> rm` already did. `amux rm --force` removes it. `amux-rm-stopped` keeps pinned sessions and lists iTerm2 sessions on a line of their own.
+- **A codex session resumes the same conversation whoever starts it.** `amux start` took the newest interactive conversation for the folder, while the dashboard and `amux -H <box> start` took an id stored earlier, which could be an older conversation. Both now follow one rule: `--fresh` starts a new conversation; otherwise the newest interactive conversation for the folder; if there is none, the stored one when its file still exists.
+- **Row numbers from another machine are that machine's own.** A server hides the sessions listed in `~/.amux/blocked-sessions.txt`, which shifted every later row in `amux -H <box> ls -c` and `amux search --sessions` by one. The server now sends each session's row. An older server on the other machine still works, with the old numbering.
+- **`amux start <name>` takes `--provider` anywhere among its options.** It was read only as the first word after the name.
+- **`amux board add` accepts a title with a quote in it.** The request was built by hand and broke on a quote or a backslash.
+- **`./install.sh --client` installs `amux` too.** A client-only install had `amux-remote` and the companions but not the `amux` command that `amux -H`, `amux -A`, `amux up` and `amux search` belong to. It still leaves the dashboard server out.
+- The dashboard shows the server's reason when a change is refused, where it showed only the status number.
+- `tools/audit-clean` no longer prints awk warnings. A dot in its list of allowed public names matched any character.
+
 ## 0.7.3 — 2026-11-23
 
 - **Find a session by its name, on every machine.** `amux search --sessions login` lists the sessions whose name contains "login" on this machine and on every machine you drive, one block per machine, each row as `amux ls` prints it. `-c` gives the compact grid of `amux ls -c`. `--matchstring start|anywhere|end` says where the text must sit, `--regex 'pattern'` takes a regular expression, `-s` matches case exactly, and a machine list or `--local` limits where it looks. It reads names only, so it answers in about a second. See "Finding a session" in the [README](README.md).

@@ -88,6 +88,8 @@ files() {
 #                     host; kept as an exact string so a real `nui-<box>` still trips.
 #   /home/linuxbrew, /home/u, /Users/you — a generic install dir and test fixtures
 #   email@example.com, git@github.com    — upstream amux's own placeholder/URL text
+# (awk reads this from the environment, not through -v: -v unescapes the value first,
+# which turned every \. into "any character" and printed a warning per file.)
 ALLOW='^(git\.nuilab\.org|amux\.nuilab\.org|100\.64\.0\.0(/10)?|nui-public|/home/linuxbrew|/home/u|/Users/you|email@example\.com|git@github\.com)$'
 
 scan() { # $1 = extended regex, $2 = label, $3 = severity
@@ -97,7 +99,7 @@ scan() { # $1 = extended regex, $2 = label, $3 = severity
     grep -nHoE "$1" "$f" 2>/dev/null
   done \
     | grep -vE '^tools/audit-clean:' \
-    | awk -F: -v allow="$ALLOW" '{ m=$0; sub(/^[^:]*:[0-9]*:/,"",m); if (m !~ allow) print }' \
+    | ALLOW="$ALLOW" awk -F: '{ m=$0; sub(/^[^:]*:[0-9]*:/,"",m); if (m !~ ENVIRON["ALLOW"]) print }' \
     | head -20)
   report "$3" "$2" "$hits"
 }

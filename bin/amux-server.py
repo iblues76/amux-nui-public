@@ -1064,6 +1064,35 @@ def _loopback_peer_uid(client_ip: str, client_port: int, server_port: int, table
     return None
 
 
+def _host_is_this_machine(host_header: str) -> bool:
+    """True when the Host a same-machine caller asked for is a name of this machine.
+    A page of another site can point its own name at 127.0.0.1 (DNS rebinding) and
+    then reach this server from the user's browser as a same-machine, same-user
+    caller. Such a request arrives with the foreign name in Host, so it must not
+    skip the token. No Host at all is not a browser."""
+    h = (host_header or "").strip().lower()
+    if not h:
+        return True
+    if h.startswith("["):
+        h = h[1:].split("]")[0]
+    elif h.count(":") == 1:
+        h = h.split(":")[0]
+    if h in ("localhost", "127.0.0.1", "::1") or h.endswith(".localhost") or h.endswith(".ts.net"):
+        return True
+    try:
+        names = {socket.gethostname().lower()}
+        names.add(names.copy().pop().split(".")[0])
+    except Exception:
+        names = set()
+    return h in names
+
+
+def _origin_host_allowed(host: str) -> bool:
+    host = (host or "").lower()
+    return host in ("localhost", "127.0.0.1", "0.0.0.0") or \
+        host == get_lan_ip() or host.endswith(".ts.net")
+
+
 def _loopback_trusted(client_ip: str, client_port: int, server_port: int, table: str = "") -> bool:
     if os.environ.get("AMUX_LOCAL_TRUST", "").strip().lower() == "any":
         return True
@@ -1438,6 +1467,31 @@ def _atomic_write_secure(path: Path, content: str) -> None:
         raise
 
 
+# A session file is KEY="value" lines, and the amux CLI loads it as shell text.
+# Inside double quotes four characters still mean something to the shell: the
+# double quote, the backslash, the dollar sign and the backtick. A value with
+# $(...) in it ran as a command the next time `amux ls` read the file. So no
+# value written here may carry them, nor a line break. The API refuses them by
+# name where a person types free text (description, tags, folder, branch), with
+# a message; _env_inert is the backstop for every other value and for old files.
+_ENV_UNSAFE = '"\\$`\r\n'
+
+
+def _env_unsafe(value) -> bool:
+    return any(c in _ENV_UNSAFE for c in str(value))
+
+
+def _env_inert(value) -> str:
+    v = str(value)
+    if not _env_unsafe(v):
+        return v
+    v = v.replace('"', "'").replace("\r", " ").replace("\n", " ")
+    return "".join(c for c in v if c not in '\\$`')
+
+
+_ENV_UNSAFE_MSG = 'may not contain a double quote, a backslash, a dollar sign, a backtick or a line break'
+
+
 def _write_env(path: Path, cfg: dict):
     """Write a cfg dict back to a amux .env file with secure permissions.
 
@@ -1447,7 +1501,7 @@ def _write_env(path: Path, cfg: dict):
     """
     lines = [f'# updated: {__import__("datetime").datetime.now().isoformat()}']
     for k, v in cfg.items():
-        lines.append(f'{k}="{v}"')
+        lines.append(f'{k}="{_env_inert(v)}"')
     _atomic_write_secure(path, "\n".join(lines) + "\n")
 
 
@@ -6679,6 +6733,12 @@ def list_sessions() -> list:
     tmux_info = _tmux_info_map()
     # Pre-compute which sessions are running and batch-capture their panes
     env_files = [f for f in sorted(CC_SESSIONS.glob("*.env")) if not _is_session_blocked(f.stem)]
+    # "row" = the number `amux ls` on this machine shows for the session: its place
+    # among ALL registered sessions, in that command's order. A blocked session is
+    # left out of this list but still has a row there, so a client that counted the
+    # entries it received was off by one from that point on.
+    _rowof = {n: i for i, n in enumerate(
+        sorted((f.stem for f in CC_SESSIONS.glob("*.env")), key=lambda n: (n.upper(), n)), 1)}
     running_names = [f.stem for f in env_files if tmux_name(f.stem) in tmux_info]
     captures = _tmux_capture_batch(running_names, 30) if running_names else {}
     # Token cache is refreshed by background job (_refresh_token_cache via scheduler)
@@ -6800,6 +6860,7 @@ def list_sessions() -> list:
         sessions.append({
             "name": name,
             "dir": resolved_dir,
+            "row": _rowof.get(name, 0),
             "desc": cfg.get("CC_DESC", ""),
             "pinned": cfg.get("CC_PINNED", "") == "1",
             "archived": cfg.get("CC_ARCHIVED", "") == "1",
@@ -8736,7 +8797,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
                                     break
                         if n < 3:
                             continue
-                    best_id = payload.get("id", "")
+                    best_id = payload.get("session_id") or payload.get("id", "")
                     best_mtime = mt
                 except Exception:
                     continue
@@ -8750,21 +8811,32 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
             if not _provider_binary_available("codex"):
                 return False, "codex is not installed on this box (binary not found on PATH, ~/.local/bin, /opt/homebrew/bin, or /usr/local/bin)"
             _auto_trust_codex_dir(work_dir)
-            # Resume from stored codex session ID (per amux session), not by cwd
-            codex_session_id = meta.get("codex_session_id", "")
+            # ONE RULE, the same as `amux start` in bin/amux (keep the two equal):
+            #   1. --fresh: a new conversation, and the stored id is dropped.
+            #   2. the newest interactive conversation recorded for this folder
+            #      (3 messages or more), as _find_latest_codex_session finds it.
+            #   3. if there is none, the id stored for this session, when its
+            #      rollout file still exists.
+            # This path used to take the stored id FIRST, so after a /new in the pane,
+            # or a start from the command line, the dashboard resumed an older
+            # conversation than `amux start` did for the same session.
+            _stored_codex = meta.get("codex_session_id", "")
+            codex_session_id = ""
             if fresh:
-                # --fresh: cold-start; drop the stored id so the NEXT plain
-                # start resumes the new conversation, not the abandoned one.
-                codex_session_id = ""
                 meta.pop("codex_session_id", None)
-            if not codex_session_id and not fresh:
-                # SAFETY NET (fix 2026-07-29, mirrors claude's _newest_resumable_uuid):
-                # a lost/corrupted meta must not silently blank a codex session. If this
-                # directory has a prior codex rollout, resume the newest one.
+            else:
                 codex_session_id = _find_latest_codex_session(work_dir)
+                if not codex_session_id and _stored_codex and re.fullmatch(r"[A-Za-z0-9-]+", _stored_codex):
+                    try:
+                        if next((Path.home() / ".codex" / "sessions").rglob(f"*{_stored_codex}.jsonl"), None):
+                            codex_session_id = _stored_codex
+                    except Exception:
+                        pass
                 if codex_session_id:
                     meta["codex_session_id"] = codex_session_id
-                    print(f"[start] {name}: codex fresh-start averted — resuming newest rollout for dir ({codex_session_id})")
+                    print(f"[start] {name}: codex resuming {codex_session_id}")
+                else:
+                    meta.pop("codex_session_id", None)
             _codex_yolo = False
             _codex_flags = flags or ""
             if any(f in _codex_flags for f in _PROVIDER_YOLO_FLAGS):
@@ -17563,7 +17635,9 @@ async function apiCall(url, options) {
     options.headers = _authHeaders(options.headers);
     const r = await fetch(url, options);
     if (!r.ok) {
-      showToast('Error: ' + r.status);
+      let why = '';
+      try { why = ((await r.clone().json()) || {}).error || ''; } catch(e) {}
+      showToast('Error: ' + (why || r.status));
       amuxTrack('api_error', { url: url.split('?')[0], status: r.status, method: options.method || 'GET' });
       return null;
     }
@@ -36255,9 +36329,7 @@ class CCHandler(BaseHTTPRequestHandler):
             from urllib.parse import urlparse as _up
             parsed = _up(origin)
             host = parsed.hostname or ""
-            allowed = host in ("localhost", "127.0.0.1", "0.0.0.0") or \
-                      host == get_lan_ip() or \
-                      host.endswith(".ts.net")
+            allowed = _origin_host_allowed(host)
             if allowed:
                 self.send_header("Access-Control-Allow-Origin", origin)
                 self.send_header("Vary", "Origin")
@@ -36656,7 +36728,10 @@ class CCHandler(BaseHTTPRequestHandler):
 
     def _from_this_user(self) -> bool:
         """True for a same-machine connection whose client end belongs to this
-        server's user (or root). Worked out once per connection."""
+        server's user (or root), asked for under a name of this machine. The owner
+        is worked out once per connection; the name is checked on every request."""
+        if not _host_is_this_machine(self.headers.get("Host", "")):
+            return False
         hit = getattr(self, "_lb_trust", None)
         if hit is None:
             hit = False
@@ -36668,6 +36743,31 @@ class CCHandler(BaseHTTPRequestHandler):
                 hit = False
             self._lb_trust = hit
         return hit
+
+    def _presents_token(self) -> bool:
+        if not AUTH_TOKEN:
+            return False
+        if self.headers.get("Authorization", "") == f"Bearer {AUTH_TOKEN}":
+            return True
+        return parse_qs(urlparse(self.path).query).get("_token", [""])[0] == AUTH_TOKEN
+
+    def _cross_site(self) -> bool:
+        """True when a browser says this request comes from a page of another site.
+        A browser sends such a POST without asking first when the body is plain text,
+        and from the user's own browser it arrives as a same-machine, same-user
+        caller, which needs no token. Same origin, the origins the dashboard may be
+        opened from, and callers with no Origin (curl, the amux CLI, hooks) pass."""
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            return self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site"
+        if origin == "null":
+            return True
+        from urllib.parse import urlparse as _up
+        parsed = _up(origin)
+        mine = {self.headers.get("Host", "").lower(), self.headers.get("X-Forwarded-Host", "").lower()} - {""}
+        if parsed.netloc.lower() in mine:
+            return False
+        return not _origin_host_allowed(parsed.hostname or "")
 
     def _request_has_valid_token(self) -> bool:
         """True if THIS request actually presented valid credentials (localhost, a valid Bearer
@@ -36685,6 +36785,10 @@ class CCHandler(BaseHTTPRequestHandler):
         return False
 
     def _route_inner(self, method: str, path: str, qs: dict):
+
+        # ── Cross-site gate ── a change asked for by a page of another site, without the token
+        if method not in ("GET", "HEAD", "OPTIONS") and self._cross_site() and not self._presents_token():
+            return self._json({"error": "cross-site request refused"}, 403)
 
         # ── Auth gate ──
         if not self._check_auth(method, path):
@@ -39328,6 +39432,10 @@ class CCHandler(BaseHTTPRequestHandler):
                     pass
             if not name:
                 return self._json({"error": "missing name"}, 400)
+            for _lbl, _val in (("a folder path", dir_path), ("a description", body.get("desc", "")),
+                               ("a creator name", body.get("creator", ""))):
+                if _env_unsafe(_val):
+                    return self._json({"error": _lbl + " " + _ENV_UNSAFE_MSG}, 400)
             name = re.sub(r'[^a-zA-Z0-9_-]', '-', name)
             if _is_session_blocked(name):
                 return self._json({
@@ -42363,6 +42471,8 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 # Change directory
                 if "dir" in body:
                     new_dir = body["dir"].strip()
+                    if _env_unsafe(new_dir):
+                        return self._json({"error": "a folder path " + _ENV_UNSAFE_MSG}, 400)
                     old_dir = cfg.get("CC_DIR", "")
                     cfg["CC_DIR"] = new_dir
                     _write_env(env_file, cfg)
@@ -42383,6 +42493,8 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
 
                 # Change description
                 if "desc" in body:
+                    if _env_unsafe(body["desc"]):
+                        return self._json({"error": "a description " + _ENV_UNSAFE_MSG}, 400)
                     cfg["CC_DESC"] = body["desc"].strip()
                     _write_env(env_file, cfg)
                     return self._json({"ok": True, "message": "description updated"})
@@ -42395,12 +42507,16 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
 
                 # Set branch
                 if "branch" in body:
+                    if _env_unsafe(body["branch"]):
+                        return self._json({"error": "a branch name " + _ENV_UNSAFE_MSG}, 400)
                     cfg["CC_BRANCH"] = body["branch"].strip()
                     _write_env(env_file, cfg)
                     return self._json({"ok": True, "message": "branch updated"})
 
                 # Set tags
                 if "tags" in body:
+                    if _env_unsafe(body["tags"]):
+                        return self._json({"error": "tags " + _ENV_UNSAFE_MSG}, 400)
                     cfg["CC_TAGS"] = body["tags"].strip()
                     _write_env(env_file, cfg)
                     return self._json({"ok": True, "message": "tags updated"})

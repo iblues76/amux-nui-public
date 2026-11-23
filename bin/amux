@@ -8,8 +8,8 @@
 
 set -euo pipefail
 
-CC_VERSION="0.9.16"
-CC_RELEASE="0.7.3"   # this repository's release: the VERSION file (tools/selftest checks they agree)
+CC_VERSION="0.9.17"
+CC_RELEASE="0.7.4"   # this repository's release: the VERSION file (tools/selftest checks they agree)
 _RESUME_TARGET=""
 _RESUME_SKIPPED=""
 
@@ -1433,17 +1433,8 @@ cmd_start() {
   load_session "$name"
 
   # One-shot provider override: `amux start <name> --provider codex` (not persisted).
-  local provider_override=""
-  if [[ "${1:-}" == "--provider" && -n "${2:-}" ]]; then
-    validate_provider "$2"
-    provider_override="$2"
-    shift 2
-  elif [[ "${1:-}" == --provider=* ]]; then
-    provider_override="${1#--provider=}"
-    validate_provider "$provider_override"
-    shift
-  fi
-  [[ -n "$provider_override" ]] && CC_PROVIDER="$provider_override"
+  # Read in the loop below, so it works anywhere among the options, like the others.
+  local provider_override="" _prov_next=0
 
   # One-shot fresh start (2026-08-12): `amux start <name> --fresh` skips every
   # provider's auto-resume and cold-starts a NEW conversation. Extracted from
@@ -1453,12 +1444,16 @@ cmd_start() {
   local _fresh=0 _oneshot_full_access=0 _oneshot_sandbox="" _ft _acct_override="" _acct_next=0 _noattach=0
   local _f_rest=() _autoprompt=0 _color_next=0
   for _ft in "$@"; do
+    if (( _prov_next )); then provider_override="$_ft"; _prov_next=0; continue; fi
     if (( _color_next )); then AMUX_COLOR_ONESHOT="$_ft"; _color_next=0; continue; fi
     if (( _acct_next )); then
       _acct_override=$(normalize_account "$_ft"); validate_account "$_acct_override"; _acct_next=0; continue
     fi
     case "$_ft" in
       --fresh) _fresh=1 ;;
+      --provider) _prov_next=1 ;;
+      --provider=*) provider_override="${_ft#--provider=}"
+                    [[ -n "$provider_override" ]] || die "--provider needs a value (one of: $AMUX_PROVIDERS)" ;;
       --no-attach|--detach) _noattach=1 ;;   # start (or leave running) without attaching
       --full-access|--yolo) _oneshot_full_access=1 ;;
       --net-sandbox)  _oneshot_sandbox=net ;;    # one-shot: confine THIS launch (amux-sandbox)
@@ -1471,6 +1466,12 @@ cmd_start() {
       *)       _f_rest+=("$_ft") ;;
     esac
   done
+  (( _prov_next )) && die "--provider needs a value (one of: $AMUX_PROVIDERS)"
+  if [[ -n "$provider_override" ]]; then
+    provider_override=$(normalize_provider "$provider_override")
+    validate_provider "$provider_override"
+    CC_PROVIDER="$provider_override"
+  fi
   (( _acct_next )) && die "--account needs a value (one of: $AMUX_ACCOUNTS)"
   (( _color_next )) && die "--color needs a value (a palette name, #rrggbb, next, auto or none — see: amux color palette)"
   if [[ -n "${AMUX_COLOR_ONESHOT:-}" ]]; then
@@ -1615,33 +1616,63 @@ cmd_start() {
     #     `amux start` resumes.
     #   - substantive only: >=3 message items, mirroring claude's rule, so a
     #     trivial/aborted TUI touch doesn't shadow the real conversation.
+    # ONE RULE, the same as the server's start path in amux-server.py (keep the two
+    # equal): --fresh = a new conversation and the stored id is dropped; else the
+    # newest interactive conversation for the folder; else the id stored in the
+    # state file, when its rollout file still exists.
     local codex_sid=""
-    if (( ! _fresh )); then
-      codex_sid=$(python3 -c '
-import sys, glob, json, os, pathlib
-wd = str(pathlib.Path(sys.argv[1]).expanduser().resolve())
-files = glob.glob(str(pathlib.Path.home()/".codex"/"sessions"/"**"/"*.jsonl"), recursive=True)
-files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
-for f in files:
+    codex_sid=$(python3 - "$dir" "$meta_file" "$_fresh" <<'PYEOF' 2>/dev/null
+import sys, glob, json, os, pathlib, re, tempfile
+wd = str(pathlib.Path(sys.argv[1]).expanduser().resolve()).rstrip("/")
+meta_file, fresh = sys.argv[2], sys.argv[3] == "1"
+root = pathlib.Path.home() / ".codex" / "sessions"
+try:
+    meta = json.load(open(meta_file))
+except Exception:
+    meta = None
+stored = (meta or {}).get("codex_session_id", "")
+sid = ""
+if not fresh:
+    files = glob.glob(str(root / "**" / "rollout-*.jsonl"), recursive=True)
+    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    for f in files:
+        try:
+            with open(f) as fh:
+                payload = json.loads(fh.readline()).get("payload", {})
+                this = payload.get("session_id") or payload.get("id")
+                if payload.get("cwd", "").rstrip("/") != wd or not this:
+                    continue
+                if payload.get("originator") not in (None, "codex-tui"):
+                    continue
+                n = 0
+                for line in fh:
+                    if '"type":"message"' in line:
+                        n += 1
+                        if n >= 3: break
+                if n < 3:
+                    continue
+            sid = this; break
+        except Exception:
+            continue
+    if not sid and stored and re.fullmatch(r"[A-Za-z0-9-]+", stored):
+        if glob.glob(str(root / "**" / ("*%s.jsonl" % stored)), recursive=True):
+            sid = stored
+# Record what this launch resumes (or drop a stale id), only in a state file that exists.
+if meta is not None and stored != sid:
+    if sid:
+        meta["codex_session_id"] = sid
+    else:
+        meta.pop("codex_session_id", None)
     try:
-        with open(f) as fh:
-            payload = json.loads(fh.readline()).get("payload", {})
-            if payload.get("cwd") != wd or not payload.get("session_id"):
-                continue
-            if payload.get("originator") not in (None, "codex-tui"):
-                continue
-            n = 0
-            for line in fh:
-                if "\"type\":\"message\"" in line:
-                    n += 1
-                    if n >= 3: break
-            if n < 3:
-                continue
-        print(payload["session_id"]); break
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(meta_file) or ".", prefix=".meta.")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(meta)); fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, meta_file)
     except Exception:
-        continue
-' "$dir" 2>/dev/null)
-    fi
+        pass
+print(sid)
+PYEOF
+)
     if [[ -n "$codex_sid" ]]; then
       cmd="codex resume $codex_sid"
       echo "  ${DIM}auto-resuming newest codex session ${codex_sid}${RESET}"
@@ -2434,8 +2465,22 @@ cmd_stop() {
 }
 
 cmd_rm() {
-  local name
-  name=$(resolve_session "${1:-}")
+  local name force=0 a rest=()
+  for a in "$@"; do
+    case "$a" in
+      -f|--force) force=1 ;;
+      -*) die "amux rm: unknown option '$a' — usage: amux rm [--force] <name>" ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  (( ${#rest[@]} <= 1 )) || die "amux rm takes one session — to remove several: amux rmnum <n>,<n>"
+  name=$(resolve_session "${rest[0]:-}")
+
+  # A session pinned in the dashboard is one somebody marked to keep. The dashboard
+  # and `amux -H <box> rm` refuse to remove it; so does this, unless --force.
+  if (( ! force )) && ( unset CC_PINNED; load_session "$name" >/dev/null 2>&1; [[ "${CC_PINNED:-}" == "1" ]] ); then
+    die "'$name' is pinned in the dashboard — unpin it there first, or: amux rm --force $name"
+  fi
 
   # Stop if running
   if is_running "$name" 2>/dev/null; then
@@ -2460,14 +2505,15 @@ cmd_rm() {
 # snapshot of the list, and the removals then go by name. Nothing is removed
 # unless every number is valid. Accepts 3,7,9 · 3 7 9 · 4-6 (mixed is fine).
 cmd_rmnum() {
-  local yes=0 specs=() a
+  local yes=0 force=0 specs=() a
   for a in "$@"; do
     case "$a" in
       -y|--yes) yes=1 ;;
+      -f|--force) force=1 ;;
       *) specs+=("$a") ;;
     esac
   done
-  (( ${#specs[@]} )) || die "usage: amux rmnum <n>[,<n>|<a>-<b>...] [-y]   (numbers from amux ls)"
+  (( ${#specs[@]} )) || die "usage: amux rmnum <n>[,<n>|<a>-<b>...] [-y] [--force]   (numbers from amux ls; --force also removes pinned ones)"
 
   local all=() f
   _session_files
@@ -2500,6 +2546,10 @@ cmd_rmnum() {
   local names=() name
   for n in "${sorted[@]}"; do
     name=${all[n-1]}
+    if (( ! force )) && ( unset CC_PINNED; load_session "$name" >/dev/null 2>&1; [[ "${CC_PINNED:-}" == "1" ]] ); then
+      echo "  $n → $name ${YELLOW}(pinned — left alone; --force removes it)${RESET}"
+      continue
+    fi
     names+=("$name")
     if is_running "$name" 2>/dev/null; then
       echo "  $n → $name ${YELLOW}(running — will be stopped)${RESET}"
@@ -2508,6 +2558,7 @@ cmd_rmnum() {
     fi
   done
 
+  (( ${#names[@]} )) || { echo "nothing to remove"; return 0; }
   if (( ! yes )); then
     [[ -t 0 ]] || die "not a terminal — re-run with -y to remove without asking"
     local ans
@@ -2516,7 +2567,7 @@ cmd_rmnum() {
   fi
 
   for name in "${names[@]}"; do
-    ( cmd_rm "$name" )
+    ( cmd_rm --force "$name" )
   done
 }
 
@@ -2888,19 +2939,17 @@ cmd_board() {
       local id="${1:-}"; local new_status="${2:-}";
       [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status>"
       local result
-      result=$(curl -sk -X PATCH \
-        -H 'Content-Type: application/json' \
-        -d "{\"status\":\"$new_status\"}" \
-        "$AMUX_API/api/board/$id")
+      result=$(python3 -c 'import json, sys; print(json.dumps({"status": sys.argv[1]}))' "$new_status" \
+        | curl -sk -X PATCH -H 'Content-Type: application/json' --data-binary @- "$AMUX_API/api/board/$id")
       echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'→',d['status'])" 2>/dev/null || echo "$result"
       ;;
     add|create)
       local title="$*"; [[ -n "$title" ]] || die "Usage: amux board add <title>"
       local result
-      result=$(curl -sk -X POST \
-        -H 'Content-Type: application/json' \
-        -d "{\"title\":\"$title\",\"status\":\"todo\"}" \
-        "$AMUX_API/api/board")
+      # The body is built by a JSON encoder: a title with a quote or a backslash in it
+      # used to produce a broken request.
+      result=$(python3 -c 'import json, sys; print(json.dumps({"title": sys.argv[1], "status": "todo"}))' "$title" \
+        | curl -sk -X POST -H 'Content-Type: application/json' --data-binary @- "$AMUX_API/api/board")
       echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Created',d['id'],'→',d['title'])" 2>/dev/null || echo "$result"
       ;;
     import)
@@ -3545,7 +3594,8 @@ ${BOLD}Key commands:${RESET}
 
 ${BOLD}Sessions:${RESET}
   amux register <name> --provider <p> [--account P|T|X] [flags]   Register without starting
-  amux rm <name>                 Remove a session: stops it, removes its registration and state file
+  amux rm [--force] <name>       Remove a session: stops it, removes its registration and state file
+                                 (a session pinned in the dashboard needs --force)
   amux rmnum <n,n,a-b> [-y]      Remove several by amux ls row number (resolved to names first; asks y/N)
   amux search [<box,box>|--corefleet|--mainfleet|--fleetall] [--providers p,p] [--in chat,files,name] [-w] ("text" | -e t -e t | --prompt)
                                  Which sessions talked about / contain "text" (+ session-less dirs); several -e terms rank by co-occurrence; all options: amux-search -h
@@ -3629,7 +3679,9 @@ ${BOLD}Another box (remote):${RESET}
   ends at once). ${BOLD}ls${RESET} there marks a session * only while its agent is alive (here: while
   its tmux session exists, even if the agent has exited to a shell). peek shows 30 lines
   on both sides; rm removes the registration and its state file on both sides, and the
-  server also deletes the session's memory file and log.
+  server also deletes the session's memory file and log. A session pinned in the
+  dashboard is refused by rm on both sides (here: amux rm --force). A codex session
+  resumes the same conversation whoever starts it. Row numbers are that box's own.
 EOF
     ;;
     pick) cat <<EOF
@@ -3671,7 +3723,8 @@ ${BOLD}Providers — which agent a session runs:${RESET}
                         (codex-tui) rollout for the dir, >=3
                         messages; 'codex exec' worker rollouts
                         (e.g. Claude-orchestrated runs in the
-                        same dir) are never picked
+                        same dir) are never picked; with none,
+                        the conversation kept in the state file
   gemini     gemini     --session-id minted at first start,       auto              --yolo
                         --resume <id> after (id lives in meta)
   opencode   opencode   -s <id>; id captured to meta; falls       first LOCAL       --auto

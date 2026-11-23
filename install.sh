@@ -2,8 +2,8 @@
 # install.sh — install amux (this repo's modified build) and its companion commands.
 #
 #   ./install.sh                  install or update everything into ~/.local/bin
-#   ./install.sh --client         companions + amux-remote only (drive other machines,
-#                                 run no sessions here)
+#   ./install.sh --client         amux and the companions, without the dashboard server
+#                                 (drive other machines from here; nothing is served here)
 #   ./install.sh --statusline     also set up the amux status line in Claude Code
 #                                 (backs up ~/.claude/settings.json; see docs/statusline.md)
 #   ./install.sh --uninstall      remove the symlinks we created (core copies stay)
@@ -105,7 +105,7 @@ mkdir -p "$BIN"
 # ── core ─────────────────────────────────────────────────────────────────────
 core_changed=0
 if [ "$CORE_SKIP" = 1 ]; then
-  echo "core: skipped (client-only role)"
+  echo "core: no dashboard server (client-only role); amux and amux-remote are linked below"
 else
   SUDO=""
   if [ ! -d "$CORE_BINDIR" ] && ! mkdir -p "$CORE_BINDIR" 2>/dev/null; then
@@ -137,10 +137,16 @@ for f in "$here"/bin/*; do
   [ -f "$f" ] || continue
   b="$(basename "$f")"
   if is_core "$b"; then
-    # amux-remote doubles as the client tool: on a client-only install (or when
-    # the core lives elsewhere) it is symlinked like any companion.
-    [ "$b" = amux-remote ] || continue
-    if [ "$CORE_SKIP" = 0 ] && [ "$CORE_BINDIR" = "$BIN" ]; then continue; fi
+    case "$b" in
+      # amux-remote doubles as the client tool: on a client-only install (or when
+      # the core lives elsewhere) it is symlinked like any companion.
+      amux-remote) if [ "$CORE_SKIP" = 0 ] && [ "$CORE_BINDIR" = "$BIN" ]; then continue; fi ;;
+      # A client-only install gets amux itself too: `amux -H <machine>`, `amux -A`,
+      # `amux up` and `amux search` are all subcommands of it. Only the dashboard
+      # server stays out.
+      amux)        [ "$CORE_SKIP" = 1 ] || continue ;;
+      *)           continue ;;
+    esac
   fi
   chmod +x "$f"
   ln -sf "$f" "$BIN/$b"
