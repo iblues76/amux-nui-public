@@ -20,6 +20,9 @@
 #   7c. amux search finds a project by content and ends with the --agentic tip;
 #       -e ranks by co-occurrence, skips injected text, --show, groups, | head
 #   7d. amux color: pin, hex, automatic, the tab sequence, the status line square
+#   7e. sessions by name (amux search --sessions) against a fake second machine, and
+#       the command-line fixes of 0.7.3: one row order everywhere, option checks,
+#       re-register keeps a session, rename/rm/start-all, same-user dashboard access
 #   8. the audit catches a planted secret
 #
 # Usage:
@@ -489,7 +492,7 @@ fi
 printf 'y\n' | run amux-config remove remotebox
 
 # ── 6. renderer parity ───────────────────────────────────────────────────────
-sect "6. Local and remote views come from one renderer"
+sect "6. amux-ls draws rows the way amux ls numbers them"
 FIX='[{"name":"alpha","running":true,"active_model":"claude-opus-5","dir":"/home/u/a","archived":false},
      {"name":"beta","running":false,"active_model":"claude-sonnet-5","dir":"/home/u/b","archived":false}]'
 loc=$(printf '%s' "$FIX" | AMUX_LS_LABEL=host AMUX_LS_KIND=local  AMUX_LS_COMPACT=1 AMUX_LS_BARE=1 python3 lib/amux-render.py 2>&1)
@@ -498,6 +501,13 @@ if [ "$loc" = "$rem" ] && [ -n "$loc" ]; then
   ok "identical data renders identically local vs remote"
 else
   bad "local and remote renders differ" "local=[$loc] remote=[$rem]"
+fi
+ORD='[{"name":"beta","provider":"codex"},{"name":"Zed","provider":"claude","account":"team"},{"name":"x-y"},{"name":"x"},{"name":"alpha","archived":true}]'
+o=$(printf '%s' "$ORD" | AMUX_LS_BARE=1 AMUX_LS_COMPACT=1 COLUMNS=200 python3 lib/amux-render.py 2>&1 | tr -s ' ')
+if has "2 ○ cx:beta 3 ○ P:cc:x 4 ○ P:cc:x-y 5 ○ T:cc:Zed" "$o"; then
+  ok "rows are sorted and tagged like amux ls; a hidden archived row keeps its number"
+else
+  bad "amux-ls row order / tags / numbers" "$o"
 fi
 
 o=$(printf '%s' "$FIX" | AMUX_LS_BARE=1 AMUX_LS_COMPACT=1 AMUX_LS_ASCII=1 python3 lib/amux-render.py 2>&1)
@@ -524,6 +534,13 @@ sect "7. Bundled amux (dummy session, never launched)"
 want=$(sed -n 's/^CC_VERSION="\(.*\)"$/\1/p' bin/amux | head -1)
 o=$(out_of "$BINDIR/amux" --version)
 if has "amux v$want" "$o"; then ok "installed amux reports v$want"; else bad "amux --version" "$o"; fi
+rel=$(tr -d ' \n' < VERSION)
+if has "amux-nui-public release $rel" "$o" && has "**Version $rel**" "$(sed -n '1,12p' README.md)" \
+   && has "## $rel " "$(sed -n '1,8p' CHANGELOG.md)"; then
+  ok "amux version, VERSION, README and CHANGELOG agree on release $rel"
+else
+  bad "release number differs between amux version, VERSION, README or CHANGELOG" "$o"
+fi
 
 o=$(out_of "$BINDIR/amux" --help)
 if has "Accounts" "$o" || has "--account" "$o"; then ok "amux --help renders"; else bad "amux --help" "$(printf '%s' "$o" | head -5)"; fi
@@ -628,6 +645,10 @@ rm -rf "$HOME/.claude"
 
 # ── 7c. amux search ──────────────────────────────────────────────────────────
 sect "7c. amux search"
+# amux search greps with ripgrep, and where there is no rg it runs Claude Code's own
+# binary as one. The stand-in `claude` from section 5b must not be taken for it
+# (on a machine without rg every file search here then found nothing).
+rm -f "$MOCKBIN/claude"
 mkdir -p "$HOME/claudecode/searchproj"
 printf 'notes about zebrafinch42\n' > "$HOME/claudecode/searchproj/notes.txt"
 o=$(cd "$SANDBOX" && PATH="$BINDIR:$PATH" "$BINDIR/amux" search zebrafinch42 2>&1 | plain)
@@ -728,6 +749,181 @@ else
   o=$("$BINDIR/amux-sandbox" check codex full 2>&1)
   [ -n "$o" ] && ok "no sandbox support here, and amux-sandbox says why ($o)" || bad "check failed silently"
 fi
+
+# ── 7e. sessions by name + the 0.7.3 command-line fixes ───────────────────────
+sect "7e. Sessions by name, one row order, option checks"
+E="$SANDBOX/e"; mkdir -p "$E/d1" "$E/d2" "$E/shared" "$E/mock"
+E=$(cd "$E" && pwd)   # as amux stores a folder (macOS's TMPDIR ends in a slash)
+A() { PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux" "$@" 2>&1 | plain; }
+S="$CC_HOME/sessions"
+# Is setting $2 present in session $1's registration? Loaded the way amux loads it;
+# the value is never printed.
+isset() { ( set +u; CC_DESC= CC_PINNED= CC_ITERM2_SESSION_ID=; . "$S/$1.env" 2>/dev/null; eval "v=\$$2"; [ -n "$v" ] ); }
+rownum() { A ls | awk -v n="$1" '{x=$2; sub(/^.*:/,"",x); if (x==n) print $1+0}'; }
+
+# option checks
+o=$(A register e1 --provider claude --strict-mcp-config --model opus --dir "$E/d1")
+has "flags: --strict-mcp-config --model opus" "$o" && ok "--strict-mcp-config no longer swallows the next option" || bad "--strict-mcp-config" "$o"
+o=$(A register e2 --provider claude --model)
+has "--model needs a value" "$o" && ! has "unbound variable" "$o" && ok "an option without its value is a message, not a crash" || bad "missing value" "$o"
+o=$(A register e2 --provider claude --dir)
+has "--dir needs a path" "$o" && ok "--dir without a path is a message" || bad "--dir without a path" "$o"
+o=$(A register e2 --provider claude opus)
+has "register does not know 'opus'" "$o" && ok "register refuses what it cannot store" || bad "register stray word" "$o"
+o=$(A register e2 --provider claude --desc hi)
+has "amux -H <box> exec" "$o" && ! has "e2" "$(A ls)" && ok "--desc is refused here (it belongs to -H exec); nothing written" || bad "--desc locally" "$o"
+
+# re-register keeps the session
+printf 'CC_DESC="from the dashboard"\nCC_PINNED="1"\n' >> "$S/e1.env"
+o=$(cd "$E/d2" && A register e1 --model sonnet)
+i=$(A info e1)
+has "dir:   $E/d1" "$i" && has "folder kept as registered" "$o" && ok "re-register without --dir keeps the folder, and says so" || bad "folder not kept" "$o / $i"
+isset e1 CC_DESC && isset e1 CC_PINNED && ok "the dashboard's description and pin survive a re-register" || bad "description or pin lost"
+( cd "$E/d2" && A register e1 --pwd >/dev/null )
+has "dir:   $E/d2" "$(A info e1)" && ok "--pwd moves the session" || bad "--pwd did not move it" "$(A info e1)"
+printf 'CC_ITERM2_SESSION_ID="w0t0p0:ABC"\n' >> "$S/e1.env"
+A register e1 --provider codex >/dev/null
+isset e1 CC_ITERM2_SESSION_ID && bad "a stale iTerm2 pane id survived a change of agent" || ok "a pane id is dropped when the agent is no longer iterm2"
+A register e1 --provider claude --dir "$E/d1" >/dev/null
+
+# ls arguments, info, peek
+o=$(A ls --bogus);  has "unknown ls option: --bogus" "$o" && ok "amux ls refuses an unknown option" || bad "ls --bogus" "$o"
+o=$(A ls zz);       has "amux search --sessions zz" "$o" && ok "amux ls <text> points to search --sessions" || bad "ls zz" "$o"
+o=$(A ls -c --bare); has "e1" "$o" && ! has " sessions " "$o" && ok "amux ls -c --bare drops the banner" || bad "ls -c --bare" "$o"
+printf 'CC_NAME="legacy"\nCC_DIR="%s"\n' "$E/d1" > "$S/legacy.env"
+o=$(A info legacy); has "provider: claude" "$o" && ! has "unbound variable" "$o" && ok "amux info reads a registration with no provider line" || bad "info legacy" "$o"
+o=$(A peek e1 abc); has "lines is a number" "$o" && ok "amux peek refuses a line count that is not a number" || bad "peek abc" "$o"
+
+# one rename
+for n in Zeta alpha x-y x; do A register "$n" --provider codex --dir "$E/shared" >/dev/null; done
+want=$(A ls | awk '$1 ~ /^2\*?$/ {x=$2; sub(/^.*:/,"",x); print x}')
+o=$(PATH="$E/mock:$BINDIR:$PATH" LC_ALL=C "$BINDIR/amux-rename" -n 2 fresh 2>&1 | plain)
+[ -n "$want" ] && has "rename $want " "$o" && ok "amux-rename <row> means the row amux ls shows ($want)" || bad "amux-rename row number" "ls row 2 = $want; $o"
+o=$(A rename alpha a.b);  has "invalid new name" "$o" && ok "rename refuses a name register would refuse" || bad "rename a.b" "$o"
+printf '{"gemini_session_id":"g1","cc_session_name":"alpha"}' > "$S/alpha.meta.json"
+mkdir -p "$CC_HOME/origins" "$CC_HOME/memory" "$CC_HOME/logs"
+echo o > "$CC_HOME/origins/alpha"; echo m > "$CC_HOME/memory/alpha.md"; echo l > "$CC_HOME/logs/alpha.log"
+o=$(A rename -n alpha gamma9); has "origin, memory, log" "$o" && [ -f "$S/alpha.meta.json" ] && ok "amux rename -n shows the plan and changes nothing" || bad "rename -n" "$o"
+o=$(A rename alpha gamma9)
+has "renamed alpha" "$o" && [ -f "$S/gamma9.meta.json" ] && [ ! -f "$S/alpha.meta.json" ] && [ -f "$CC_HOME/memory/gamma9.md" ] \
+  && [ -f "$CC_HOME/origins/gamma9" ] && [ -f "$CC_HOME/logs/gamma9.log" ] \
+  && ok "amux rename moves the registration, state file, origin, memory and log together" || bad "amux rename" "$o"
+( set +u; . "$S/gamma9.env"; [ "$CC_NAME" = gamma9 ] ) && ok "…and rewrites the name inside the registration" || bad "name inside the registration"
+
+# rm, start-all, amux up, amux-tabs
+o=$(printf 'y\n' | A rm gamma9)
+[ ! -f "$S/gamma9.meta.json" ] && [ ! -e "$CC_HOME/origins/gamma9" ] && [ -f "$CC_HOME/memory/gamma9.md" ] \
+  && ok "amux rm removes the state file and origin record, and leaves the memory file" || bad "amux rm" "$o"
+: > "$TMUX_LOG"
+o=$(A start-all </dev/null)
+tried=1; for n in Zeta x-y x; do { has "$n" "$o"; } || tried=0; done
+[ "$tried" = 1 ] && ! has "attach-session" "$(out_of sed -n '1,400p' "$TMUX_LOG")" \
+  && ok "amux start-all goes through every session and attaches to none" || bad "amux start-all" "$o"
+o=$(PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux-up" x 2>&1 </dev/null | plain)
+! has "is not a local session" "$o" && ok "amux up <name> finds a session on this machine" || bad "amux up local" "$o"
+o=$(PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux-up" nosuchsession 2>&1 </dev/null | plain)
+has "is not a local session" "$o" && ok "an unknown name still gets the hint" || bad "amux up unknown" "$o"
+o=$(PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux-tabs" --dry-run --all 2>&1 | plain)
+has "amux start x-y" "$o" && has "amux start Zeta" "$o" && ! has "ssh -t" "$o" \
+  && ok "amux-tabs --all reads names without the account/agent tag" || bad "amux-tabs --all" "$o"
+
+# one codex default
+cdef=$(sed -n 's/^CC_CODEX_DEFAULT_MODEL="\([^"]*\)".*/\1/p' bin/amux)
+sdef=$(sed -n 's/^CODEX_DEFAULT_MODEL = "\([^"]*\)"$/\1/p' bin/amux-server.py)
+A register cxd --provider claude --dir "$E/d1" --model opus >/dev/null
+o=$(A provider cxd codex)
+[ -n "$cdef" ] && [ "$cdef" = "$sdef" ] && has "--model $cdef" "$o" \
+  && ok "one codex default: amux start, amux provider and the server agree ($cdef)" || bad "codex default differs" "amux=$cdef server=$sdef; $o"
+
+# the dashboard trusts a same-machine caller only when it is this user (or root)
+o=$(python3 - bin/amux-server.py <<'PYT' 2>&1
+import os, sys, tempfile
+src = open(sys.argv[1], encoding="utf-8").read()
+ns = {"os": os}
+exec(src[src.index("_PROC_TCP = {False"):src.index("# The codex model when a session names none.")], ns)
+trusted, me = ns["_loopback_trusted"], os.getuid()
+def table(uid, st="01"):
+    f = tempfile.NamedTemporaryFile("w", delete=False, suffix=".tcp")
+    f.write("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+    f.write("   0: 0100007F:2276 0100007F:C001 01 00000000:00000000 00:00000000 00000000 %5d        0 1 1 0 20 4 30 10 -1\n" % me)
+    f.write("   1: 0100007F:C001 0100007F:2276 %s 00000000:00000000 00:00000000 00000000 %5d        0 2 1 0 20 4 30 10 -1\n" % (st, uid))
+    f.close(); return f.name
+r = [trusted("127.0.0.1", 0xC001, 8822, table(me)), trusted("127.0.0.1", 0xC001, 8822, table(0)),
+     trusted("127.0.0.1", 0xC001, 8822, table(me + 4242)), trusted("127.0.0.1", 0xC001, 8822, table(0, "06")),
+     trusted("127.0.0.1", 0xC002, 8822, table(me)), trusted("127.0.0.1", 0xC001, 8822, "/nonexistent/tcp")]
+print("verdicts", r)
+PYT
+)
+has "verdicts [True, True, False, False, False, True]" "$o" \
+  && ok "a same-machine request skips the token for this user or root only" || bad "same-user dashboard rule" "$o"
+
+# a machine that is down names the cause; a second machine for --sessions
+cat > "$E/mock/curl" <<'SH'
+#!/usr/bin/env bash
+url=""; for a in "$@"; do case "$a" in http://*|https://*) url="$a" ;; esac; done
+case "$url" in
+  *boxa.test*/api/sessions) printf '%s' '[{"name":"zebra-notes","provider":"codex","account":"","running":true,"dir":"/home/u/zebra","flags":"--model gpt-x --dangerously-skip-permissions","preview":"last line here"},{"name":"Alpha","provider":"claude","account":"team","running":false,"dir":"/home/u/a","flags":""},{"name":"my-ZEBRA-2","provider":"claude","account":"personal","running":false,"dir":"/home/u/b","flags":"--model opus"}]' ;;
+  *boxb.test*/api/sessions) printf '[]' ;;
+  *boxdown.test*) exit 7 ;;
+  *) printf '{}' ;;
+esac
+SH
+chmod +x "$E/mock/curl"
+for b in boxa boxb boxdown; do printf '%s' "$FAKE_TOKEN" | run amux-config add "$b" --host "$b.test" --token-stdin; done
+R() { PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux-remote" "$@" 2>&1 | plain; }
+o=$(R boxdown provider x); has "connection refused" "$o" && ! has "could not parse" "$o" && ok "a machine that is down: provider names the cause" || bad "provider on a dead box" "$o"
+o=$(R boxdown curl /api/sessions); has "connection refused" "$o" && ok "…and so does curl" || bad "curl on a dead box" "$o"
+o=$(R rm x); has "a box is required first" "$o" && ok "a forgotten machine name gets the hint for every verb" || bad "amux-remote rm x" "$o"
+
+# search: rows, the hint, shared folders
+for n in paris-old paris-new; do A register "$n" --provider claude --dir "$E/shared" >/dev/null; done
+o=$(A search --in name --no-orphans paris)
+has "paris-old" "$o" && has "paris-new" "$o" && ok "search --in name finds sessions that share a folder" || bad "shared folder" "$o"
+row=$(printf '%s\n' "$(A search --in name --no-orphans Zeta)" | awk '$2=="Zeta"{print $1}')
+[ -n "$row" ] && [ "$row" = "$(rownum Zeta)" ] && ok "a search row number is the amux ls row ($row)" || bad "search row vs ls row" "search=$row ls=$(rownum Zeta)"
+o=$(A search --in name --no-orphans Zeta)
+has "amux pick <box> --sessionid <row>" "$o" && ! has "attach <row>" "$o" && ok "the hint for another machine names a command that exists" || bad "open hint" "$o"
+o=$(A search -c hello); has "amux search --continue" "$o" && ok "search -c alone says it now means compact" || bad "search -c" "$o"
+
+# sessions by name
+A register zebra-local --provider claude --dir "$E/d1" --model opus >/dev/null
+A register ZEBRA-caps  --provider codex  --dir "$E/d2" >/dev/null
+o=$(A search --sessions zebra); rc=0; PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux" search --sessions zebra >/dev/null 2>&1 || rc=$?
+[ "$rc" = 0 ] && has "zebra-local" "$o" && has "ZEBRA-caps" "$o" && has "zebra-notes" "$o" && has "my-ZEBRA-2" "$o" && ! has "Alpha" "$o" \
+  && ok "--sessions lists matching names on this machine and the other, case ignored" || bad "--sessions" "$o"
+first=$(printf '%s\n' "$o" | grep '▸' | head -1)
+has "(local)" "$first" && has "▸ boxa" "$o" && ok "one block per machine, this machine first" || bad "blocks" "$o"
+has "no match: boxb" "$o" && has "offline:  boxdown (its amux server is not running)" "$o" \
+  && ok "machines with no match or no answer are named on one line each" || bad "no match / offline lines" "$o"
+lsline=$(A ls | grep 'zebra-local')
+has "$lsline" "$o" && ok "this machine's rows are amux ls rows, unchanged" || bad "local row differs from amux ls" "$lsline"
+has " 3*   cx:zebra-notes      /home/u/zebra YOLO gpt-x │ last line here" "$o" && has " 2  P:cc:my-ZEBRA-2       /home/u/b opus" "$o" \
+  && ok "another machine's rows are drawn like amux ls rows, numbered by that machine's order" || bad "remote rows" "$o"
+o=$(COLUMNS=200 A search --sessions -c zebra)
+has "● cx:zebra-notes" "$o" && has "○ P:cc:my-ZEBRA-2" "$o" && has "$(rownum zebra-local) ○ P:cc:zebra-local" "$o" \
+  && ok "-c prints the compact grid with the amux ls row numbers" || bad "--sessions -c" "$o"
+o=$(A search --sessions -s zebra); has "zebra-local" "$o" && ! has "ZEBRA-caps" "$o" && ! has "my-ZEBRA-2" "$o" && ok "-s matches case exactly" || bad "-s" "$o"
+o=$(A search --sessions --matchstring start zebra); has "zebra-notes" "$o" && ! has "my-ZEBRA-2" "$o" && ok "--matchstring start" || bad "--matchstring start" "$o"
+o=$(A search --sessions --matchstring end 2); has "my-ZEBRA-2" "$o" && ! has "zebra-notes" "$o" && ok "--matchstring end" || bad "--matchstring end" "$o"
+o=$(A search --sessions --regex '^zebra-[a-z]+$' boxa); has "zebra-notes" "$o" && ! has "zebra-local" "$o" && ! has "my-ZEBRA-2" "$o" && ok "--regex, with a machine list" || bad "--regex" "$o"
+o=$(A search --sessions --local zebra); has "zebra-local" "$o" && ! has "zebra-notes" "$o" && ok "--local looks at this machine only" || bad "--local" "$o"
+rc=0; PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux" search --sessions nosuchname >/dev/null 2>&1 || rc=$?
+o=$(A search --sessions nosuchname); [ "$rc" = 1 ] && has "no session name matches 'nosuchname'" "$o" && ok "nothing matched: it says so and exits 1" || bad "no match" "rc=$rc $o"
+o=$(A search --sessions --regex x --matchstring start); has "cannot be combined" "$o" && ok "--regex with --matchstring is refused" || bad "--regex + --matchstring" "$o"
+o=$(A search --sessions --regex '('); has "not a valid regular expression" "$o" && ok "a bad regular expression is reported" || bad "bad regex" "$o"
+o=$(A search --sessions --in name x); has "does not apply" "$o" && ok "options of the other search modes are refused with --sessions" || bad "--sessions --in" "$o"
+
+# completion offers what works where it is typed
+"$BINDIR/amux" completion bash > "$E/comp.bash" 2>/dev/null
+o=$(bash -c '. "$1" 2>/dev/null
+  c() { COMP_WORDS=("$@"); COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 )); COMPREPLY=(); _amux_complete; printf "%s => %s\n" "${COMP_WORDS[*]}" "${COMPREPLY[*]}"; }
+  c amux start x --; c amux -H box start x --; c amux register x --; c amux -H box exec x --; c amux search --' _ "$E/comp.bash" 2>&1)
+l1=$(printf '%s\n' "$o" | sed -n 1p); l2=$(printf '%s\n' "$o" | sed -n 2p); l3=$(printf '%s\n' "$o" | sed -n 3p)
+l4=$(printf '%s\n' "$o" | sed -n 4p); l5=$(printf '%s\n' "$o" | sed -n 5p)
+! has "--mosh" "$l1" && has "--mosh" "$l2" && ! has "--desc" "$l3" && has "--worktree" "$l4" && has "--sessions" "$l5" && has "--continue" "$l5" \
+  && ok "completion: attach lanes and --desc only after -H; search offers --sessions and --continue" || bad "completion" "$o"
+
+for b in boxa boxb boxdown; do printf 'y\n' | run amux-config remove "$b"; done
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"

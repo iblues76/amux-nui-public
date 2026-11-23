@@ -6,7 +6,8 @@
 # session `amux-<name>` (the same test amux itself uses). Those are the `○`
 # entries in `amux ls -c` / the ones with no `*` in `amux ls`.
 #
-# Removal is `amux rm <name>`, which only deletes the registration (.env).
+# Removal is `amux rm <name>`, which deletes the registration (.env) and the
+# session's state file (.meta.json); its memory file and pane log stay.
 # The Claude/Codex conversation lives in the session's DIRECTORY, not its name,
 # so re-registering the same name+dir later auto-resumes it — this is not a
 # data-destroying operation, but it IS unrecoverable as a *list* (the flags,

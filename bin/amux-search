@@ -14,8 +14,10 @@ Usage:
   amux search --show <box> <row|dir> -e t    what one session said around the terms
   amux search --agentic "question" [--provider claude|codex|opencode] [--model m] [--effort e] [--account P|T|X]
                                              an agent runs the literal searches for you (below)
-  amux search -c "follow-up"                 reply to the last agentic answer (same agent, scope, memory)
-  amux search -c                             …typing the reply at a prompt
+  amux search --continue "follow-up"         reply to the last agentic answer (same agent, scope, memory)
+  amux search --continue                     …typing the reply at a prompt
+  amux search --sessions "text"              sessions whose NAME contains the text, on every machine,
+                                             listed like `amux ls` (see Sessions by name)
 
 Box groups (literal default: this box; agentic default: --corefleet):
   --corefleet          the CORE boxes
@@ -43,6 +45,26 @@ Options:
   -t SEC               per-box time budget (default 45)
   -h, --help           this help
 
+Sessions by name (--sessions): lists the sessions whose name matches, one block per
+machine, each row as `amux ls` prints it (row number, running mark, agent, folder,
+last line). It reads names only: no transcripts, no files.
+  amux search --sessions "text"              on this machine and every configured one
+  amux search --sessions -c "text"           the same as a compact grid, like `amux ls -c`
+  amux search --sessions <box,box> "text"    only those machines ('local' = this one)
+  amux search --sessions --regex 'pattern' [<box,box>]
+  --local              this machine only (--corefleet / --mainfleet pick a group)
+  --matchstring start|anywhere|end
+                       where a plain text must sit in the name (default: anywhere)
+  --regex PATTERN      a regular expression instead of a text, searched in the name
+                       (write ^ and $ yourself; not combinable with --matchstring)
+  -c, --compact        the grid of `amux ls -c` instead of full rows
+  -s, --case-sensitive match case exactly (default: ignored)
+  -t SEC               how long one machine may take to answer (default 15)
+This machine is read with its own `amux ls`; every other machine is asked through
+its amux server (the route `amux -A` uses), so a machine whose server is down is
+listed as offline. A row number is the one that machine's `amux ls` shows.
+Exit status: 0 = something matched, 1 = nothing did.
+
 Agentic mode (--agentic): a quick literal look at the question's keywords prints
 first (seconds), then a headless agent runs more literal searches (synonyms,
 file names, --in scopes), reads what the matching sessions said, and returns the
@@ -51,8 +73,9 @@ Scope is --corefleet by default; the agent widens to --mainfleet / --fleetall on
 when core has nothing. A box list or --mainfleet / --fleetall sets the scope,
 --local means this box only. --providers / --in / -t / --since pass through. If the
 agent runs out of time (10 min) you get what it had found, not nothing.
-  -c, --continue       follow up on the last agentic answer; the agent keeps its memory
+  --continue           follow up on the last agentic answer; the agent keeps its memory
                        and settings (stored in ~/.amux/search-last.json). No text = prompt
+                       (it was also -c before 0.7.3; -c now means compact, for --sessions)
   --local              this box only
   --provider p         which agent does the searching: claude (default), codex, opencode (experimental)
                        (--providers p,p — plural — still filters which SESSIONS are scanned)
@@ -72,7 +95,7 @@ refreshed per transcript when it changes.
 Output: one block per box as each box answers, one line per hit:
   <row>  <session>  <provider>  <dir>  chat×N files×N name   [term×N term×N · all in N]
        ↳ snippet
-then `amux -H <box> attach <row>` (or `amux <row>` locally) opens it.
+then `amux <row>` opens it on this box, `amux pick <box> --sessionid <row>` on another.
 """
 import concurrent.futures as cf
 import glob
@@ -141,18 +164,30 @@ def read_keys(path, keys):
     return out
 
 
-def registered_sessions():
-    """Sessions in `amux ls` row order. The order comes from bash's own glob, the
-    same expansion resolve_session() uses, so row numbers match on every box."""
-    if not os.path.isdir(SESSIONS):
+def ls_key(name):
+    """Sort key of an `amux ls` row: case-insensitive like `LC_ALL=C sort -f` (upper-fold,
+    ties byte-wise). amux (_session_files) and amux-remote's ls use the same key, so
+    row N is the same session in every numbered view."""
+    return (name.upper(), name)
+
+
+def session_names():
+    """Registered session names in `amux ls` row order."""
+    try:
+        names = [fn[:-4] for fn in os.listdir(SESSIONS)
+                 if fn.endswith(".env") and not fn.startswith(".") and os.path.isfile(SESSIONS + "/" + fn)]
+    except OSError:
         return []
-    r = subprocess.run(
-        ["bash", "-c", 'for f in "$1"/*.env; do [ -f "$f" ] && echo "${f##*/}"; done', "_", SESSIONS],
-        capture_output=True, text=True)
+    return sorted(names, key=ls_key)
+
+
+def registered_sessions():
+    """Sessions in `amux ls` row order. (The order once came from a bare shell glob,
+    which is byte or locale order, not the sorted order `amux ls` uses: a row
+    printed here could be another session there.)"""
     out = []
-    for i, fn in enumerate(l for l in r.stdout.splitlines() if l):
-        name = fn[:-4]
-        kv = read_keys(SESSIONS + "/" + fn, ("CC_DIR", "CC_PROVIDER"))
+    for i, name in enumerate(session_names()):
+        kv = read_keys(SESSIONS + "/" + name + ".env", ("CC_DIR", "CC_PROVIDER"))
         d = kv.get("CC_DIR") or ""
         out.append({"row": i + 1, "name": name, "provider": kv.get("CC_PROVIDER") or "claude",
                     "dir": os.path.realpath(os.path.expanduser(d)) if d else ""})
@@ -557,11 +592,28 @@ def search_local(req):
                 c["_chat_snip"] = True
 
     if "name" in kinds:
-        for d, c in cands.items():
-            found = {t: 1 for t in terms
-                     if any(next(occurrences(x or "", t, cs), None) for x in (c["name"], c["provider"], c["dir"]))}
+        def named(fields):
+            return {t: 1 for t in terms
+                    if any(next(occurrences(x or "", t, cs), None) for x in fields)}
+        for d, c in list(cands.items()):
+            found = named((c["name"], c["provider"], c["dir"]))
             if found:
                 bump(d, "name", 1, "", found)
+        # A session that shares its folder with an earlier row is not a candidate of
+        # its own (the first row stands for the folder), so its NAME was never
+        # looked at: `--in name paris` found nothing when paris-x lived in a folder
+        # another session also used. Such a session gets its own name-only hit.
+        for sess in regs:
+            if provs and sess["provider"] not in provs:
+                continue
+            rep_ = cands.get(sess["dir"] or ("<nodir>:" + sess["name"]))
+            if rep_ is not None and rep_.get("name") == sess["name"]:
+                continue  # it is the row that stands for its folder
+            found = named((sess["name"], sess["provider"]))
+            if found:
+                key = "<shared>:" + sess["name"]
+                cands[key] = dict(sess, hits={}, snip="", tc={}, cooc=0, allin=0, newest=0)
+                bump(key, "name", 1, "", found)
 
     if "files" in kinds and dirs:
         for f in grep_files(dirs, terms, cs):
@@ -1002,7 +1054,7 @@ def search_remote(label, ladder, req, budget):
 
 # ───────────────────────────── agentic ─────────────────────────────
 
-LAST = CC_HOME + "/search-last.json"  # the previous agentic run, for -c / --continue
+LAST = CC_HOME + "/search-last.json"  # the previous agentic run, for --continue
 
 RESULT_SCHEMA = {
     "type": "object",
@@ -1446,6 +1498,13 @@ def agentic_search(q, run, resume=None, evidence=""):
     return res, bool(sid), note
 
 
+# How to open a hit. A row number only works where that row was counted: `amux <row>`
+# on this box, `amux pick <box> --sessionid <row>` on another (it reads that box's
+# `ls -c`). `amux -H <box> attach` takes a NAME, not a row number.
+OPEN_HINT = ("%sopen one: amux <row> (this box) · amux pick <box> --sessionid <row> (another box) · "
+             "session-less dir: amux exec <name> --provider <p> --dir <dir>%s")
+
+
 def plain(s):
     """Strip the markdown an agent slips into prose meant for a terminal."""
     s = re.sub(r"\*\*|__|`", "", s or "")
@@ -1459,7 +1518,7 @@ def render_agentic(res, q, can_reply, note=""):
     if res is None:
         print("%sno ranked answer — the quick look above is the best literal answer%s" % (k["D"], k["X"]))
         if can_reply:
-            print("%sreply: amux search -c \"…\"   (the agent keeps what it found so far)%s" % (k["D"], k["X"]))
+            print("%sreply: amux search --continue \"…\"   (the agent keeps what it found so far)%s" % (k["D"], k["X"]))
         return
     hits = res.get("hits") or []
     conf = {"high": k["G"], "medium": k["Y"], "low": k["D"]}
@@ -1487,10 +1546,9 @@ def render_agentic(res, q, can_reply, note=""):
     if res.get("queries"):
         print("%ssearched: %s%s" % (k["D"], " · ".join(repr(x) for x in res["queries"]), k["X"]))
     if hits:
-        print("%sopen one: amux <row> (this box) · amux -H <box> attach <row> · "
-              "session-less dir: amux exec <name> --provider <p> --dir <dir>%s" % (k["D"], k["X"]))
+        print(OPEN_HINT % (k["D"], k["X"]))
     if can_reply:
-        print("%sreply: amux search -c \"…\"   (or just: amux search -c)%s" % (k["D"], k["X"]))
+        print("%sreply: amux search --continue \"…\"   (or just: amux search --continue)%s" % (k["D"], k["X"]))
 
 
 # ───────────────────────────── output ─────────────────────────────
@@ -1555,8 +1613,7 @@ def render_footer(results, q, total, hint=True):
     if empty and len(results) > 1:
         print("%sno matches on: %s%s" % (k["D"], ", ".join(empty), k["X"]))
     if total and hint:
-        print("%sopen one: amux <row> (this box) · amux -H <box> attach <row> · "
-              "session-less dir: amux exec <name> --provider <p> --dir <dir>%s" % (k["D"], k["X"]))
+        print(OPEN_HINT % (k["D"], k["X"]))
     elif not total:
         print("%sno matches for %r%s" % (k["D"], q, k["X"]))
 
@@ -1589,6 +1646,261 @@ def fanout(targets, req, budget, show=True, terms=None, limit=None):
                 total += render_box(r, terms, limit, r["elapsed"] if len(targets) > 1 else None)
                 sys.stdout.flush()
     return results, total
+
+
+# ───────────────────────────── sessions by name (--sessions) ─────────────────────────────
+#
+# `amux search --sessions <text>`: the sessions whose NAME matches, on every machine,
+# printed the way `amux ls` prints them, one block per machine.
+#
+# This machine is read with its own `amux ls`, and its matching rows are printed
+# as they came, so the row numbers and running marks are exactly that command's.
+# Every other machine is asked through its amux server (`amux-remote <box> curl
+# /api/sessions`, the call `amux -A`, the picker and --find already make): one
+# request returns name, folder, agent, account, running state and last line, and
+# nothing has to exist or run on the far side beyond the server. Those rows are
+# drawn here in the `amux ls` layout. All matching happens in this file, with one
+# regular-expression dialect, for every machine.
+
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+LS_ROW = re.compile(r"^\s*(\d+)(\*?)\s+(\S+)")  # ` 12* P:cc:name …`, colors stripped
+LS_CODE = {"claude": "cc", "iterm2": "it", "codex": "cx", "gemini": "gm", "opencode": "oc", "agy": "ag"}
+LS_CODE_COL = {"cc:": "1;38;5;51", "it:": "1;38;5;45", "cx:": "1;38;5;201",
+               "oc:": "1;38;5;46", "ag:": "1;38;5;208", "gm:": "1;38;5;141"}
+LS_ACCT_COL = {"P:": "1;94", "T:": "1;93", "X:": "1;95"}
+LS_PREFIX_W = 5      # widest tag ("P:cc:"), as in amux ls
+SESS_WAIT = 15       # seconds one machine may take to list its sessions (-t changes it)
+HR = "─" * 56
+
+
+def name_matcher(text, regex, where, cs):
+    """A test for one session name. A plain text matches anywhere in the name
+    (--matchstring start|end pins it to an end); --regex is searched, not anchored.
+    Case is ignored unless -s."""
+    if regex is not None:
+        try:
+            rx = re.compile(regex, 0 if cs else re.I)
+        except re.error as e:
+            die("--regex %r is not a valid regular expression: %s" % (regex, e))
+        return lambda n: rx.search(n) is not None
+    t = text if cs else text.lower()
+    fold = (lambda n: n) if cs else (lambda n: n.lower())
+    if where == "start":
+        return lambda n: fold(n).startswith(t)
+    if where == "end":
+        return lambda n: fold(n).endswith(t)
+    return lambda n: t in fold(n)
+
+
+def sess_colors():
+    """Color on a terminal, or when AMUX_FORCE_COLOR says so (as amux and amux-remote do)."""
+    force = os.environ.get("AMUX_FORCE_COLOR", "") not in ("", "0")
+    on = force or (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+                   and os.environ.get("TERM", "dumb") != "dumb")
+    return on, (lambda code: ("\033[" + code + "m") if on else "")
+
+
+def ls_tag(provider, account):
+    """The `amux ls` tag of a session: P:cc: / T:it: / X:cc: for the agents that bill
+    a Claude subscription, cx: / oc: / ag: / gm: for the rest (_ls_prefix in amux)."""
+    p = (provider or "claude").strip().lower()
+    code = LS_CODE.get(p, p[:2] or "??")
+    if p in ("claude", "iterm2"):
+        return {"team": "T", "team2": "X"}.get(account or "", "P") + ":" + code + ":"
+    return code + ":"
+
+
+def tag_colored(tag, c):
+    out, rest = "", tag
+    if rest[:2] in LS_ACCT_COL:
+        out, rest = c(LS_ACCT_COL[rest[:2]]) + rest[:2] + c("0"), rest[2:]
+    if rest:
+        out += c(LS_CODE_COL.get(rest, "1")) + rest + c("0")
+    return out
+
+
+def sessions_here(color):
+    """This machine's sessions from its own `amux ls`: (rows, error). A row keeps the
+    line as printed, so a match is shown exactly as `amux ls` shows it."""
+    exe = shutil.which("amux")
+    if not exe:
+        return (None, "amux is not on PATH") if session_names() else ([], None)
+    env = dict(os.environ, AMUX_FORCE_COLOR="1" if color else "0")
+    try:
+        r = subprocess.run([exe, "ls"], capture_output=True, text=True, timeout=60, env=env)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, "amux ls: %s" % type(e).__name__
+    if r.returncode != 0:
+        return None, ANSI.sub("", (r.stderr.strip().splitlines() or ["amux ls failed"])[-1])
+    rows = []
+    for line in r.stdout.splitlines():
+        m = LS_ROW.match(ANSI.sub("", line))
+        if not m:
+            continue
+        tag, _, name = m.group(3).rpartition(":")
+        rows.append({"row": int(m.group(1)), "name": name, "tag": tag + ":" if tag else "",
+                     "running": bool(m.group(2)), "line": line})
+    return rows, None
+
+
+def sessions_there(box, wait):
+    """Another machine's sessions from its amux server: (rows, error). Rows are numbered
+    as that machine's `amux ls` numbers them (same sort key)."""
+    exe = shutil.which("amux-remote")
+    if not exe:
+        return None, "amux-remote is not on PATH"
+    env = dict(os.environ, AMUX_API_CONNECT_TIMEOUT=str(min(wait, 4)), AMUX_API_MAX_TIME=str(wait),
+               AMUX_FORCE_COLOR="0")
+    try:
+        r = subprocess.run([exe, box, "curl", "/api/sessions"], capture_output=True, text=True,
+                           timeout=wait + 10, env=env)
+    except subprocess.TimeoutExpired:
+        return None, "no answer in %ss" % wait
+    except OSError as e:
+        return None, "amux-remote: %s" % type(e).__name__
+    if r.returncode != 0:
+        msg = ANSI.sub("", (r.stderr.strip().splitlines() or ["no answer"])[-1])
+        msg = re.sub(r"^error:\s*", "", msg)
+        low = msg.lower()
+        for key, short in (("connection refused", "its amux server is not running"),
+                           ("no answer from", "no answer"), ("cannot resolve", "address does not resolve"),
+                           ("tls handshake", "TLS handshake failed"), ("unknown box", "not a configured machine")):
+            if key in low:
+                return None, short
+        return None, msg[:80]
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return None, "unexpected reply from its amux server"
+    if isinstance(data, dict):
+        return None, "server: %s" % (data.get("error") or "unexpected reply")
+    data = sorted((x for x in (data or []) if isinstance(x, dict) and x.get("name")),
+                  key=lambda x: ls_key(x["name"]))
+    rows = []
+    for i, x in enumerate(data, 1):
+        rows.append({"row": i, "name": x["name"], "tag": ls_tag(x.get("provider"), x.get("account")),
+                     "running": bool(x.get("running")), "dir": x.get("dir") or "",
+                     "flags": x.get("flags") or "", "preview": x.get("preview") or ""})
+    return rows, None
+
+
+def ls_line(r, c):
+    """A session from another machine, drawn as `amux ls` draws a row (cmd_ls in amux)."""
+    icon = (c("32") + "*" + c("0")) if r["running"] else (c("2") + " " + c("0"))
+    tag = " " * max(0, LS_PREFIX_W - len(r["tag"])) + tag_colored(r["tag"], c)
+    extra = ""
+    if "--dangerously-skip-permissions" in r["flags"]:
+        extra += " " + c("33") + "YOLO" + c("0")
+    m = re.search(r"--model ([^ ]+)", r["flags"])
+    if m:
+        extra += " " + c("36") + m.group(1) + c("0")
+    last = re.sub(r"[\x00-\x1f\x7f]", " ", r["preview"]).strip()[:60]
+    if r["running"] and last:
+        extra += " " + c("2") + "│ " + last + c("0")
+    return " %d%s %s%s%-16s%s %s%s%s%s" % (r["row"], icon, tag, c("1"), r["name"], c("0"),
+                                            c("2"), r["dir"], c("0"), extra)
+
+
+def ls_grid(rows, c, width):
+    """The matching sessions as the `amux ls -c` grid: number, ●/○, tag and name,
+    column-major (cmd_ls_compact in amux)."""
+    total = len(rows)
+    maxw = max(len(r["tag"]) + len(r["name"]) for r in rows)
+    numw = max(2, len(str(max(r["row"] for r in rows))))
+    cellw = numw + 1 + 1 + 1 + maxw + 2
+    ncols = max(1, min(width // cellw, total))
+    nrows = (total + ncols - 1) // ncols
+    out = []
+    for i in range(nrows):
+        line = ""
+        for j in range(ncols):
+            idx = j * nrows + i
+            if idx >= total:
+                continue
+            r = rows[idx]
+            mark, nc = ((c("32") + "●" + c("0"), c("1")) if r["running"] else (c("2") + "○" + c("0"), c("2")))
+            line += "%*d %s %s%s%-*s%s  " % (numw, r["row"], mark, tag_colored(r["tag"], c), nc,
+                                             maxw - len(r["tag"]), r["name"], c("0"))
+        out.append(line.rstrip())
+    return out
+
+
+def sessions_search(match, what, targets, compact, wait):
+    """List the sessions whose name passes `match` on every target; 0 if any did."""
+    color, c = sess_colors()
+    here = socket.gethostname().split(".")[0]
+    # this machine first, then the others by name: the same order on every run
+    targets = sorted(targets, key=lambda t: (t[1] is not None, t[0].lower()))
+    if len(targets) > 1:
+        k = colors(sys.stderr)
+        print("%slisting %d machines…%s" % (k["D"], len(targets), k["X"]), file=sys.stderr)
+
+    def one(t):
+        label, ladder = t
+        rows, err = sessions_here(color) if ladder is None else sessions_there(label, wait)
+        return {"label": label, "local": ladder is None, "rows": rows or [], "error": err,
+                "hits": [r for r in (rows or []) if match(r["name"])]}
+
+    with cf.ThreadPoolExecutor(max_workers=max(1, min(16, len(targets)))) as ex:
+        results = list(ex.map(one, targets))
+
+    try:
+        width = int(os.environ.get("COLUMNS", "") or 0)
+    except ValueError:
+        width = 0
+    if width <= 0:
+        width = shutil.get_terminal_size((100, 24)).columns
+    total, quiet, down = 0, [], []
+    for r in results:
+        name = "%s (local)" % r["label"] if r["local"] else r["label"]
+        if r["error"]:
+            down.append("%s (%s)" % (name, r["error"]))
+            continue
+        hits = r["hits"]
+        if not hits:
+            quiet.append(name)
+            continue
+        total += len(hits)
+        print(HR)
+        print("  ▸ %s%s%s  ·  %d of %d session%s · %s%d ●%s running"
+              % (c("1"), name, c("0"), len(hits), len(r["rows"]), "" if len(r["rows"]) == 1 else "s",
+                 c("32"), sum(1 for h in hits if h["running"]), c("0")))
+        print(HR)
+        if compact:
+            for line in ls_grid(hits, c, max(20, width - 2)):
+                print("  " + line)
+        else:
+            # `amux ls` does not pad its row numbers; a filtered list jumps from 7 to
+            # 112, so each row is indented to line the numbers up (the row itself
+            # is untouched)
+            numw = max(len(str(h["row"])) for h in hits)
+            for h in hits:
+                print("  " + " " * (numw - len(str(h["row"]))) + (h["line"] if r["local"] else ls_line(h, c)))
+    answered = len(targets) - len(down)
+    if total:
+        print()
+    elif not answered:
+        print("%sno machine answered%s" % (c("2"), c("0")))
+    else:
+        print("%sno session name matches %s on %s%s"
+              % (c("2"), what, "this machine" if answered == 1 and results[0]["local"] and not down
+                 else "%d machine%s" % (answered, "" if answered == 1 else "s"), c("0")))
+    if quiet and total:
+        print("  %sno match: %s%s" % (c("2"), ", ".join(quiet), c("0")))
+    if down:
+        print("  %soffline:  %s%s" % (c("2"), ", ".join(down), c("0")))
+    if not answered and all(r["error"] == "not a configured machine" for r in results):
+        # the usual slip: the text typed before the machine list
+        print("  %sthe machine list comes first, then the text: amux search --sessions <machine,machine> \"text\"%s"
+              % (c("2"), c("0")))
+    if total:
+        ways = []
+        if any(r["local"] and r["hits"] for r in results):
+            ways.append("amux <row> on this machine")
+        if any(not r["local"] and r["hits"] for r in results):
+            ways.append("amux up <machine> <name> on another")
+        print("  %sopen one: %s%s" % (c("2"), " · ".join(ways), c("0")))
+    return 0 if total else 1
 
 
 # ───────────────────────────── main ─────────────────────────────
@@ -1644,6 +1956,8 @@ def main(argv):
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `amux search … | head` ends quietly
 
     prompt = cs = word = agentic = raw = cont = local = every = show = False
+    sessions = compact = False
+    regex = where = None
     orphans = True
     provs = kinds = since = None
     scope = None
@@ -1674,8 +1988,20 @@ def main(argv):
             orphans = False
         elif a == "--agentic":
             agentic = True
-        elif a in ("-c", "--continue"):
+        elif a == "--continue":
             agentic = cont = True
+        elif a == "--sessions":
+            sessions = True
+        elif a in ("-c", "--compact"):
+            compact = True
+        elif a == "--regex" or a.startswith("--regex="):
+            regex = a.split("=", 1)[1] if "=" in a else next(it, None)
+            if not regex:
+                die("--regex needs a pattern, e.g. --regex '^web-[0-9]+$'")
+        elif a == "--matchstring" or a.startswith("--matchstring="):
+            where = a.split("=", 1)[1] if "=" in a else next(it, None)
+            if where not in ("start", "anywhere", "end"):
+                die("--matchstring takes start, anywhere or end, not %r" % where)
         elif a == "--local":
             local = True
         elif a == "--raw":
@@ -1736,6 +2062,50 @@ def main(argv):
             die("unknown option '%s' (see amux search -h)" % a)
         else:
             pos.append(a)
+
+    if sessions:
+        other = [n for n, on in (
+            ("--agentic", agentic and not cont), ("--continue", cont), ("--show", show), ("-e", terms),
+            ("--prompt", prompt), ("--in", kinds), ("--providers", provs), ("--provider", single),
+            ("-w", word), ("--and", every), ("--since", since), ("--no-orphans", not orphans),
+            ("--raw", raw), ("--model/--effort/--account", any(ag.values())), ("-n", nshow != 20)) if on]
+        if other:
+            die("--sessions lists sessions by name; %s does not apply to it (see amux search -h)"
+                % ", ".join(other))
+        if regex is not None and where:
+            die("--regex and --matchstring cannot be combined: put ^ or $ in the pattern instead")
+        if regex is not None:
+            if len(pos) > 1:
+                die("with --regex, the only other argument is the machine list, got: %s" % " ".join(pos))
+            boxes, text = (pos[0] if pos else None), None
+            what = "the pattern %r" % regex
+        else:
+            if not pos:
+                die('give the text to look for in the names: amux search --sessions [-c] [machines] "text"  '
+                    "(or --regex 'pattern')")
+            if len(pos) > 2:
+                die("too many arguments: amux search --sessions [machines] \"text\"  (machines = one comma list)")
+            boxes, text = (pos[0] if len(pos) == 2 else None), pos[-1]
+            if not text.strip():
+                die("empty text")
+            what = repr(text) + ({"start": " at the start", "end": " at the end"}.get(where, ""))
+        if (scope or local) and boxes:
+            die("use either a machine list or --local/--corefleet/--mainfleet/--fleetall, not both")
+        if scope and local:
+            die("--local and --%s contradict each other" % SCOPE_FLAG[scope][2:])
+        if local:
+            tg = resolve_boxes(None, False)
+        elif boxes:
+            tg = resolve_boxes(boxes, False, quiet=True)
+        else:  # default: this machine and every configured one
+            tg = targets_for(None, scope or "all")
+        return sessions_search(name_matcher(text, regex, where, cs), what, tg, compact,
+                               budget if budget != BOX_BUDGET else SESS_WAIT)
+    if compact:
+        die("-c is the compact view of --sessions: amux search --sessions -c \"text\". "
+            "To reply to the last agentic answer: amux search --continue [\"follow-up\"]")
+    if regex is not None or where:
+        die("--regex and --matchstring only apply with --sessions")
 
     if show:
         if agentic or scope or prompt:
@@ -1810,7 +2180,7 @@ def main(argv):
         if cont and not last:
             die("nothing to continue: no earlier agentic search on this box (%s)" % tilde(LAST))
         if cont and (single or any(ag.values()) or boxes or scope or local):
-            die("-c continues the last run as it was; start a new search to change provider/model/scope")
+            die("--continue carries on the last run as it was; start a new search to change provider/model/scope")
         evidence = ""
         if cont:
             run = {kk: last[kk] for kk in ("agent", "model", "effort", "account", "prefix", "scope", "label")}

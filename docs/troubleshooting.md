@@ -1,31 +1,31 @@
 # Troubleshooting
 
-Start with `amux-doctor`. It checks the machine end to end and most of what follows is a longer explanation of something it already told you.
+Start with `amux-doctor`. It checks the whole machine, and most of this page explains in more detail something that it reports.
 
 ## Sessions say "Please run /login"
 
-**First, read the rest of the error.** Two very different problems share that banner.
+Read the rest of the error first, because two different problems show that message.
 
-`401 The socket connection was closed unexpectedly` is a **network** failure mislabelled as an auth failure. Your credentials are fine. Logging in again does not help and only churns your credential store. Wait for the connection to recover, then re-send.
+`401 The socket connection was closed unexpectedly` is a network failure that is reported as a sign-in failure. Your credentials are fine, and signing in again does not help. Wait for the connection to come back, then send the prompt again.
 
-`OAuth access token has expired` or `Invalid authentication credentials` is a real auth failure. Usually it is the shadowing trap: a stored browser login and a long-lived token on the same machine, where sessions prefer the login and do not fall back when it expires. See [auth.md](auth.md). Fix:
+`OAuth access token has expired` or `Invalid authentication credentials` is a real sign-in failure. The usual cause is a machine that has both a stored browser login and a long-lived token: sessions use the login and do not fall back to the token when the login expires. See [auth.md](auth.md). To fix it:
 
 ```sh
-check-claude-auth        # says honestly which credential is in play
+check-claude-auth        # says which credential is really in use
 amux-reauth --all        # probe, clear a shadowing login, restart what is stuck
 ```
 
 ## A session shows as running after I stopped it
 
-Fixed in the bundled amux: the session list now checks that the agent is actually running in the pane, not just that a tmux session exists. If you still see it, an older amux is probably first on your `PATH` — `amux-doctor` says which build it found; re-run `./install.sh`.
+The bundled amux fixes this. The session list now checks that the agent is running in the pane, not only that a tmux session exists. If you still see it, an older amux is probably first on your `PATH`. `amux-doctor` says which build it found. Run `./install.sh` again.
 
 ## A session lost all its context after restarting
 
-Also fixed in the bundled amux: when it cannot tell which conversation to resume, it resumes the newest real conversation for the session's directory instead of starting a blank one. Older conversations are never deleted — use `amux-convos <session>` to list them and `amux-convos <session> --resume N` to pick one.
+The bundled amux fixes this too. When it cannot tell which conversation to resume, it resumes the newest real conversation for the session's directory instead of starting a blank one. Older conversations are never deleted. `amux-convos <session>` lists them, and `amux-convos <session> --resume N` resumes one.
 
 ## A session dies about 3 seconds after `amux start`
 
-Usually a Claude Code **background** session (`claude --bg`, or "Backgrounding after the current tool finishes…") still holds the newest conversation for that directory, and claude refuses to resume a conversation another process holds. The bundled amux skips held conversations and says which one it skipped; `claude agents` lists the holders, and `claude stop <id>` releases one.
+The usual cause is a Claude Code background session (`claude --bg`, or "Backgrounding after the current tool finishes…") that still holds the newest conversation for that directory. claude refuses to resume a conversation that another process holds. The bundled amux skips such a conversation and says which one it skipped. `claude agents` lists the processes that hold conversations, and `claude stop <id>` releases one.
 
 ## A machine shows UNREACHABLE
 
@@ -33,46 +33,46 @@ Usually a Claude Code **background** session (`claude --bg`, or "Backgrounding a
 amux-config test <box>
 ```
 
-The message distinguishes the cases. For "unreachable", work outward:
+The message says which case it is. For "unreachable", check these in order:
 
 1. Is the server running there? On that machine: `setup/serve-install --status`
 2. Can you reach the address at all? `ping <address>`, or `ssh <address>`
 3. Is the port open? A firewall on the serving machine may be blocking 8822 even though the host answers pings.
-4. If you are on a VPN or tailnet, is it connected on *both* machines?
+4. If you are on a VPN or tailnet, is it connected on both machines?
 
-For "reachable but token REJECTED", the token changed. `amux-config token <box>` re-fetches it.
+For "reachable but token REJECTED", the token changed. `amux-config token <box>` fetches it again.
 
 ## `amux serve` seems dead but the dashboard works (or vice versa)
 
-Do not trust `pgrep -f "amux serve"`. The command execs into `python .../amux-server.py`, so the string `amux serve` is not in the process table at all — a `pkill -f "amux serve"` silently kills nothing, which looks like "the restart did not take".
+Do not rely on `pgrep -f "amux serve"`. The command replaces itself with `python .../amux-server.py`, so the string `amux serve` is not in the process table. For the same reason, `pkill -f "amux serve"` stops nothing and reports no error, so a restart done that way has no effect.
 
-`setup/serve-install --status` reports the HTTP probe as the authority and matches the process on the right pattern.
+`setup/serve-install --status` tests the server over HTTP and looks for the process under its real name.
 
 ## Installed commands are "not found"
 
-`~/.local/bin` is probably not on your PATH. `install.sh` warns about this and prints the line to add. Check with `amux-doctor`, which tests it explicitly.
+`~/.local/bin` is probably not on your PATH. `install.sh` warns about this and prints the line to add. `amux-doctor` checks it too.
 
 ## The commands run but cannot find `lib/`
 
-`install.sh` symlinks rather than copies, and each command resolves its own symlink back to the checkout to locate `lib/`. If you moved or deleted the checkout, re-clone it and re-run `install.sh`.
+`install.sh` makes symlinks to the companion commands instead of copying them, and each command follows its own symlink back to the checkout to find `lib/`. If you moved or deleted the checkout, clone it again and run `install.sh` again.
 
 ## Windows: "tmux is missing calls amux needs"
 
-Your tmux is not the real thing, or not complete enough. On Windows, run amux inside WSL2 with Ubuntu 26.04 LTS; [windows.md](windows.md) has the steps. Outside WSL, MSYS2's tmux is genuine but untested, psmux is a reimplementation, and Git Bash has none.
+Your tmux is not tmux itself, or it is incomplete. On Windows, run amux inside WSL2 with Ubuntu 26.04 LTS. [windows.md](windows.md) has the steps. Outside WSL, MSYS2 has a real tmux that is untested with amux, psmux is a different program, and Git Bash has no tmux.
 
 ## The grid shows boxes instead of status dots
 
-A console font without the round Unicode marks. Force ASCII:
+The console font does not have the round Unicode marks. Use plain ASCII marks instead:
 
 ```sh
 export AMUX_ASCII=1
 ```
 
-This is the default on Windows outside WSL already.
+On Windows outside WSL, this is already the default.
 
 ## `/chrome` says Disabled even though the extension is installed
 
-Expected when the machine authenticates with a long-lived token — Claude Code turns Chrome integration off deliberately in that mode, and `--chrome` will not override it. Also unavailable in WSL entirely. Full explanation in [auth.md](auth.md).
+This is expected when the machine signs in with a long-lived token. Claude Code then turns Chrome integration off on purpose, and `--chrome` does not turn it back on. Chrome integration is also unavailable in WSL. [auth.md](auth.md) explains why.
 
 ## Undoing things
 
@@ -91,4 +91,4 @@ Include the output of:
 amux-doctor
 ```
 
-It never prints a token — only a four-character prefix and a length, which is enough to tell two tokens apart without revealing either.
+It never prints a token. It prints only a four-character prefix and a length, which is enough to tell two tokens apart.

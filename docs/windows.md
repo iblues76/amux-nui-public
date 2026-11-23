@@ -58,7 +58,7 @@ Plain Windows (PowerShell, Command Prompt, Git Bash) cannot run amux sessions. a
 
 ## Without WSL (untested)
 
-These setups may work, but none has been tested with this repo. Run `amux-doctor` and trust what it reports: it starts a throwaway tmux session and tries every tmux call amux depends on (`new-session`, `has-session`, `list-sessions`, `send-keys`, `capture-pane`, `set-environment`).
+These setups may work, but none has been tested with this repo. Run `amux-doctor` and go by its report. It starts a temporary tmux session and tries every tmux call that amux depends on (`new-session`, `has-session`, `list-sessions`, `send-keys`, `capture-pane`, `set-environment`).
 
 | Setup | Run sessions here | Drive other machines | Claude in Chrome |
 |---|---|---|---|
@@ -67,7 +67,7 @@ These setups may work, but none has been tested with this repo. Run `amux-doctor
 | **Scoop** with psmux | untested | untested | yes |
 | **Cygwin** with its tmux | untested | untested | yes |
 
-- **MSYS2** ships a genuine [tmux](https://packages.msys2.org/packages/tmux?variant=x86_64) (`pacman -S tmux`). It has no Linux kernel, though, and [some tmux behavior differs](https://tmux.app/install/windows/), particularly around sockets.
+- **MSYS2** has a real [tmux](https://packages.msys2.org/packages/tmux?variant=x86_64) (`pacman -S tmux`). It has no Linux kernel, though, and [some tmux behavior differs](https://tmux.app/install/windows/), particularly around sockets.
 - **Git Bash** has no tmux, so at most it can drive amux on other machines. `amux-remote`, `amux-all`, `amux-ls`, `ccjump` and `amux-config` need only SSH and HTTPS, not tmux.
 - **psmux**, which Scoop installs, is a tmux-like program written in Rust, not tmux. amux calls tmux in about fifty places, and psmux has not been checked against them.
 - **Claude Code** for these shells is installed on Windows itself, from PowerShell: `irm https://claude.ai/install.ps1 | iex`, or `winget install Anthropic.ClaudeCode`. It lands on the Windows PATH, so Git Bash finds it too.

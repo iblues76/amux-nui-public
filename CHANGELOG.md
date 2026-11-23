@@ -2,6 +2,24 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.3 — 2026-11-23
+
+- **Find a session by its name, on every machine.** `amux search --sessions login` lists the sessions whose name contains "login" on this machine and on every machine you drive, one block per machine, each row as `amux ls` prints it. `-c` gives the compact grid of `amux ls -c`. `--matchstring start|anywhere|end` says where the text must sit, `--regex 'pattern'` takes a regular expression, `-s` matches case exactly, and a machine list or `--local` limits where it looks. It reads names only, so it answers in about a second. See "Finding a session" in the [README](README.md).
+- **`amux search -c` now means compact.** To reply to the last `--agentic` answer, use `amux search --continue`. `-c` used to do that; alone, it now tells you so.
+- **`amux search` row numbers match `amux ls` again.** Search numbered sessions in file order while `amux ls` sorts them by name, so `amux <row>` after a search could open another session. The hint for opening a hit on another machine named a command that does not exist; it now says `amux pick <box> --sessionid <row>`. A session that shares its folder with another one is no longer missed by `--in name`.
+- **`amux rename` renames in place.** It now runs `amux-rename`: the registration, the state file, the running tmux session, the color and the dashboard rows move together and the agent keeps running. Before, it stopped the session, moved only the registration and restarted it. `amux rename -n` shows the plan first.
+- **`amux up <name>` works for a session on this machine.** It answered "not a local session" for every local session. A machine can also be given by another of its names.
+- **Re-registering a session no longer moves it.** `amux register` or `amux exec` on an existing session without `--dir` kept nothing: the session moved to the current folder and lost the description, tags and pin set in the dashboard. The folder and those fields are now kept; `--dir <path>` or `--pwd` still moves it.
+- **Options are checked.** `--strict-mcp-config` no longer swallows the option after it. An option that needs a value says so when the value is missing, where it used to crash. `amux register` refuses what it cannot store, and `amux ls` refuses arguments it does not know, where both used to ignore them.
+- **One codex default model.** A codex session started by the server (the dashboard, `amux -H <box> start`, an automatic restart) or switched with `amux provider <name> codex` used an older default model than `amux start`. All of them now use the same one.
+- **`amux start-all` starts every session.** It attached to the first one it started and never reached the rest. It now starts each without attaching and reports any that could not start.
+- **`amux rm` removes the session's state file too.** Left behind, it was inherited by the next session registered under the same name.
+- **A machine that is down says why.** `amux -H <box> provider`, `model`, `account`, `full-access` and `info` answered "could not parse server response", and `curl` exited without a word. Each now names the cause, as `ls` did.
+- **Same-machine requests to the dashboard are checked on Linux.** A request from the machine itself skipped the token whoever sent it, so anyone with a login there could drive the sessions and read the token from the dashboard page. It is now skipped only for your own user and root. macOS is unchanged. See [docs/remote.md](docs/remote.md).
+- **`amux peek` shows the same amount everywhere.** 30 lines by default, on this machine and through `-H` (which showed 80). The line count must be a number.
+- **`amux version` also prints this release.** It printed only the version of the bundled amux program (0.9.x), never the release (0.7.x).
+- Tab completion offers only what works where you type it: the attach options (`--mosh`, `--cc`, `--plain`) and `peek --raw` after `-H` or `--find`, `--desc` and `--worktree` after `-H`. `amux help` no longer calls codex "sandboxed" by default and lists the companion commands that exist. `amux-tabs --all` reads session names correctly again and has `--dry-run`. `amux-ls` numbers rows like `amux ls`.
+
 ## 0.7.2 — 2026-11-21
 
 - **What each system needs, in one table.** The README's new "What you need" section covers macOS, Linux and Windows: how amux runs on each, what to install and how, and what the sandbox flags add.
@@ -51,7 +69,7 @@ What changed in each release of amux-nui-public, newest first. From 0.3.0 on, ev
 - **Several words at once**: `amux search -e login -e oauth`. Sessions that use the words together rank first, then newer ones. `--and` keeps only sessions with every word; `--since 30d` keeps recent ones.
 - **`amux search --show [machine] <row|folder> -e word`**: one session's conversations, newest first, with their opening prompts and dated excerpts around the words.
 - **Machine groups**: `--corefleet` and `--mainfleet` search the `CORE` and `MAIN` lists in `~/.amux/search-groups.conf`. `--fleetall` is every machine, and `--fleet` still works. Results print as each machine answers.
-- **`--agentic` is faster and never comes back empty-handed.** It starts with a quick search of the question's main words, prints each step as it goes, searches your CORE group first (this machine if you have no groups), and stops after 10 minutes with what it found by then. It is told to search conversations only, never to run commands on your machines, and more write commands are blocked.
+- **`--agentic` is faster and always shows a result.** It starts with a quick search of the question's main words, prints each step as it goes, searches your CORE group first (this machine if you have no groups), and stops after 10 minutes with what it found by then. It is told to search conversations only, never to run commands on your machines, and more write commands are blocked.
 - File names listed in `~/.config/amux/search-exclude.txt` (one per line) are never searched.
 - `amux search … | head` no longer ends in a Python error. A search started from inside a Claude Code session doesn't list that session as a match.
 - See "Finding a session" in the [README](README.md).

@@ -1,24 +1,26 @@
 # Connecting machines
 
-You need none of this to use one computer. Install amux, run `amux`, done. This page is for when a second machine appears.
+You need none of this to use amux on one computer. This page is for when you have a second machine.
 
-## The model
+## How it works
 
 One machine runs `amux serve`, a small HTTPS server that exposes its sessions over a REST API. Any other machine holding that server's **token** can list, peek at, message, create, configure, start and stop those sessions.
 
-The token is the whole security boundary. Anyone with it controls every session on that machine — which means it can read and write any file those agents can reach. Treat it exactly like a password.
+The token is the only protection. Anyone who has it controls every session on that machine, and so can read and write any file that those agents can reach. Treat it like a password.
 
-Consequently: **never expose an amux server directly to the internet.** `setup/serve-install` binds to loopback plus one specific address you choose, never `0.0.0.0`, on purpose.
+One caller needs no token: the machine itself. The sessions on it, the `amux` command and its hooks reach the server on `127.0.0.1` without one. On Linux this applies only when the request comes from your own user or root. Another person logged in to the same machine is asked for the token like anyone else. On macOS every local user is still trusted this way, so do not run `amux serve` on a Mac that other people log in to. To trust every local user on Linux as well, put `AMUX_LOCAL_TRUST=any` in `~/.amux/server.env`.
+
+For that reason, never expose an amux server directly to the internet. `setup/serve-install` binds to loopback and to one address that you choose, and never to `0.0.0.0`.
 
 ## Getting a network path between them
 
-Pick whichever fits. `amux-config` does not care which you chose — it only wants an address it can reach.
+There are three ways, and any of them works. `amux-config` needs only an address that it can reach.
 
-**A private mesh VPN (recommended).** Something like Tailscale gives each machine a stable private address that works from anywhere without port forwarding, and the traffic is encrypted end to end independently of amux. This is the least fragile option for a laptop that moves between networks. `setup/serve-install` detects a Tailscale address automatically when one exists.
+**A private mesh VPN (recommended).** A mesh VPN such as Tailscale gives each machine a stable private address that works from anywhere without port forwarding, and it encrypts the traffic itself. It is the most reliable choice for a laptop that moves between networks. `setup/serve-install` finds a Tailscale address by itself when there is one.
 
-**Your local network.** Fine when both machines are always on the same trusted LAN. Use the hostname (`desktop.local`) or the LAN IP. It stops working the moment you take the laptop elsewhere, and a coffee-shop network is not a trusted LAN.
+**Your local network.** This works when both machines are always on the same trusted LAN. Use the hostname (`desktop.local`) or the LAN address. It stops working when you take the laptop somewhere else, and a public network such as a coffee shop's is not a trusted LAN.
 
-**An SSH tunnel.** No extra software, works wherever SSH does. Bind the server to loopback only, then forward the port:
+**An SSH tunnel.** This needs no extra software and works wherever SSH does. Bind the server to loopback only, then forward the port:
 
 ```sh
 setup/serve-install --loopback-only          # on the machine being served
@@ -26,7 +28,7 @@ ssh -N -L 8822:127.0.0.1:8822 that-machine   # on the machine driving it
 amux-config add work --host 127.0.0.1        # the tunnel makes it local
 ```
 
-The tunnel must be running whenever you want to reach it, which is the tradeoff.
+The cost is that the tunnel must be running whenever you want to reach that machine.
 
 ## Setting it up
 
@@ -36,7 +38,7 @@ The tunnel must be running whenever you want to reach it, which is the tradeoff.
 setup/serve-install
 ```
 
-It works out an address, starts the server, makes it survive reboot, and prints the exact command to run next.
+It chooses an address, starts the server, sets it to start again after a reboot, and prints the command to run next.
 
 **On the machine you drive from:**
 
@@ -44,13 +46,13 @@ It works out an address, starts the server, makes it survive reboot, and prints 
 amux-config add desktop --host 192.0.2.10
 ```
 
-That reads the token over SSH and stores it mode-600 at `~/.amux/remotes/desktop.env`. No SSH between them? Move the token across some other way and pipe it in:
+That reads the token over SSH and stores it, mode 600, at `~/.amux/remotes/desktop.env`. If there is no SSH between the two machines, move the token another way and pipe it in:
 
 ```sh
 amux-config add desktop --host 192.0.2.10 --token-stdin < token.txt
 ```
 
-There is deliberately no `--token` flag. A token typed on a command line is visible to every user on the machine via `ps` and is saved to your shell history forever.
+There is no `--token` flag, on purpose. Every user on the machine can see a token typed on a command line through `ps`, and it stays in your shell history.
 
 **Check it:**
 
@@ -58,7 +60,7 @@ There is deliberately no `--token` flag. A token typed on a command line is visi
 amux-config test --all
 ```
 
-This distinguishes the three failures that look alike: unreachable (nothing answered), reachable but rejected (the token is wrong or was rotated), and working.
+It tells three results apart: unreachable (nothing answered), reachable but rejected (the token is wrong or was changed), and working.
 
 ## Using it
 
@@ -73,11 +75,13 @@ amux-up desktop myproject        # ensure a session is started AND attach to it
 amux attach myproject --find     # not on this machine? look on the others
 ```
 
-Every one of these names the machine **first**, the same way. There is no default remote and no inferred "the only configured one" — guessing which machine to drive is how you start a session on the wrong computer.
+Each of these commands names the machine first. amux has no default machine and never guesses one, even when only one is configured, so that a session cannot start on the wrong computer.
 
 `amux -H <box> start <name>` starts the session and, when you run it in a terminal, attaches too. `--no-attach` (or running it from a script) only starts it.
 
-`exec` creates and starts a session in one operation. It needs `--provider` and accepts `--dir`, `--model`, `--account`, `--full-access`, `--desc` and `--worktree`; quote a `~/...` directory so the remote machine expands it (amux-remote also rewrites your own home prefix back to `~/` and says so). `amux -H <box> provider <name> [<p>]` and `amux -H <box> account <name> [P|T|X]` show or change an existing session's agent and account.
+`exec` creates and starts a session in one operation. It needs `--provider` and accepts `--dir`, `--model`, `--account`, `--full-access`, `--net-sandbox` or `--full-sandbox`, `--autoprompt`, `--desc` and `--worktree`. Quote a `~/...` directory so that the remote machine expands it. amux-remote also changes your own home prefix back to `~/`, and says so. `amux -H <box> provider <name> [<p>]` and `amux -H <box> account <name> [P|T|X]` show or change an existing session's agent and account.
+
+The same commands work on this machine and through `-H`, with two differences that are on purpose. `stop` on another machine asks the agent to exit first, while on this machine the session's tmux ends at once. `ls` on another machine marks a session as running only while its agent is alive, while on this machine it marks it while its tmux session exists, even if the agent has exited to a shell. `--desc` and `--worktree` exist only through `-H`, because the server applies them.
 
 Remote session names are validated before SSH attach, encoded before entering a REST path, and matched exactly in tmux. The dashboard token reaches curl through a header file, not a command-line argument, so it never appears in `ps`.
 
@@ -99,13 +103,13 @@ If a machine's token changes, or you think it leaked:
 amux-config token desktop        # re-fetch over SSH, keeping all other settings
 ```
 
-Do this on every machine that had the old one. `amux-config test --all` will show you which ones still fail.
+Do this on every machine that had the old one. `amux-config test --all` shows which ones still fail.
 
-## Growing past two machines
+## More than two machines
 
-Nothing changes. Add one `~/.amux/remotes/<name>.env` per machine and every command picks it up automatically — `amux-all` and `ccjump` enumerate whatever is configured.
+It works the same way. Add one `~/.amux/remotes/<name>.env` for each machine. Every command then uses it, and `amux-all` and `ccjump` list every machine that is configured.
 
-Two things worth doing once you have several:
+Two notes for when you have several:
 
-- Give each machine a name you will recognize under pressure. `laptop` and `gpu-box` beat `machine1` and `machine2`.
-- `amux-all` bounds each machine's call with a timeout, so one unreachable machine slows the view rather than hanging it. It marks the dead one and moves on.
+- Give each machine a name that you will recognize. `laptop` and `gpu-box` are better than `machine1` and `machine2`.
+- `amux-all` gives each machine a time limit, so a machine that does not answer makes the view slower but does not block it. That machine is marked as unreachable.

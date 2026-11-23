@@ -1023,6 +1023,61 @@ _stop_pool = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).T
 _USER_SHELL = os.environ.get("SHELL", "/bin/bash")
 # pane_current_command values that mean "idle shell, nothing running" (is_running)
 _SHELL_NAMES = {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"}
+# ── Who is on the other end of a same-machine connection? ────────────────────
+# A request from 127.0.0.1 / ::1 skips the token: the sessions on this box, the
+# amux CLI and the hooks all talk to the server that way. But "from this machine"
+# is not "from this user". On a box where other people log in, any of them could
+# drive every session (send text, start, stop) and read the dashboard page, which
+# carries the token itself. So on Linux the skip now applies only when the
+# connection's client end belongs to this server's user, or to root (who can read
+# the token file anyway). /proc/net/tcp names the owner of every TCP socket.
+# Anything else falls through to the ordinary token check. Where the table does
+# not exist (macOS) the old rule stands. AMUX_LOCAL_TRUST=any in
+# ~/.amux/server.env restores it everywhere.
+_PROC_TCP = {False: "/proc/net/tcp", True: "/proc/net/tcp6"}
+_LOOPBACK_HEX = {False: "0100007F", True: "00000000000000000000000001000000"}
+
+
+def _loopback_peer_uid(client_ip: str, client_port: int, server_port: int, table: str = ""):
+    """Owner (uid) of the client end of a loopback TCP connection. Returns
+    "unsupported" when this system has no socket table to read, and None when the
+    table exists but cannot name the owner (entry gone, or already in TIME_WAIT,
+    where the kernel no longer records one)."""
+    v6 = ":" in client_ip
+    path = table or _PROC_TCP[v6]
+    if not os.path.exists(path):
+        return "unsupported"
+    want = "%s:%04X" % (_LOOPBACK_HEX[v6], client_port)
+    tail = ":%04X" % server_port
+    try:
+        with open(path) as fh:
+            next(fh, None)  # header
+            for line in fh:
+                f = line.split()
+                if len(f) < 8 or f[1] != want or not f[2].endswith(tail):
+                    continue
+                if f[3] == "06":  # TIME_WAIT
+                    return None
+                return int(f[7])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _loopback_trusted(client_ip: str, client_port: int, server_port: int, table: str = "") -> bool:
+    if os.environ.get("AMUX_LOCAL_TRUST", "").strip().lower() == "any":
+        return True
+    uid = _loopback_peer_uid(client_ip, client_port, server_port, table)
+    if uid == "unsupported":
+        return True
+    return uid is not None and uid in (os.getuid(), 0)
+
+
+# The codex model when a session names none. ONE value for every start path: keep
+# it equal to CC_CODEX_DEFAULT_MODEL in bin/amux. (This file once named an older
+# model in three places while `amux start` used the newer default, so the same
+# session ran a different model depending on who started it.)
+CODEX_DEFAULT_MODEL = "gpt-6.1-sol"
 _session_auto_actions: dict = {} # {name: {"last_compact": ts, "last_restart": ts}}
 _steering_queue: dict = {}      # {session_name: [{"text": str, "queued_at": float, "id": str}]}
 _steering_lock = threading.Lock()
@@ -8060,7 +8115,7 @@ def _agy_refused_flag(*flag_strings) -> str:
 
 def _default_model_for_provider(provider: str) -> str:
     if provider == "codex":
-        return "gpt-5.6-sol"
+        return CODEX_DEFAULT_MODEL
     if provider == "gemini":
         return "auto"
     if provider == "agy":
@@ -8728,7 +8783,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
             if extra_flags:
                 _codex_opts += f" {_shell_quote_flags(extra_flags)}"
             if "--model" not in _codex_opts and "-m " not in _codex_opts:
-                _codex_opts += " --model gpt-5.6-sol"
+                _codex_opts += f" --model {CODEX_DEFAULT_MODEL}"
             # codex has NO --effort flag — not on `codex`, not on `codex resume`
             # (verified 0.147.0 on Linux and macOS: "unexpected argument
             # '--effort' found"). The dashboard's effort editor still writes
@@ -14851,6 +14906,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
             </optgroup>
             <optgroup label="Codex (OpenAI)">
+            <option value="gpt-6.1-sol">gpt-6.1-sol</option>
             <option value="gpt-5.6-sol">gpt-5.6-sol</option>
             <option value="gpt-5.5">gpt-5.5</option>
             <option value="o3">o3</option>
@@ -18001,7 +18057,7 @@ function sessionProvider(s) {
 }
 
 function providerDefaultModel(provider) {
-  if (provider === 'codex') return 'gpt-5.6-sol';
+  if (provider === 'codex') return window._AMUX_CODEX_DEFAULT_MODEL || 'gpt-6.1-sol';
   if (provider === 'gemini') return 'auto';
   if (provider === 'opencode') return '';  // server pins a verified-local model at launch
   return window._AMUX_DEFAULT_MODEL || 'sonnet';
@@ -19096,7 +19152,7 @@ function editField(session, field, current, provider) {
       {v:'claude-haiku-4-5-20251001',l:'claude-haiku-4-5-20251001'}
     ];
     const codexModels = [
-      {v:'',l:'Default'},{v:'gpt-5.6-sol',l:'gpt-5.6-sol'},{v:'gpt-5.5',l:'gpt-5.5'},{v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
+      {v:'',l:'Default'},{v:'gpt-6.1-sol',l:'gpt-6.1-sol'},{v:'gpt-5.6-sol',l:'gpt-5.6-sol'},{v:'gpt-5.5',l:'gpt-5.5'},{v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
       {v:'gpt-4o',l:'gpt-4o'},{v:'gpt-4.1',l:'gpt-4.1'},{v:'gpt-4.1-mini',l:'gpt-4.1-mini'}
     ];
     const geminiModels = [
@@ -36578,9 +36634,9 @@ class CCHandler(BaseHTTPRequestHandler):
         """Return True if request is authorized. Sends 401 and returns False if not."""
         if not AUTH_TOKEN:
             return True
-        # Localhost always bypasses auth (local sessions, CLI tools)
-        ip = self.client_address[0] if self.client_address else ""
-        if ip in ("127.0.0.1", "::1"):
+        # A same-machine caller that is this user (or root) bypasses auth: the local
+        # sessions, the amux CLI, the hooks. See _loopback_trusted.
+        if self._from_this_user():
             return True
         if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
             return True
@@ -36598,6 +36654,21 @@ class CCHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({"error": "unauthorized"}).encode())
         return False
 
+    def _from_this_user(self) -> bool:
+        """True for a same-machine connection whose client end belongs to this
+        server's user (or root). Worked out once per connection."""
+        hit = getattr(self, "_lb_trust", None)
+        if hit is None:
+            hit = False
+            try:
+                ip, port = self.client_address[0], self.client_address[1]
+                if ip in ("127.0.0.1", "::1"):
+                    hit = _loopback_trusted(ip, port, self.connection.getsockname()[1])
+            except Exception:
+                hit = False
+            self._lb_trust = hit
+        return hit
+
     def _request_has_valid_token(self) -> bool:
         """True if THIS request actually presented valid credentials (localhost, a valid Bearer
         header, or ?_token=). Distinct from _check_auth, which returns True for public GETs like
@@ -36605,8 +36676,7 @@ class CCHandler(BaseHTTPRequestHandler):
         API keys) in the served page, so an unauthenticated LAN client never receives them."""
         if not AUTH_TOKEN:
             return True
-        ip = self.client_address[0] if self.client_address else ""
-        if ip in ("127.0.0.1", "::1"):
+        if self._from_this_user():
             return True
         if self.headers.get("Authorization", "") == f"Bearer {AUTH_TOKEN}":
             return True
@@ -36646,6 +36716,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 f'window._AMUX_USER_EMAIL={_json.dumps(_user_email)};'
                 f'window._AMUX_USER_ID={_json.dumps(_user_id)};'
                 f'window._AMUX_UI_TOKEN={_json.dumps(_uitok)};'
+                f'window._AMUX_CODEX_DEFAULT_MODEL={_json.dumps(CODEX_DEFAULT_MODEL)};'
                 f'window._AMUX_DEFAULT_MODEL={_json.dumps(_get_default_model())};</script></head>',
                 1,
             )

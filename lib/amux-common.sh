@@ -357,10 +357,10 @@ amux_python() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Session rendering lives in lib/amux-render.py, NOT here.
 #
-# Both amux-ls (this machine) and amux-remote (another machine) pipe the raw
-# /api/sessions JSON into that one program. Keeping a second renderer in this
-# library is how the local and remote views silently drift apart, so there
-# deliberately is not one.
+# amux-ls pipes the raw /api/sessions JSON into that program. `amux ls` and
+# `amux-remote <box> ls` draw their own lists. What must not drift between the
+# three is the row order (names sorted case-insensitively, like `sort -f`) and
+# the account/agent tag: tools/selftest checks them against each other.
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 # tmux capability probe — the heart of amux-doctor on Windows.

@@ -8,15 +8,16 @@
 # screen, which is exactly when you most want to see everything at once.
 #
 # This reads the LOCAL amux server's REST API on 127.0.0.1 — the same interface
-# `amux-remote` uses for other machines — so the local and remote views come from
-# one renderer and cannot drift apart. It also means no patch to amux is needed
-# to get a compact list.
+# `amux-remote` uses for other machines — so no patch to amux is needed to get a
+# compact list. Rows are numbered like `amux ls` (names sorted case-insensitively)
+# and carry the same P:cc: / cx: tag, so row N here is the session `amux <N>` opens.
 #
 # Usage:
 #   amux-ls              compact grid (default): NN * name
 #   amux-ls -v           verbose rows: status, model, directory
 #   amux-ls --bare       no header (for embedding in other tools)
-#   amux-ls --archived   include archived sessions
+#   amux-ls --archived   include archived sessions (hidden by default; their row
+#                        numbers stay reserved, so the others keep theirs)
 #   amux-ls --port N     local server port (default 8822, or $AMUX_LOCAL_PORT)
 #
 # Requires the local `amux serve` to be running. If it is not, this says so and
@@ -68,8 +69,7 @@ if [ -z "$json" ]; then
   check it:   curl -sk $AMUX_URL/api/sessions -o /dev/null -w '%{http_code}\\n'"
 fi
 
-# Render with the SAME program amux-remote uses, so `amux-ls` here and
-# `amux-remote <box> ls` there produce identical output for identical data.
+# Draw the list (lib/amux-render.py: same row order and tags as `amux ls`).
 RENDER="$_here/../lib/amux-render.py"
 if [ ! -f "$RENDER" ]; then
   _real=$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")

@@ -2,9 +2,10 @@
 """amux-render.py — render a list of amux sessions from the server JSON.
 
 Reads the /api/sessions JSON on stdin and prints either a compact column-major
-grid or verbose rows. Used by BOTH amux-ls (this machine, via 127.0.0.1) and
-amux-remote (another machine), so the local and remote views are literally the
-same code and cannot drift apart.
+grid or verbose rows. Used by amux-ls (this machine, through its local server).
+`amux ls` and `amux-remote <box> ls` draw their own lists; all three number the
+rows by one rule (names sorted case-insensitively, as `sort -f` does) and show
+the same account/agent tag, so row N is the same session in each of them.
 
 Driven entirely by environment variables so the callers stay plain shell:
     AMUX_LS_LABEL     name shown in the header (hostname or box name)
@@ -23,7 +24,13 @@ except Exception:
     sys.exit("could not parse response (check AMUX_URL / AMUX_TOKEN)")
 if isinstance(data, dict) and data.get("error"):
     sys.exit("server: " + str(data["error"]))
-data = data or []
+data = [s for s in (data or []) if isinstance(s, dict)]
+# Row order and numbers = `amux ls`: alphabetical, case-insensitive like `sort -f`
+# (upper-fold, ties byte-wise). The number is the position in the FULL list, so it
+# stays the one `amux <N>` takes even when archived sessions are hidden below.
+data.sort(key=lambda s: ((s.get("name") or "").upper(), s.get("name") or ""))
+for _i, _s in enumerate(data, 1):
+    _s["_row"] = _i
 
 # Color only on a real terminal (mirrors amux), unless AMUX_FORCE_COLOR is set —
 # amux-all sets it so this stays colored even when it captures our output.
@@ -54,6 +61,16 @@ if os.environ.get("AMUX_SHOW_ARCHIVED","0") != "1":
     total   = len(data)
     running = sum(1 for s in data if s.get("running"))
 
+# The tag `amux ls` puts before a name: P:cc: / T:cc: / X:cc: on the agents that bill
+# a Claude subscription (by account), cx: / oc: / ag: / gm: on the others.
+PROV_CODE = {"claude": "cc", "iterm2": "it", "codex": "cx", "gemini": "gm", "opencode": "oc", "agy": "ag"}
+def tag(s):
+    p = (s.get("provider") or "claude").strip().lower()
+    code = PROV_CODE.get(p, p[:2] or "??")
+    if p in ("claude", "iterm2"):
+        return {"team": "T", "team2": "X"}.get(s.get("account") or "", "P") + ":" + code + ":"
+    return code + ":"
+
 def short_model(s):
     m = ""
     mm = re.search(r"--model\s+(\S+)", s.get("flags","") or "")
@@ -82,10 +99,10 @@ if total == 0:
     sys.exit(0)
 
 if compact:
-    names = [s.get("name","") for s in data]
+    names = [tag(s) + s.get("name","") for s in data]
     runs  = [bool(s.get("running")) for s in data]
     maxw  = max(len(n) for n in names)
-    numw  = max(2, len(str(total)))
+    numw  = max(2, len(str(max(s["_row"] for s in data))))
     cellw = numw + 1 + 1 + 1 + maxw + 2
     try:
         termw = int(os.environ.get("COLUMNS","") or 0)
@@ -104,7 +121,7 @@ if compact:
                 mark = f"{GREEN}{MARK_ON}{R}"; nc = BOLD
             else:
                 mark = f"{DIM}{MARK_OFF}{R}"; nc = DIM
-            line += f"{idx+1:>{numw}} {mark} {nc}{names[idx]:<{maxw}}{R}  "
+            line += f"{data[idx]['_row']:>{numw}} {mark} {nc}{names[idx]:<{maxw}}{R}  "
         print(line)
 else:
     namew = min(max((len(s.get("name","")) for s in data), default=4), 22)
@@ -113,4 +130,4 @@ else:
         name  = s.get("name","")
         model = short_model(s)
         sdir  = short_dir(s)
-        print(f" {icon} {BOLD}{name:<{namew}}{R} {CYAN}{model:<7}{R} {DIM}{sdir}{R}")
+        print(f" {s['_row']:>3} {icon} {tag(s):>5}{BOLD}{name:<{namew}}{R} {CYAN}{model:<7}{R} {DIM}{sdir}{R}")

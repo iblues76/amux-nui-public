@@ -357,7 +357,7 @@ case "${1:-}" in
       @*)     tmo 8 "$AMUXBOX" "${loc#@}" ls -c 2>/dev/null | clean || echo "(unreachable)"; exit 0 ;;
     esac
     if [ "$loc" = local ]; then "$AMUX" peek "$name" 2>/dev/null | clean || echo "(no preview)"
-    else tmo 4 "$AMUXBOX" "$loc" peek "$name" 2>/dev/null | clean || echo "(no preview)"; fi
+    else tmo 4 "$AMUXBOX" "$loc" peek "$name" 80 2>/dev/null | clean || echo "(no preview)"; fi   # 80: what the remote peek printed by default until it took amux peek's 30
     exit 0 ;;
 esac
 

@@ -21,6 +21,7 @@ macOS + iTerm2 only; run it from iTerm.
 USAGE
   amux-tabs [-w] <name> [<name> ...] [amux-flags...]
   amux-tabs [-w] --all [amux-flags...]
+  amux-tabs --dry-run --all            (or with names: show the tabs, open none)
 
 WHAT EACH TAB RUNS
   amux start <name> [amux-flags...]
@@ -45,6 +46,7 @@ OPTIONS (amux-tabs's own — put them BEFORE the names)
   -H, --host BOX   run each session on a REMOTE box: the tab does `ssh -t BOX 'amux start <name>'`,
                    so from your Mac you get a tab attached to a session on a remote host over SSH
   --all            a tab for every session (`amux ls`, or `ssh BOX amux ls` with --host).
+  --dry-run        print the command each tab would run; open nothing.
   -h, --help       this help.
 
 REMOTE (drive a Linux box's amux from your Mac)
@@ -57,12 +59,13 @@ NOTES
 EOF
 }
 
-NEWWIN=0; ALL=0; NAMES=""; PASS=""; HOST=""
+NEWWIN=0; ALL=0; NAMES=""; PASS=""; HOST=""; DRYRUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -w|--window) NEWWIN=1; shift ;;
     -H|--host)   HOST="${2:-}"; shift 2 ;;      # run each tab's session on a REMOTE box (ssh -t)
     --all)       ALL=1; shift ;;
+    --dry-run)   DRYRUN=1; shift ;;             # print what each tab would run, open nothing
     -h|--help)   usage; exit 0 ;;
     --)          shift; PASS="$*"; break ;;     # everything after -- is passed to each amux
     -*)          PASS="$*"; break ;;            # first flag after the names -> passed to each amux
@@ -71,10 +74,14 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$ALL" = 1 ]; then
-  # name column from `amux ls` (col 1 may carry a running-marker like 4*; col 2 is the name).
+  # name column from `amux ls`: col 1 is the row number (with a * when running), col 2
+  # is the account/agent tag glued to the name — P:cc:myname, cx:myname. Names never
+  # contain ':', so the name is what follows the last one. (Taking the whole of
+  # col 2 as the name made the box:name split below read "T:cc:acm" as session
+  # cc:acm on a box called T.)
   # with --host, list the REMOTE box's sessions.
   LSCMD="amux ls"; [ -n "$HOST" ] && LSCMD="ssh $HOST amux ls"
-  NAMES=$($LSCMD 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '{n=$2; gsub(/\*/,"",n); if (n ~ /^[A-Za-z0-9]/) print n}')
+  NAMES=$($LSCMD 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 ~ /^[0-9]+\*?$/ {n=$2; sub(/^.*:/,"",n); if (n ~ /^[A-Za-z0-9_]/) print n}')
 fi
 NAMES=$(printf '%s\n' $NAMES | sed '/^$/d')
 [ -n "$NAMES" ] || { echo "no session names given (and --all found none)"; exit 1; }
@@ -90,6 +97,7 @@ printf '%s\n' "$NAMES" | while IFS= read -r n; do
   box="$HOST"
   case "$n" in *:*) box="${n%%:*}"; n="${n#*:}" ;; esac   # per-name box:name overrides --host
   if [ -n "$box" ]; then cmd="ssh -t $box 'AMUX_TABCOLOR=1 amux start $n${PASS:+ $PASS}'"; lbl="$box:$n"; else cmd="AMUX_TABCOLOR=1 amux start $n${PASS:+ $PASS}"; lbl="$n"; fi
+  if [ "$DRYRUN" = 1 ]; then echo "  tab -> $cmd   (dry run)"; continue; fi
   if [ "$NEWWIN" = 1 ] && [ "$first" = 1 ]; then
     osascript - "$cmd" "$lbl" <<'OSA'
 on run argv

@@ -29,14 +29,14 @@
 #
 # Usage:
 #   amux-remote                         list configured boxes (~/.amux/remotes/*.env)
-#   amux-remote <box> ls [-c] [--bare]  list sessions (-c = compact grid; --bare = no header; --names = names only)
+#   amux-remote <box> ls [-c] [--bare] [--names]  list sessions (-c = compact grid; --bare = no header; --names = names only)
 #   amux-remote <box> pick [--sessionid N]  pick one of <box>'s sessions and attach (via ccjump);
 #                                       --sessionid N = row N of `ls -c`: attach, or start + attach
 #   amux-remote <box> box               print the configured box name this spelling resolves to
 #   amux-remote <box> attach <name> [--cc|--plain|--mosh] [--color <c>]   SSH in and attach (native iTerm2 tabs in -CC mode;
 #                                       --mosh = plain tmux over mosh: instant local echo on
 #                                       laggy links, survives network changes/sleep)
-#   amux-remote <box> peek <name> [lines]    print a session's recent output (default 80)
+#   amux-remote <box> peek <name> [lines]    print a session's recent output (default 30, like `amux peek`)
 #   amux-remote <box> send <name> <text...>  send text/prompt to a session
 #   amux-remote <box> start <name> [flags...]   start a session (flags forwarded
 #                                       one-shot to the launch) and, when run
@@ -256,14 +256,17 @@ api() {
   # address for a bare IPv4 literal and curl sends the request over cellular
   # instead of tailscale0 — it times out while ssh/nc to the same box work.
   # AMUX_CURL_FAMILY overrides it: set it empty to let curl choose, or -6.
-  local out rc
+  # `|| rc=$?` IS NOT OPTIONAL: called directly or as a pipeline stage, errexit is
+  # live here, and a bare failing assignment would end the (sub)shell before the
+  # case below could say WHY — `curl /x` exited silently and `provider x` blamed
+  # the parser for a box that was simply down.
+  local out rc=0
   out=$(curl -sk ${AMUX_CURL_FAMILY--4} -X "$method" \
     --connect-timeout "${AMUX_API_CONNECT_TIMEOUT:-6}" \
     --max-time "${AMUX_API_MAX_TIME:-45}" \
     -H @<(printf 'Authorization: Bearer %s\n' "${AMUX_TOKEN}") \
     "$@" \
-    "${AMUX_URL}${path}")
-  rc=$?
+    "${AMUX_URL}${path}") || rc=$?
 
   # Distinguish "never got there" from "got there, disliked the answer". Both
   # used to surface as a parse failure blaming AMUX_URL/AMUX_TOKEN, which sends
@@ -447,10 +450,18 @@ else:
 
 cmd_peek() {
   require_config
-  local raw=0
-  [[ "${1:-}" == "--raw" ]] && { raw=1; shift; }
-  local name="${1:-}"; local lines="${2:-80}"
+  local raw=0 name="" lines="" a
+  for a in "$@"; do
+    case "$a" in
+      --raw) raw=1 ;;
+      -*)    die "unknown peek option: $a (usage: amux-remote $BOX peek [--raw] <name> [lines])" ;;
+      *)     if [[ -z "$name" ]]; then name="$a"
+             elif [[ -z "$lines" ]]; then lines="$a"
+             else die "unexpected argument: $a (usage: amux-remote $BOX peek [--raw] <name> [lines])"; fi ;;
+    esac
+  done
   [[ -n "$name" ]] || die "usage: amux-remote $BOX peek [--raw] <name> [lines]"
+  lines="${lines:-30}"   # same default as the local `amux peek`
   validate_remote_name "$name"
   [[ "$lines" =~ ^[0-9]+$ ]] || die "lines must be a number, got: $lines"
   local body; body=$(api GET "/api/sessions/${name}/peek?lines=${lines}")
@@ -662,7 +673,7 @@ cmd_simple_post() {  # stop/clear — take NO flags; error loudly on extras
 cmd_exec() {
   require_config
   local name="${1:-}"; shift || true
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--autoprompt] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
   validate_remote_name "$name"
   local dir="" model="" desc="" provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0 sandbox=""
   local attach_flags=()
@@ -804,7 +815,8 @@ cmd_info() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "usage: amux-remote $BOX info <name>"
   validate_remote_name "$name"
-  api GET "/api/sessions/${name}/info" | python3 -m json.tool 2>/dev/null || api GET "/api/sessions/${name}/info"
+  local body; body=$(api GET "/api/sessions/${name}/info")
+  printf '%s' "$body" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$body"
 }
 
 # amux-remote <box> provider <name> [<p>] — show or change a session's agent
@@ -821,7 +833,8 @@ cmd_provider() {
     --provider=*) new="${new#--provider=}" ;;
   esac
   if [[ -z "$new" ]]; then
-    api GET "/api/sessions/${name}/info" | python3 -c '
+    local body; body=$(api GET "/api/sessions/${name}/info")
+    printf '%s' "$body" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit("could not parse server response")
@@ -836,8 +849,8 @@ print((d.get("provider") or d.get("config",{}).get("CC_PROVIDER") or "claude"))'
   esac
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"provider": sys.argv[1]}))' "$new")
-  api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload" \
-    | python3 -c '
+  local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload")
+  printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit("could not parse server response")
@@ -854,7 +867,8 @@ cmd_model() {
   [[ -n "$name" ]] || die "usage: amux-remote $BOX model <name> [<model>]"
   validate_remote_name "$name"
   if [[ -z "$new" ]]; then
-    api GET "/api/sessions/${name}/info" | python3 -c '
+    local body; body=$(api GET "/api/sessions/${name}/info")
+    printf '%s' "$body" | python3 -c '
 import json,sys,shlex
 try: d = json.load(sys.stdin)
 except Exception: sys.exit("could not parse server response")
@@ -865,8 +879,8 @@ print(f[f.index("--model") + 1] if "--model" in f[:-1] else "(box default)")'
   fi
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1]}))' "$new")
-  api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload" \
-    | python3 -c '
+  local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload")
+  printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit("could not parse server response")
@@ -882,7 +896,8 @@ cmd_full_access() {
   [[ -n "$name" ]] || die "usage: amux-remote $BOX full-access <name> [on|off]"
   validate_remote_name "$name"
   if [[ -z "$new" ]]; then
-    api GET "/api/sessions/${name}/info" | python3 -c '
+    local body; body=$(api GET "/api/sessions/${name}/info")
+    printf '%s' "$body" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit("could not parse server response")
@@ -898,8 +913,8 @@ print("on" if on else "off")'
     off|no|false|0) want=false ;;
     *) die "full-access takes on or off, not '$new'" ;;
   esac
-  api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "{\"full_access\": $want}" \
-    | python3 -c '
+  local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "{\"full_access\": $want}")
+  printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit("could not parse server response")
@@ -922,7 +937,8 @@ cmd_account() {
     --account=*) new="${new#--account=}" ;;
   esac
   if [[ -z "$new" ]]; then
-    api GET "/api/sessions/${name}/info" | python3 -c '
+    local body; body=$(api GET "/api/sessions/${name}/info")
+    printf '%s' "$body" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit("could not parse server response")
@@ -944,8 +960,8 @@ print(a if a else "(no account: not a claude/iterm2 session)")'
   esac
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"account": sys.argv[1]}))' "$new")
-  api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload" \
-    | python3 -c '
+  local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload")
+  printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit("could not parse server response")
@@ -1192,16 +1208,19 @@ ${BOLD}Per-box config${RESET} ${DIM}(~/.amux/remotes/<box>.env, chmod 600)${RESE
   AMUX_MOSH      ${DIM}1 = attach over mosh by default (like --mosh; --cc overrides)${RESET}
 
 ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
-  ${CYAN}ls${RESET} [-c] [--bare]         list sessions ${DIM}(-c = compact grid, like 'amux ls -c'; --bare = no header)${RESET}
+  ${CYAN}ls${RESET} [-c] [--bare] [--names]  list sessions ${DIM}(-c = compact grid, like 'amux ls -c'; --bare = no header;${RESET}
+                          ${DIM}--names = the names only, one per line)${RESET}
+  ${CYAN}pick${RESET} [--sessionid N]    pick one of the box's sessions and attach ${DIM}(--sessionid N = row N of 'ls -c':${RESET}
+                          ${DIM}attach, or start + attach)${RESET}
   ${CYAN}attach${RESET} <name> [--cc|--plain|--mosh]  SSH in + attach (native iTerm2 tabs in -CC mode)
                           ${DIM}--mosh = plain tmux over mosh: keystrokes echo instantly on a${RESET}
                           ${DIM}laggy link and the session survives Wi-Fi/hotspot switches and${RESET}
                           ${DIM}sleep. Falls back to SSH if mosh is missing on either end.${RESET}
-  ${CYAN}peek${RESET} [--raw] <name> [lines]  print recent output (default 80; colors kept, every other
+  ${CYAN}peek${RESET} [--raw] <name> [lines]  print recent output (default 30, like 'amux peek'; colors kept, every other
                           ${DIM}escape stripped so replayed terminal queries/clipboard writes can't fire;${RESET}
                           ${DIM}--raw = the server's bytes untouched)${RESET}
   ${CYAN}send${RESET} <name> <text...>   send text/prompt to a session
-  ${CYAN}exec${RESET} <name> --provider <p> [--account P|T|X] [--dir <p>] [--model <m>] [--full-access] [--autoprompt] [--desc <t>] [--worktree] [--no-attach] [--cc|--plain|--mosh]
+  ${CYAN}exec${RESET} <name> --provider <p> [--account P|T|X] [--dir <p>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--desc <t>] [--worktree] [--no-attach] [--cc|--plain|--mosh]
                           ${DIM}create + start in one step (like local 'amux exec'); attaches${RESET}
                           ${DIM}when interactive (--cc/--plain/--mosh pick the lane, as for attach). quote '~/…' so the REMOTE box expands it.${RESET}
                           ${BOLD}--account personal|team|team2${RESET} ${DIM}(P/T/X) = which Claude subscription the${RESET}
@@ -1212,8 +1231,12 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
                           ${DIM}session's flags; the box re-spells it for the provider (codex${RESET}
                           ${DIM}--dangerously-bypass-approvals-and-sandbox, gemini --yolo,${RESET}
                           ${DIM}opencode --auto, claude/agy --dangerously-skip-permissions).${RESET}
-                          ${DIM}Without it codex runs sandboxed (amux-default profile if ~/.codex has one).${RESET}
+                          ${DIM}codex, agy and opencode already run with full access when no${RESET}
+                          ${DIM}sandbox is asked for; claude keeps its own permission mode.${RESET}
                           ${DIM}(--yolo is accepted as the compatibility spelling)${RESET}
+                          ${BOLD}--net-sandbox${RESET} ${DIM}/${RESET} ${BOLD}--full-sandbox${RESET} ${DIM}= keep the agent's commands inside the${RESET}
+                          ${DIM}session folder, with / without network (amux help access).${RESET}
+                          ${DIM}Cannot be combined with --full-access.${RESET}
                           ${BOLD}--autoprompt${RESET} ${DIM}= Claude prompt suggestions ON for this session${RESET}
                           ${DIM}(even if your settings turn them off); stored. One-shot on start: --autoprompt. ${RESET}${BOLD}--pwd${RESET}${DIM} is${RESET}
                           ${DIM}local-only and refused here — your cwd is not on the box.${RESET}
@@ -1243,6 +1266,7 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
   ${CYAN}info${RESET} <name>             session status/meta as JSON
   ${CYAN}url${RESET}                     print the box's server URL
   ${CYAN}curl${RESET} <path> [args...]   raw authenticated GET against the API
+  ${CYAN}box${RESET}                     print the configured box name this spelling resolves to
 
 ${BOLD}Last resort${RESET}
   ${CYAN}--ssh${RESET}                   ${DIM}run the verb through the box's own 'amux' over SSH${RESET}
@@ -1356,7 +1380,7 @@ esac
 BOX_ENV="$AMUX_REMOTES_DIR/$BOX.env"
 if [[ ! -f "$BOX_ENV" ]]; then
   # A leading subcommand (the common slip now that a box is mandatory) lands here.
-  case " ls list attach a peek send exec start stop info meta curl url provider model full-access " in
+  case " ls list pick choose attach a peek send exec start stop rm remove del info meta curl url provider account acct model full-access box resolve " in
     *" $BOX "*) die "a box is required first: try 'amux-remote <box> $BOX …' — boxes: $(list_boxes)" ;;
   esac
   # One machine has several SSH names — a LAN alias, a tailnet twin, a couple of

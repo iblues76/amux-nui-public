@@ -36,6 +36,7 @@ esac
 set -uo pipefail
 
 remdir="$HOME/.amux/remotes"
+sessdir="${CC_HOME:-$HOME/.amux}/sessions"
 raw="${1:-}"
 [ -z "$raw" ] && { echo "usage: amux-up [<box>] <name> [flags]   (-h for details)"; exit 2; }
 shift || true
@@ -53,6 +54,15 @@ case "$raw" in
         ""|-*) : ;;   # nothing (or a flag) follows -> $raw is a session name
         *) box="$raw"; name="$1"; box_explicit=1; shift ;;
       esac
+    elif [ ! -f "$sessdir/$raw.env" ] && command -v amux-remote >/dev/null 2>&1; then
+      # Not a configured box name and not a session here: with a name after it,
+      # it may be another spelling of a box (box1-01 for box1), which `amux -H`
+      # already accepts. `amux-remote <x> box` prints the configured name, offline.
+      case "${1:-}" in
+        ""|-*) : ;;
+        *) _b="$(amux-remote "$raw" box 2>/dev/null || true)"
+           if [ -n "$_b" ] && [ -f "$remdir/$_b.env" ]; then box="$_b"; name="$1"; box_explicit=1; shift; fi ;;
+      esac
     fi
     ;;
 esac
@@ -61,9 +71,9 @@ known_local=0
 if [ "$box_explicit" = 1 ]; then
   : # box named explicitly (two-arg form) — go remote, skip the local lane
 elif command -v amux >/dev/null 2>&1; then
-  if amux ls -c 2>/dev/null | grep -qE "(^|[[:space:]])${name}([[:space:]]|\$)"; then
-    known_local=1
-  fi
+  # Registered here = it has a registration file. (Looking for the bare name in
+  # `amux ls -c` never matched: every cell there reads P:cc:<name>.)
+  [ -f "$sessdir/$name.env" ] && known_local=1
 fi
 
 if [ "$known_local" = 1 ]; then

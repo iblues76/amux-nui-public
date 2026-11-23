@@ -1,6 +1,6 @@
 # The amux status line
 
-Claude Code draws one line under the prompt box, and lets a script decide what goes on it. `amux-statusline` is that script, built for running many sessions at once under amux: every session says which one it is, where it runs, what it bills, and how much room it has left.
+Claude Code draws one line under the prompt box, and a script decides what that line shows. `amux-statusline` is such a script, made for running many sessions at once under amux. Each session's line shows which session it is, where it runs, which subscription it bills, and how much context it has left.
 
 ```
  4  laptop:…/api ○  T  Op5⁵ hi · ctx 82% · in 36k · Σ251k · ⎇ feat/login* · 7d 75% 2d 7h · 5h 61% 3h 29m ↻
@@ -15,13 +15,13 @@ It is optional. amux works the same without it.
 amux-statusline --install        # or later, on its own
 ```
 
-Either one writes a `statusLine` entry into `~/.claude/settings.json` that points at the `amux-statusline` command in `~/.local/bin`, so `git pull` in the checkout updates it. It takes effect on the next render; no restart needed.
+Either one writes a `statusLine` entry into `~/.claude/settings.json` that points at the `amux-statusline` command in `~/.local/bin`, so `git pull` in the checkout updates it. It takes effect the next time the line is drawn, without a restart.
 
 - A backup is made first: `~/.claude/settings.json.bak-amux-<date>`.
 - If you already have a status line, it stops and shows it. `amux-statusline --install --force` replaces it (still with a backup).
 - `amux-statusline --uninstall` removes the entry, but only if it is still this one. `./install.sh --uninstall` does that for you.
 
-Needs `python3`. `git` is used for the branch segment only; without it, the branch is simply never shown.
+It needs `python3`. `git` is used only for the branch part, and without git the branch is not shown.
 
 ## What each part means
 
