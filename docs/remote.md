@@ -83,7 +83,7 @@ Each of these commands names the machine first. amux has no default machine and 
 
 `amux -H <box> start <name>` starts the session and, when you run it in a terminal, attaches too. `--no-attach` (or running it from a script) only starts it.
 
-`exec` creates and starts a session in one operation. It needs `--provider` and accepts `--dir`, `--model`, `--account`, `--full-access`, `--net-sandbox` or `--full-sandbox`, `--autoprompt`, `--desc` and `--worktree`. Quote a `~/...` directory so that the remote machine expands it. amux-remote also changes your own home prefix back to `~/`, and says so. `amux -H <box> provider <name> [<p>]` and `amux -H <box> account <name> [P|T|X]` show or change an existing session's agent and account.
+`exec` creates and starts a session in one operation. It needs `--provider` and accepts `--dir`, `--model`, `--account`, `--full-access`, `--net-sandbox` or `--full-sandbox`, `--autoprompt`, `--partners` (opencode only), `--desc` and `--worktree`. Quote a `~/...` directory so that the remote machine expands it. amux-remote also changes your own home prefix back to `~/`, and says so. `amux -H <box> provider <name> [<p>]` and `amux -H <box> account <name> [P|T|X]` show or change an existing session's agent and account.
 
 The same commands work on this machine and through `-H`, by the same rules.
 

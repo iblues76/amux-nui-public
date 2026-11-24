@@ -28,6 +28,7 @@
 #   7g. one rule for running / open shell / stopped in amux and in the server, the
 #       three marks, one stop (ask, wait, end; --now), the same-user rule on macOS
 #   7h. amux offload hands over to the offload tool; amux info --dir / --porcelain
+#   7i. --partners: an opencode session gets OPENCODE_PARTNERS=1 only when asked for
 #   8. the audit catches a planted secret
 #
 # Usage:
@@ -1187,6 +1188,74 @@ o=$(PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux" info --porcelain m-shell 2>&1)
 [ "$o" = "$(printf 'm-shell\tshell\tcodex\t\t%s\t' "$E/d7h")" ] && ok "amux info --porcelain <name>: the one line" || bad "info --porcelain name" "$o"
 rm -f "$E/mock/tmux" "$E/mock/pgrep" "$E/mock/offload"
 for n in m-agent m-shell m-off; do A rm $n >/dev/null; done
+
+# ── 7i. --partners: OPENCODE_PARTNERS=1 for an opencode session, only on request ─
+sect "7i. --partners (opencode): the variable is set only when asked for"
+mkdir -p "$E/d7i" "$HOME/.config/opencode"
+_ocfg="$HOME/.config/opencode/opencode.json"; _ocfg_made=0
+if [ ! -e "$_ocfg" ] && [ ! -e "$HOME/.config/opencode/opencode.jsonc" ]; then
+  printf '%s\n' '{"provider": {"lab": {"options": {"baseURL": "http://127.0.0.1:11434/v1"}, "models": {"m1": {}}}}}' > "$_ocfg"; _ocfg_made=1
+fi
+printf '#!/bin/sh\n[ "${1:-}" = session ] && echo "[]"\nexit 0\n' > "$E/mock/opencode"
+printf '#!/bin/sh\nexit 0\n' > "$E/mock/codex"
+# a stand-in tmux: nothing runs; it keeps the command line a new session would get
+cat > "$E/mock/tmux" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  new-session) for a in "$@"; do last="$a"; done; printf '%s\n' "$last" > "$AMUX_T7I_LOG" ;;
+  has-session|list-sessions|list-panes|respawn-pane) exit 1 ;;
+  display-message) echo 0 ;;
+esac
+exit 0
+SH
+chmod +x "$E/mock/opencode" "$E/mock/codex" "$E/mock/tmux"
+export AMUX_T7I_LOG="$E/t7i.cmd"
+launched() { cat "$AMUX_T7I_LOG" 2>/dev/null; : > "$AMUX_T7I_LOG"; }
+fl() { PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux" info "$1" --porcelain 2>/dev/null | cut -f6; }
+# the shell that starts amux carries the variable in every call below
+o=$(OPENCODE_PARTNERS=1 A exec oc1 --provider opencode --model lab/m1 --partners --dir "$E/d7i" --no-attach); c=$(launched)
+has "export OPENCODE_PARTNERS=1; " "$c" && has "opencode -m lab/m1" "$c" && ! has "--partners" "$c" && has "partner models: shown" "$o" \
+  && ok "exec --partners: opencode starts with OPENCODE_PARTNERS=1; the flag itself is not handed to it" || bad "exec --partners" "$o / $c"
+has "--partners" "$(fl oc1)" && ok "the flag is stored with the session, so a restart keeps it" || bad "--partners not stored" "$(fl oc1)"
+o=$(OPENCODE_PARTNERS=1 A exec oc2 --provider opencode --model lab/m1 --dir "$E/d7i" --no-attach); c=$(launched)
+has "unset OPENCODE_PARTNERS; " "$c" && ! has "export OPENCODE_PARTNERS" "$c" \
+  && ok "no flag: the variable is unset for the agent, although the starting shell has it" || bad "no flag" "$o / $c"
+o=$(OPENCODE_PARTNERS=1 A start oc1 --no-attach); c=$(launched)
+has "export OPENCODE_PARTNERS=1; " "$c" && ok "a plain start of that session has it again (stored)" || bad "restart" "$o / $c"
+o=$(OPENCODE_PARTNERS=1 A start oc1 --no-partners --no-attach); c=$(launched)
+has "unset OPENCODE_PARTNERS; " "$c" && has "--partners" "$(fl oc1)" \
+  && ok "start --no-partners: left out for one launch, the stored flag stays" || bad "start --no-partners" "$o / $c / $(fl oc1)"
+o=$(A start oc2 --partners --no-attach); c=$(launched)
+has "export OPENCODE_PARTNERS=1; " "$c" && ! has "--partners" "$(fl oc2)" \
+  && ok "start --partners: on for one launch, not stored" || bad "start --partners" "$o / $c / $(fl oc2)"
+o=$(A exec cx1 --provider codex --partners --dir "$E/d7i" --no-attach); c=$(launched)
+has "opencode provider only" "$o" && [ -z "$c" ] && [ ! -e "$S/cx1.env" ] \
+  && ok "exec --partners with another agent is refused: nothing registered, nothing started" || bad "codex + --partners" "$o / $c"
+A register cx1 --provider codex --dir "$E/d7i" >/dev/null
+o=$(A start cx1 --partners --no-attach); c=$(launched)
+has "opencode provider only" "$o" && [ -z "$c" ] && ok "start --partners on a session of another agent is refused" || bad "start codex --partners" "$o / $c"
+o=$(A provider oc1 codex); ! has "partners" "$(fl oc1)" \
+  && ok "changing the session to another agent drops the flag" || bad "provider change kept --partners" "$o / $(fl oc1)"
+o=$(A help flags); has "--partners" "$o" && has "OPENCODE_PARTNERS" "$o" && has "--no-partners" "$o" \
+  && ok "amux help flags explains --partners and --no-partners" || bad "help flags: --partners"
+# the server keeps the same rule in its own launch path
+o=$(python3 - bin/amux-server.py <<'PYT' 2>&1
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+ns = {"re": re}
+exec(src[src.index("_PARTNERS_RE = "):src.index("def _respell_full_access(")], ns)
+f = ns["_take_partners"]
+print([f("--model x --partners"), f("--partners --auto"), f("--no-partners"), f("--model x"), f(""), f("--partners --no-partners"), f("--partnersx")])
+PYT
+)
+has "[('--model x', True), ('--auto', True), ('', False), ('--model x', None), ('', None), ('', False), ('--partnersx', None)]" "$o" \
+  && ok "the server strips the marker the same way (stored, one launch, --no-partners)" || bad "server _take_partners" "$o"
+n=$(grep -c 'shell_rc += _PARTNERS_ENV if _partners else _PARTNERS_OFF' bin/amux-server.py)
+m=$(grep -c 'if pt == "1": body\["partners"\] = True' bin/amux-remote)
+[ "$n" = 1 ] && [ "$m" = 1 ] && ok "the server sets or unsets it after the login profile; amux -H <box> exec sends the flag" || bad "server/remote wiring" "$n $m"
+rm -f "$E/mock/tmux" "$E/mock/opencode" "$E/mock/codex" "$AMUX_T7I_LOG"; unset AMUX_T7I_LOG
+[ "$_ocfg_made" = 1 ] && rm -f "$_ocfg"
+for n in oc1 oc2 cx1; do A rm $n >/dev/null; done
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"

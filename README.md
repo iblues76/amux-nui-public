@@ -4,7 +4,7 @@ amux-nui-public is a build of [**amux**](https://github.com/mixpeek/amux) that i
 
 It is the setup that I use every day, with the personal parts taken out. It contains no machine names, accounts, addresses or credentials, so you add your own.
 
-**Version 0.7.5**, which bundles a modified **amux 0.9.19** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
+**Version 0.7.6**, which bundles a modified **amux 0.9.20** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
 
 It runs on **macOS** and **Linux**, and on **Windows inside WSL2**. [What you need](#what-you-need) lists what each system needs.
 
@@ -62,7 +62,7 @@ amux stop api            # the conversation is kept; `amux start api` resumes it
 amux --help              # everything else
 ```
 
-A new session needs `--provider`, which is `claude`, `codex`, `gemini`, `opencode` or `agy`. With `opencode`, amux accepts local models only and refuses cloud providers. `--model`, `--full-access` and any other flags for the agent are passed on to it and remembered. codex, agy and opencode run with full access unless you add `--net-sandbox` or `--full-sandbox`, which keep the agent's commands inside the session folder, with or without network. See [docs/sandbox.md](docs/sandbox.md).
+A new session needs `--provider`, which is `claude`, `codex`, `gemini`, `opencode` or `agy`. With `opencode`, amux accepts local models only and refuses cloud providers. `--partners` (opencode only) starts it with `OPENCODE_PARTNERS=1`, for a plugin that hides some models unless that variable is set; without the flag amux unsets the variable for the agent. `--model`, `--full-access` and any other flags for the agent are passed on to it and remembered. codex, agy and opencode run with full access unless you add `--net-sandbox` or `--full-sandbox`, which keep the agent's commands inside the session folder, with or without network. See [docs/sandbox.md](docs/sandbox.md).
 
 There is also a web dashboard, which you can use from a phone on your private network. Run `amux serve`, then open `https://localhost:8822`.
 

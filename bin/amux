@@ -8,8 +8,8 @@
 
 set -euo pipefail
 
-CC_VERSION="0.9.19"
-CC_RELEASE="0.7.5"   # this repository's release: the VERSION file (tools/selftest checks they agree)
+CC_VERSION="0.9.20"
+CC_RELEASE="0.7.6"   # this repository's release: the VERSION file (tools/selftest checks they agree)
 _RESUME_TARGET=""
 _RESUME_SKIPPED=""
 
@@ -939,6 +939,15 @@ parse_claude_flags() {
         CC_FLAGS+=("--autoprompt")
         shift
         ;;
+      # --partners (2026-11-24): opencode only. A marker token in CC_FLAGS, like
+      # --autoprompt: every launch path strips it and starts opencode with
+      # OPENCODE_PARTNERS=1 in its environment (an OpenCode plugin reads that to also
+      # list the partner models it hides by default). Without the marker the variable
+      # is unset for the agent, whatever the launching shell or tmux carries.
+      --partners)
+        CC_FLAGS+=("--partners")
+        shift
+        ;;
       # Sandboxes (2026-11-21): --net-sandbox / --full-sandbox confine the agent's commands
       # to the session folder (no network for --full-sandbox). Persisted as marker tokens
       # in CC_FLAGS; cmd_start turns them into each agent's own controls via amux-sandbox.
@@ -1105,6 +1114,9 @@ _write_registration() {
   fi
   [[ -n "$provider" ]] || die "--provider is required for a new session (no default): amux $verb $name --provider claude|codex|gemini|opencode|iterm2|agy"
   validate_provider "$provider"
+  if [[ " $CC_FLAGS_STR " == *" --partners "* && "$provider" != "opencode" ]]; then
+    die "--partners applies to the opencode provider only (session '$name' runs $provider)"
+  fi
   local account extra
   account=$(resolve_account_for_write "$provider" "$file")
   extra=$(_session_extra_lines "$file" "$provider")   # read BEFORE the file is rewritten
@@ -1120,7 +1132,7 @@ _write_registration() {
 
 cmd_register() {
   local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: amux register <name> --provider claude|codex|gemini|opencode|iterm2|agy [--model opus] [--full-access] [--dir /path | --pwd] [--autoprompt] [agent flags...] (--provider required for a new session)"
+  [[ -n "$name" ]] || die "usage: amux register <name> --provider claude|codex|gemini|opencode|iterm2|agy [--model opus] [--full-access] [--dir /path | --pwd] [--autoprompt] [--partners] [agent flags...] (--provider required for a new session)"
   validate_name "$name"
   shift
 
@@ -1231,6 +1243,8 @@ while i < len(toks):
         i += 1; continue
     if t in YOLO:
         was_yolo = True; i += 1; continue
+    if t == "--partners" and new != "opencode":
+        i += 1; continue   # an opencode-only marker: it does not follow the session to another agent
     keep.append(t); i += 1
 
 def default_model():
@@ -1501,7 +1515,7 @@ cmd_start() {
   # One-shot account (2026-09-05): `amux start <name> --account team` puts THIS
   # launch on the other Claude identity without touching the stored choice.
   local _fresh=0 _oneshot_full_access=0 _oneshot_sandbox="" _ft _acct_override="" _acct_next=0 _noattach=0
-  local _f_rest=() _autoprompt=0 _color_next=0
+  local _f_rest=() _autoprompt=0 _color_next=0 _partners=0 _partners_once=""
   for _ft in "$@"; do
     if (( _prov_next )); then provider_override="$_ft"; _prov_next=0; continue; fi
     if (( _color_next )); then AMUX_COLOR_ONESHOT="$_ft"; _color_next=0; continue; fi
@@ -1518,6 +1532,8 @@ cmd_start() {
       --net-sandbox)  _oneshot_sandbox=net ;;    # one-shot: confine THIS launch (amux-sandbox)
       --full-sandbox) _oneshot_sandbox=full ;;
       --autoprompt) _autoprompt=1 ;;   # one-shot: prompt suggestions on for this launch
+      --partners)    _partners_once=1 ;;   # one-shot: opencode partner models for this launch
+      --no-partners) _partners_once=0 ;;   # one-shot: not for this launch, although stored
       --account) _acct_next=1 ;;
       --account=*) _acct_override=$(normalize_account "${_ft#--account=}"); validate_account "$_acct_override" ;;
       --color) _color_next=1 ;;        # one-shot tab/square color for this launch (amux color)
@@ -1548,6 +1564,21 @@ cmd_start() {
     _apf="${_apf// --autoprompt / }"; _apf="${_apf# }"; CC_FLAGS="${_apf% }"
   fi
   AMUX_AUTOPROMPT=$_autoprompt
+  # --partners is an amux marker too (opencode only): strip it before any launch
+  # builder reads CC_FLAGS. One-shot --partners / --no-partners beats the stored
+  # marker. A stored marker is dropped without a word when this launch runs another
+  # agent (start --provider <p>); asking for it by hand there is an error.
+  local _ptf=" ${CC_FLAGS:-} "
+  if [[ "$_ptf" == *" --partners "* ]]; then
+    _partners=1
+    while [[ "$_ptf" == *" --partners "* ]]; do _ptf="${_ptf// --partners / }"; done
+    _ptf="${_ptf# }"; CC_FLAGS="${_ptf% }"
+  fi
+  [[ -z "$_partners_once" ]] || _partners=$_partners_once
+  if [[ "${CC_PROVIDER:-claude}" != "opencode" ]]; then
+    [[ "$_partners_once" != 1 ]] || die "--partners applies to the opencode provider only (session '$name' runs ${CC_PROVIDER:-claude})"
+    _partners=0
+  fi
   # Sandbox (2026-11-21): one-shot --net-sandbox/--full-sandbox > one-shot --full-access >
   # the stored marker. The markers never reach an agent; a sandbox drops every stored
   # full-access spelling, and a one-shot --full-access drops a stored sandbox.
@@ -2179,6 +2210,17 @@ PYEOF
   # to prevent auth conflict — BYO-key users don't have oauthAccount so they're
   # unaffected.
   local shell_setup=""
+  # opencode partner models (--partners): the variable is set only by the marker.
+  # Without it, unset: a value in the launching shell or in the tmux server's
+  # environment must not reach the agent.
+  if [[ "$provider" == "opencode" ]]; then
+    if (( _partners )); then
+      shell_setup="export OPENCODE_PARTNERS=1; "
+      echo "  ${DIM}partner models: shown (--partners)${RESET}"
+    else
+      shell_setup="unset OPENCODE_PARTNERS; "
+    fi
+  fi
   if [[ "$provider" == "claude" ]]; then
     shell_setup="unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; "
     # AUTH FIX (2026-07-06): source the long-lived CLAUDE_CODE_OAUTH_TOKEN (setup-token)
@@ -2265,7 +2307,7 @@ PYEOF
 cmd_exec() {
   # Register + start in one step
   local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: amux exec <name> --provider claude|codex|gemini|opencode|iterm2|agy [--model opus] [--full-access] [--dir /path | --pwd] [--autoprompt] [agent flags...] (--provider required for a new session)"
+  [[ -n "$name" ]] || die "usage: amux exec <name> --provider claude|codex|gemini|opencode|iterm2|agy [--model opus] [--full-access] [--dir /path | --pwd] [--autoprompt] [--partners] [agent flags...] (--provider required for a new session)"
   validate_name "$name"
   shift
 
@@ -3763,10 +3805,10 @@ ${BOLD}Key commands:${RESET}
   amux ls [-c]                   List sessions with status + preview (-c: compact grid). Marks: * running,
                                  ~ tmux session open but the agent has left, blank stopped (● ◐ ○ with -c);
                                  by name, on every machine: amux search --sessions <text>
-  amux exec <name> --provider <p> [--dir <path> | --pwd] [--full-access | --net-sandbox | --full-sandbox] [--autoprompt]
+  amux exec <name> --provider <p> [--dir <path> | --pwd] [--full-access | --net-sandbox | --full-sandbox] [--autoprompt] [--partners]
                                  Register + start in one step (--provider REQUIRED for a new session:
                                  claude|codex|gemini|opencode|iterm2|agy)
-  amux start <name> [--fresh] [--full-access | --net-sandbox | --full-sandbox] [--autoprompt] [--no-attach] [--color <c>]
+  amux start <name> [--fresh] [--full-access | --net-sandbox | --full-sandbox] [--autoprompt] [--partners | --no-partners] [--no-attach] [--color <c>]
                                  Start a registered session (flags apply to this launch only)
   amux attach <name>             Attach to a running session (detach: Ctrl-b d); amux 3 = session #3 from ls
   amux up [<box>] <name> [flags] Start if needed, THEN attach (== amux-up; also amux -H <box> up <name>)
@@ -3941,7 +3983,8 @@ ${BOLD}Providers — which agent a session runs:${RESET}
 
   ${DIM}opencode is the LOCAL-MODEL lane: amux pins a verified local (Ollama/tailnet)
   provider/model from ~/.config/opencode/opencode.json[c] or AMUX_OPENCODE_MODEL and
-  REFUSES anything else — it never runs on the Claude subscription (compliance).${RESET}$(_provider_avail_note)
+  REFUSES anything else — it never runs on the Claude subscription (compliance).
+  --partners (opencode only) starts it with OPENCODE_PARTNERS=1: amux help flags.${RESET}$(_provider_avail_note)
   See also: amux help access · amux models [provider]
 EOF
     ;;
@@ -4035,6 +4078,13 @@ ${BOLD}Agent flags (on register/exec):${RESET}
   --autoprompt                 Claude prompt suggestions ON for this session (they are
                                e.g. after you turned them off); stored, so restarts keep it. Also works
                                one-shot: amux start <name> --autoprompt
+  --partners                   opencode only: start it with OPENCODE_PARTNERS=1 in its
+                               environment, for an OpenCode plugin that hides the
+                               partner models unless that variable is set. Stored, so
+                               restarts keep it. Without it amux unsets the variable
+                               for the agent, whatever the shell you start from has.
+                               One launch only: amux start <name> --partners
+                               Leave it out once: amux start <name> --no-partners
   --verbose                    Verbose mode
   --chrome / --no-chrome       Browser automation toggle
   ... and all other claude CLI flags pass through
@@ -4261,7 +4311,7 @@ _amux() {
     fi
   }
   case $cmd in
-    start)             _amux_name_then --fresh --full-access --net-sandbox --full-sandbox --account --no-attach --color --find $lane ;;
+    start)             _amux_name_then --fresh --full-access --net-sandbox --full-sandbox --account --no-attach --partners --no-partners --color --find $lane ;;
     attach|a)          _amux_name_then --color --find $lane ;;
     color|recolor)     _amux_name_then --reroll ;;
     up)                _amux_name_then --fresh --full-access --net-sandbox --full-sandbox --account --mosh --cc --plain ;;
@@ -4280,14 +4330,14 @@ _amux() {
       # -H <box> exec is the server's exec: its own, shorter option list (with --desc
       # and --worktree, which do not exist locally). register does not launch.
       if (( remote )); then
-        _amux_name_then --provider --account --model --dir --full-access --yolo --net-sandbox --full-sandbox --autoprompt \
+        _amux_name_then --provider --account --model --dir --full-access --yolo --net-sandbox --full-sandbox --autoprompt --partners \
           --desc --worktree --no-attach --mosh --cc --plain
       elif [[ $cmd == (exec|run) ]]; then
-        _amux_name_then --provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --effort \
+        _amux_name_then --provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --partners --effort \
           --permission-mode --system-prompt --append-system-prompt --mcp-config \
           --allowedTools --disallowedTools --verbose --chrome --no-chrome --color --no-attach
       else
-        _amux_name_then --provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --effort \
+        _amux_name_then --provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --partners --effort \
           --permission-mode --system-prompt --append-system-prompt --mcp-config \
           --allowedTools --disallowedTools --verbose --chrome --no-chrome --color
       fi ;;
@@ -4406,9 +4456,9 @@ _amux_complete() {
   else
     for w in "${COMP_WORDS[@]}"; do [[ $w == --find ]] && { lane="--mosh --cc --plain"; rawopt="--raw"; }; done
   fi
-  local reg_local="--provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --effort --permission-mode --system-prompt --append-system-prompt --mcp-config --allowedTools --disallowedTools --verbose --chrome --no-chrome --color"
+  local reg_local="--provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --partners --effort --permission-mode --system-prompt --append-system-prompt --mcp-config --allowedTools --disallowedTools --verbose --chrome --no-chrome --color"
   case $cmd in
-    start)             words="--fresh --full-access --net-sandbox --full-sandbox --account --no-attach --color --find $lane" ;;
+    start)             words="--fresh --full-access --net-sandbox --full-sandbox --account --no-attach --partners --no-partners --color --find $lane" ;;
     attach|a)          words="--color --find $lane" ;;
     color|recolor)     words="--reroll" ;;
     up)                words="--fresh --full-access --net-sandbox --full-sandbox --account --mosh --cc --plain" ;;
@@ -4426,7 +4476,7 @@ _amux_complete() {
     register|reg|exec|run)
       # -H <box> exec is the server's exec, with its own option list; register does not launch
       if (( remote )); then
-        words="--provider --account --model --dir --full-access --yolo --net-sandbox --full-sandbox --autoprompt --desc --worktree --no-attach --mosh --cc --plain"
+        words="--provider --account --model --dir --full-access --yolo --net-sandbox --full-sandbox --autoprompt --partners --desc --worktree --no-attach --mosh --cc --plain"
       elif [[ $cmd == exec || $cmd == run ]]; then words="$reg_local --no-attach"
       else words="$reg_local"; fi ;;
     ls|list)           if (( remote )); then w="-c --bare --names"; else w="-c --bare"; fi

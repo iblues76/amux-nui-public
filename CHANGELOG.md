@@ -2,6 +2,10 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.6 — 2026-11-24
+
+- **`--partners` for opencode sessions.** `amux exec <name> --provider opencode --partners` starts OpenCode with `OPENCODE_PARTNERS=1` in its environment. This is for an OpenCode plugin that hides some models (a provider's partner models, for example) unless that variable is set. The flag is stored with the session, like `--autoprompt`, so a restart keeps it. `amux start <name> --partners` turns it on for one launch, and `amux start <name> --no-partners` leaves it out for one launch. Without the flag, amux unsets the variable for the agent, so a value in the shell you start from, in tmux or in the server's environment does not reach it. Other agents refuse the flag. It works the same through a server (`amux -H <box> exec … --partners`); update the server on a machine where you use it that way.
+
 ## 0.7.5 — 2026-11-24
 
 The command line and the server each had their own answer to "is this session running" and their own way to stop one. They now share one rule. Update the server on every machine: the list a new `amux` draws for another machine is best with a new server there (an older one still works).

@@ -1781,6 +1781,7 @@ def _start_iterm2_session_tab(name: str, cfg: dict, fresh: bool = False,
         # claude sessions; other agents are the tmux providers).
         cmd = "claude"
         flags, _autoprompt = _take_autoprompt(cfg.get("CC_FLAGS", ""))
+        flags, _ = _take_partners(flags)   # an opencode-only marker
         if _SANDBOX_RE.search(flags):
             return False, "--net-sandbox / --full-sandbox are not available for iterm2 sessions (use a tmux provider)"
         flags = _respell_full_access(flags, "claude")
@@ -8281,6 +8282,31 @@ def _take_autoprompt(flags: str) -> tuple[str, bool]:
     return " ".join(_AUTOPROMPT_RE.sub(" ", flags).split()), True
 
 
+_PARTNERS_RE = re.compile(r'(?:^|\s)--(no-)?partners(?=\s|$)')
+_PARTNERS_ENV = "export OPENCODE_PARTNERS=1; "
+_PARTNERS_OFF = "unset OPENCODE_PARTNERS; "
+
+
+def _take_partners(flags: str):
+    """Strip amux's --partners / --no-partners markers from a flags string (2026-11-24).
+
+    --partners is for the opencode provider only: the session starts with
+    OPENCODE_PARTNERS=1 in its environment, which an OpenCode plugin reads to also list
+    the partner models it hides by default. Like --autoprompt it is stored in CC_FLAGS
+    (or passed for one launch on start) and is NOT an agent flag, so every launch path
+    strips it. --no-partners (start only) leaves the stored marker out for one launch.
+    Returns (flags without the markers, True / False / None when not mentioned).
+    """
+    if not flags:
+        return flags, None
+    found = None
+    for m in _PARTNERS_RE.finditer(flags):
+        found = m.group(1) is None
+    if found is None:
+        return flags, None
+    return " ".join(_PARTNERS_RE.sub(" ", flags).split()), found
+
+
 def _respell_full_access(flags: str, provider: str) -> str:
     """Rewrite the provider-neutral --full-access into the spelling the agent
     binary actually accepts (2026-08-18, mirrors the bash CLI). --full-access is
@@ -8720,6 +8746,9 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
         flags, _autoprompt = _take_autoprompt(flags)
         extra_flags, _autoprompt_once = _take_autoprompt(extra_flags)
         _autoprompt = _autoprompt or _autoprompt_once
+        # --partners (stored or one-shot) / --no-partners (one-shot): opencode only.
+        flags, _partners_stored = _take_partners(flags)
+        extra_flags, _partners_once = _take_partners(extra_flags)
         # Claude Code v2.1.69+ rejects --dangerously-skip-permissions when running as root.
         if os.getuid() == 0 and "--dangerously-skip-permissions" in flags:
             flags = flags.replace("--dangerously-skip-permissions", "").strip()
@@ -8729,6 +8758,10 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
         # Determine session resume strategy: name-based (new) > UUID (migration) > fresh
         meta = _load_meta(name)
         provider = (provider_override or cfg.get("CC_PROVIDER", "claude")).strip().lower()
+        if _partners_once and provider != "opencode":
+            return False, f"--partners applies to the opencode provider only (session '{name}' runs {provider})"
+        _partners = provider == "opencode" and bool(
+            _partners_stored if _partners_once is None else _partners_once)
         # --full-access is amux's provider-neutral word (2026-08-18) — re-spell it
         # for THIS provider before anything downstream reads the flags, or it
         # lands on the agent's argv and codex/gemini/opencode reject it.
@@ -9263,6 +9296,12 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
                 print(f"[start] {name}: prompt suggestions on (--autoprompt)")
             if provider not in ("codex", "gemini", "opencode") and _has_oauth:
                 shell_rc += "unset ANTHROPIC_API_KEY; "
+            # opencode partner models: set only by the marker; otherwise unset, so a value
+            # in the server's own environment or in the login profile never reaches the agent.
+            if provider == "opencode":
+                shell_rc += _PARTNERS_ENV if _partners else _PARTNERS_OFF
+                if _partners:
+                    print(f"[start] {name}: partner models shown (--partners)")
             # GUARD (2026-09-14): this failure was invisible from the outside -- the server
             # log said team while the pane actually ran as personal. If anything ever
             # re-orders the lines above, stop the start rather than run on the wrong slot.
@@ -39608,6 +39647,13 @@ class CCHandler(BaseHTTPRequestHandler):
             # start_session strips and turns into CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=true.
             if body.get("autoprompt") and provider in ("claude", "iterm2"):
                 cfg["CC_FLAGS"] = f'{cfg["CC_FLAGS"]} --autoprompt'.strip()
+            # partners (2026-11-24): REST mirror of `amux exec <name> --provider opencode
+            # --partners`; stored as a CC_FLAGS marker that start_session strips and turns
+            # into OPENCODE_PARTNERS=1. Refused for every other provider.
+            if body.get("partners"):
+                if provider != "opencode":
+                    return self._json({"error": "--partners applies to the opencode provider only"}, 400)
+                cfg["CC_FLAGS"] = f'{cfg["CC_FLAGS"]} --partners'.strip()
             if provider == "iterm2":
                 # Optional since 2026-08-12: with no pane id, the session
                 # spawns its own iTerm2 tab at first start (see
@@ -42342,6 +42388,8 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         }, 400)
                     was_yolo = _is_yolo_enabled(current_flags, cfg)
                     flags_no_yolo = _strip_provider_yolo_flags(flags_no_model)
+                    if provider_val != "opencode":
+                        flags_no_yolo, _ = _take_partners(flags_no_yolo)
                     default_model = _default_model_for_provider(provider_val)
                     flags = (
                         f"--model {default_model} {flags_no_yolo}".strip()

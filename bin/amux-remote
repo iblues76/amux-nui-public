@@ -697,9 +697,9 @@ cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; err
 cmd_exec() {
   require_config
   local name="${1:-}"; shift || true
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--partners] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
   validate_remote_name "$name"
-  local dir="" model="" desc="" provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0 sandbox=""
+  local dir="" model="" desc="" provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0 sandbox="" partners=0
   local attach_flags=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -708,6 +708,8 @@ cmd_exec() {
       --pwd)      die "--pwd is local-only: your current directory ($PWD) is on this machine, not on $BOX — pass --dir <path> (a path on $BOX)" ;;
       # Prompt suggestions ON for this session; stored in its flags.
       --autoprompt) autoprompt=1; shift ;;
+      # opencode only: the session starts with OPENCODE_PARTNERS=1; stored in its flags.
+      --partners) partners=1; shift ;;
       # Claude account (2026-09-05): personal|team|team2 (P/T/X). Claude/iterm2 only;
       # the server accepts-and-ignores it for other providers.
       --account)  account="${2:-}"
@@ -746,7 +748,7 @@ cmd_exec() {
       # Sandboxes: confine the agent's commands to the session folder.
       --net-sandbox)  sandbox=net;  shift ;;
       --full-sandbox) sandbox=full; shift ;;
-      -*)         die "unknown exec option: $1 (try --dir, --model, --provider, --account, --full-access, --net-sandbox, --full-sandbox, --autoprompt, --desc, --worktree, --no-attach, --cc, --plain, --mosh)" ;;
+      -*)         die "unknown exec option: $1 (try --dir, --model, --provider, --account, --full-access, --net-sandbox, --full-sandbox, --autoprompt, --partners, --desc, --worktree, --no-attach, --cc, --plain, --mosh)" ;;
       *)          die "unexpected argument: $1 (name comes first)" ;;
     esac
   done
@@ -756,6 +758,9 @@ cmd_exec() {
   # a better error. exec on an EXISTING session errors "already exists" anyway,
   # so unlike local amux there is no stored-provider-preserving path to allow.)
   [[ -n "$provider" ]] || die "--provider is required (no default): amux-remote $BOX exec $name --provider claude|codex|gemini|opencode|iterm2|agy [--dir <path>] ..."
+  if (( partners )) && [[ "$provider" != "opencode" ]]; then
+    die "--partners applies to the opencode provider only (this session would run $provider)"
+  fi
 
   # `~` is expanded by the LOCAL shell long before we see it, so an unquoted
   # `--dir ~/x` sends the CALLER's home path. That is right Mac->Mac and WRONG
@@ -774,7 +779,7 @@ cmd_exec() {
   local payload resp created ok msg
   payload=$(python3 -c '
 import json,sys
-name, d, desc, wt, prov, fa, acct, ap, sbx = sys.argv[1:10]
+name, d, desc, wt, prov, fa, acct, ap, sbx, pt = sys.argv[1:11]
 body = {"name": name}
 if d:         body["dir"]      = d
 if desc:      body["desc"]     = desc
@@ -784,7 +789,8 @@ if fa == "1": body["full_access"] = True
 if acct:      body["account"]  = acct
 if ap == "1": body["autoprompt"] = True
 if sbx:       body["sandbox"]  = sbx
-print(json.dumps(body))' "$name" "$dir" "$desc" "$worktree" "$provider" "$full_access" "$account" "$autoprompt" "$sandbox")
+if pt == "1": body["partners"] = True
+print(json.dumps(body))' "$name" "$dir" "$desc" "$worktree" "$provider" "$full_access" "$account" "$autoprompt" "$sandbox" "$partners")
 
   resp=$(api POST /api/sessions -H 'Content-Type: application/json' -d "$payload")
   created=$(printf '%s' "$resp" | python3 -c '
@@ -810,6 +816,9 @@ print(str(d.get("error") or d.get("message") or "create failed"))' 2>/dev/null)
   fi
   if (( autoprompt )); then
     echo "${GREEN}✓${RESET} prompt suggestions on ${DIM}(--autoprompt)${RESET}"
+  fi
+  if (( partners )); then
+    echo "${GREEN}✓${RESET} partner models shown ${DIM}(--partners; OPENCODE_PARTNERS=1 for the agent)${RESET}"
   fi
 
   if [[ -n "$model" ]]; then
@@ -1244,7 +1253,7 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
                           ${DIM}escape stripped so replayed terminal queries/clipboard writes can't fire;${RESET}
                           ${DIM}--raw = the server's bytes untouched)${RESET}
   ${CYAN}send${RESET} <name> <text...>   send text/prompt to a session
-  ${CYAN}exec${RESET} <name> --provider <p> [--account P|T|X] [--dir <p>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--desc <t>] [--worktree] [--no-attach] [--cc|--plain|--mosh]
+  ${CYAN}exec${RESET} <name> --provider <p> [--account P|T|X] [--dir <p>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--partners] [--desc <t>] [--worktree] [--no-attach] [--cc|--plain|--mosh]
                           ${DIM}create + start in one step (like local 'amux exec'); attaches${RESET}
                           ${DIM}when interactive (--cc/--plain/--mosh pick the lane, as for attach). quote '~/…' so the REMOTE box expands it.${RESET}
                           ${BOLD}--account personal|team|team2${RESET} ${DIM}(P/T/X) = which Claude subscription the${RESET}
@@ -1264,6 +1273,9 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
                           ${BOLD}--autoprompt${RESET} ${DIM}= Claude prompt suggestions ON for this session${RESET}
                           ${DIM}(even if your settings turn them off); stored. One-shot on start: --autoprompt. ${RESET}${BOLD}--pwd${RESET}${DIM} is${RESET}
                           ${DIM}local-only and refused here — your cwd is not on the box.${RESET}
+                          ${BOLD}--partners${RESET} ${DIM}= opencode only: the agent starts with OPENCODE_PARTNERS=1${RESET}
+                          ${DIM}(a plugin then lists its partner models too); stored. On start:${RESET}
+                          ${DIM}--partners for one launch, --no-partners to leave it out once.${RESET}
                           ${BOLD}--provider is REQUIRED${RESET} ${DIM}(claude|codex|gemini|opencode|agy — no default:${RESET}
                           ${DIM}a silent claude fallback once put an opencode workspace on${RESET}
                           ${DIM}the Claude subscription)${RESET}
