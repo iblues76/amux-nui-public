@@ -81,7 +81,7 @@ count(){ # $1 = box key
       # local rows " 3* name…", remote rows " * name…" / "   name…"
       awk 'NF{t++} /^[[:space:]]*[0-9]*\*/{r++} END{print r+0, t+0}'
     else
-      awk '{r+=gsub(/●/,"");t+=gsub(/○/,"")} END{print r+0, r+t}'
+      awk '{r+=gsub(/●/,"");t+=gsub(/○/,"");t+=gsub(/◐/,"")} END{print r+0, r+t}'
     fi
 }
 

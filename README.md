@@ -4,7 +4,7 @@ amux-nui-public is a build of [**amux**](https://github.com/mixpeek/amux) that i
 
 It is the setup that I use every day, with the personal parts taken out. It contains no machine names, accounts, addresses or credentials, so you add your own.
 
-**Version 0.7.4**, which bundles a modified **amux 0.9.17** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
+**Version 0.7.5**, which bundles a modified **amux 0.9.19** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
 
 It runs on **macOS** and **Linux**, and on **Windows inside WSL2**. [What you need](#what-you-need) lists what each system needs.
 
@@ -187,6 +187,8 @@ With `--agentic`, a coding agent does the search, and you ask your question in p
 
 Every command prints its help with `-h`.
 
+**Moving a session's work to another machine.** `amux offload claude <folder or session>` hands over to [offload](https://git.nuilab.org/f.ortega/offload), a separate one-file tool: the session working in the folder writes a handoff note, the folder is copied over ssh, and a new amux session starts on the other machine and reads the note. `amux offload <anything else>` runs the same tool.
+
 ## Docs
 
 - [**accounts.md**](docs/accounts.md): how to bill each session to a different Claude subscription
@@ -217,7 +219,7 @@ One rule holds everywhere: a secret never appears on a command line, in output, 
 - Tokens move over stdin, SSH, or a mode-600 file. `amux-config` has no `--token` flag on purpose.
 - Where a token must be identified, only a short prefix and a length are printed.
 - `setup/serve-install` binds to loopback plus one address you choose, never `0.0.0.0`.
-- On Linux, a request from the same machine skips the token only when it comes from your own user or root. Other people with a login on that machine are asked for the token like anyone else. See [docs/remote.md](docs/remote.md).
+- A request from the same machine skips the token only when it comes from your own user (on Linux, also root). Other people with a login on that machine are asked for the token like anyone else. See [docs/remote.md](docs/remote.md).
 - A web page open in a browser on the same machine cannot use that trust: the server refuses a change asked for by a page of another site.
 - Text typed in the dashboard (a description, tags, a folder, a branch) is stored as text and cannot run as a command.
 - `tools/audit-clean` scans the tree (and `--history`) for credentials, private addresses and personal data before anything is published. `tools/selftest` checks that the checkout works, without touching your real `~/.amux`.

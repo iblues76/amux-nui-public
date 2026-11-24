@@ -1663,7 +1663,8 @@ def fanout(targets, req, budget, show=True, terms=None, limit=None):
 # regular-expression dialect, for every machine.
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-LS_ROW = re.compile(r"^\s*(\d+)(\*?)\s+(\S+)")  # ` 12* P:cc:name …`, colors stripped
+LS_ROW = re.compile(r"^\s*(\d+)([*~]?)\s+(\S+)")  # ` 12* P:cc:name …` (or `12~`), colors stripped
+LS_STATE = {"*": "agent", "~": "shell", "": "stopped"}   # the marks of `amux ls`
 LS_CODE = {"claude": "cc", "iterm2": "it", "codex": "cx", "gemini": "gm", "opencode": "oc", "agy": "ag"}
 LS_CODE_COL = {"cc:": "1;38;5;51", "it:": "1;38;5;45", "cx:": "1;38;5;201",
                "oc:": "1;38;5;46", "ag:": "1;38;5;208", "gm:": "1;38;5;141"}
@@ -1739,7 +1740,7 @@ def sessions_here(color):
             continue
         tag, _, name = m.group(3).rpartition(":")
         rows.append({"row": int(m.group(1)), "name": name, "tag": tag + ":" if tag else "",
-                     "running": bool(m.group(2)), "line": line})
+                     "running": m.group(2) == "*", "state": LS_STATE[m.group(2)], "line": line})
     return rows, None
 
 
@@ -1780,14 +1781,17 @@ def sessions_there(box, wait):
     for i, x in enumerate(data, 1):
         # the number that machine's own `amux ls` shows; an older server does not send it
         rows.append({"row": x.get("row") or i, "name": x["name"], "tag": ls_tag(x.get("provider"), x.get("account")),
-                     "running": bool(x.get("running")), "dir": x.get("dir") or "",
+                     "running": bool(x.get("running")),
+                     # an older server sends only "running"
+                     "state": x.get("state") or ("agent" if x.get("running") else "stopped"),
+                     "dir": x.get("dir") or "",
                      "flags": x.get("flags") or "", "preview": x.get("preview") or ""})
     return rows, None
 
 
 def ls_line(r, c):
     """A session from another machine, drawn as `amux ls` draws a row (cmd_ls in amux)."""
-    icon = (c("32") + "*" + c("0")) if r["running"] else (c("2") + " " + c("0"))
+    icon = {"agent": c("32") + "*" + c("0"), "shell": c("33") + "~" + c("0")}.get(r["state"], c("2") + " " + c("0"))
     tag = " " * max(0, LS_PREFIX_W - len(r["tag"])) + tag_colored(r["tag"], c)
     extra = ""
     if "--dangerously-skip-permissions" in r["flags"]:
@@ -1819,7 +1823,8 @@ def ls_grid(rows, c, width):
             if idx >= total:
                 continue
             r = rows[idx]
-            mark, nc = ((c("32") + "●" + c("0"), c("1")) if r["running"] else (c("2") + "○" + c("0"), c("2")))
+            mark, nc = {"agent": (c("32") + "●" + c("0"), c("1")),
+                        "shell": (c("33") + "◐" + c("0"), "")}.get(r["state"], (c("2") + "○" + c("0"), c("2")))
             line += "%*d %s %s%s%-*s%s  " % (numw, r["row"], mark, tag_colored(r["tag"], c), nc,
                                              maxw - len(r["tag"]), r["name"], c("0"))
         out.append(line.rstrip())
@@ -1865,7 +1870,7 @@ def sessions_search(match, what, targets, compact, wait):
         print(HR)
         print("  ▸ %s%s%s  ·  %d of %d session%s · %s%d ●%s running"
               % (c("1"), name, c("0"), len(hits), len(r["rows"]), "" if len(r["rows"]) == 1 else "s",
-                 c("32"), sum(1 for h in hits if h["running"]), c("0")))
+                 c("32"), sum(1 for h in hits if h["state"] == "agent"), c("0")))
         print(HR)
         if compact:
             for line in ls_grid(hits, c, max(20, width - 2)):

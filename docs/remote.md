@@ -8,7 +8,7 @@ One machine runs `amux serve`, a small HTTPS server that exposes its sessions ov
 
 The token is the only protection. Anyone who has it controls every session on that machine, and so can read and write any file that those agents can reach. Treat it like a password.
 
-One caller needs no token: the machine itself. The sessions on it, the `amux` command and its hooks reach the server on `127.0.0.1` without one. On Linux this applies only when the request comes from your own user or root. Another person logged in to the same machine is asked for the token like anyone else. On macOS every local user is still trusted this way, so do not run `amux serve` on a Mac that other people log in to. To trust every local user on Linux as well, put `AMUX_LOCAL_TRUST=any` in `~/.amux/server.env`.
+One caller needs no token: the machine itself. The sessions on it, the `amux` command and its hooks reach the server on `127.0.0.1` without one. This applies only when the request comes from your own user (on Linux, also from root). Another person logged in to the same machine is asked for the token like anyone else. The server finds out who is on the other end of the connection: on Linux from the kernel's socket table, on macOS with `lsof`, which takes 10 to 20 milliseconds per connection. To trust every local user again, put `AMUX_LOCAL_TRUST=any` in `~/.amux/server.env`.
 
 Two more rules keep a web page from using that trust. A browser on the same machine is also a same-machine caller, so the server refuses a change that a page of another site asks for (the browser names the page's site in the request), unless the request carries the token. It also skips the token only when the request asks for the server under a name of this machine, such as `localhost` or `127.0.0.1`. The dashboard itself, `curl` and the `amux` command are not affected.
 
@@ -85,9 +85,15 @@ Each of these commands names the machine first. amux has no default machine and 
 
 `exec` creates and starts a session in one operation. It needs `--provider` and accepts `--dir`, `--model`, `--account`, `--full-access`, `--net-sandbox` or `--full-sandbox`, `--autoprompt`, `--desc` and `--worktree`. Quote a `~/...` directory so that the remote machine expands it. amux-remote also changes your own home prefix back to `~/`, and says so. `amux -H <box> provider <name> [<p>]` and `amux -H <box> account <name> [P|T|X]` show or change an existing session's agent and account.
 
-The same commands work on this machine and through `-H`, with two differences that are on purpose. `stop` on another machine asks the agent to exit first, while on this machine the session's tmux ends at once. `ls` on another machine marks a session as running only while its agent is alive, while on this machine it marks it while its tmux session exists, even if the agent has exited to a shell. `--desc` and `--worktree` exist only through `-H`, because the server applies them.
+The same commands work on this machine and through `-H`, by the same rules.
 
-Three things are the same on both sides. A session pinned in the dashboard is not removed by `rm`: unpin it first, or on this machine use `amux rm --force`. A codex session resumes the same conversation whoever starts it: the newest interactive conversation for its folder, or a new one with `--fresh`. And a row number is always the one that machine's own `amux ls` shows, also when its server hides a session listed in `~/.amux/blocked-sessions.txt`.
+**What a session is doing.** `amux ls` marks a session `*` while something runs in its pane, `~` when its tmux session is open but the agent has left (a shell prompt, or a pane whose program ended), and leaves it blank when it is stopped. In the compact grid the marks are `●`, `◐` and `○`. `amux start` on a `~` session starts the agent again in that same pane.
+
+**Stop.** `amux stop <name>` asks the agent to exit, so it can save its state, and ends the tmux session once the agent has left, or after 15 seconds if it has not. `amux stop --now <name>` ends the session at once. `amux stop-all` asks every session at the same time.
+
+`--desc` and `--worktree` exist only through `-H`, because the server applies them.
+
+Three more things are the same on both sides. A session pinned in the dashboard is not removed by `rm`: unpin it first, or on this machine use `amux rm --force`. A codex session resumes the same conversation whoever starts it: the newest interactive conversation for its folder, or a new one with `--fresh`. And a row number is always the one that machine's own `amux ls` shows, also when its server hides a session listed in `~/.amux/blocked-sessions.txt`.
 
 Remote session names are validated before SSH attach, encoded before entering a REST path, and matched exactly in tmux. The dashboard token reaches curl through a header file, not a command-line argument, so it never appears in `ps`.
 

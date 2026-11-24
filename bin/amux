@@ -8,8 +8,8 @@
 
 set -euo pipefail
 
-CC_VERSION="0.9.17"
-CC_RELEASE="0.7.4"   # this repository's release: the VERSION file (tools/selftest checks they agree)
+CC_VERSION="0.9.19"
+CC_RELEASE="0.7.5"   # this repository's release: the VERSION file (tools/selftest checks they agree)
 _RESUME_TARGET=""
 _RESUME_SKIPPED=""
 
@@ -288,6 +288,43 @@ is_running() {
   fi
   migrate_tmux "$1"
   tmux has-session -t "=$(tmux_name "$1")" 2>/dev/null
+}
+
+# ── One rule for what a session is doing ──────────────────────────────────────
+#   agent    something runs in its pane: the agent, or anything else in the foreground
+#   shell    the tmux session is there but the agent is gone: the pane is dead, or it
+#            sits at a shell prompt with no process under it
+#   stopped  no tmux session (for an iTerm2 session: no such tab)
+# `amux ls` prints these as "*", "~" and blank ("●", "◐", "○" in the compact grid).
+# is_running above answers a narrower question ("is there a session to attach to?").
+# The server uses the SAME rule (_pane_state_of in amux-server.py): keep the two
+# equal. tools/selftest feeds both the same cases.
+AMUX_SHELL_NAMES=" bash zsh sh dash fish ksh tcsh csh "
+_pane_state_of() {  # $1 pane_dead  $2 pane_current_command  $3 pane_pid  [$4 = list of pids that have a child]
+  [[ "$1" == 1 ]] && { printf shell; return 0; }
+  local c="${2##*/}"; c="${c#-}"
+  if [[ "$AMUX_SHELL_NAMES" != *" $c "* ]]; then printf agent; return 0; fi
+  if [[ $# -ge 4 ]]; then
+    [[ $'\n'"$4"$'\n' == *$'\n'"$3"$'\n'* ]] && printf agent || printf shell
+  elif [[ -n "$(pgrep -P "$3" 2>/dev/null | head -1 || true)" ]]; then
+    printf agent
+  else
+    printf shell
+  fi
+  return 0
+}
+session_state() {   # $1 session name -> agent | shell | stopped
+  local _isid row
+  _isid=$(_iterm2_id "$1")
+  if [[ -n "$_isid" ]]; then
+    if _iterm2_exists "$_isid"; then printf agent; else printf stopped; fi
+    return 0
+  fi
+  migrate_tmux "$1"
+  row=$(tmux list-panes -t "=$(tmux_name "$1"):" -F '#{pane_dead}|#{pane_pid}|#{pane_current_command}' 2>/dev/null | head -1 || true)
+  [[ -n "$row" ]] || { printf stopped; return 0; }
+  local dead="${row%%|*}" rest="${row#*|}"
+  _pane_state_of "$dead" "${rest#*|}" "${rest%%|*}"
 }
 
 # ─── Shell-safe flag quoting ─────────────────────────────────────────────────
@@ -707,9 +744,31 @@ SESSION_PREFIX_W=5   # widest prefix ("P:cc:"), for the fixed column in ls
 _LS_LIVE=""            # newline-joined live tmux session names
 _LS_ITERM_LIVE=""      # newline-joined live iTerm2 pane ids
 _LS_ITERM_SCANNED=0
+_LS_SHELL=""           # newline-joined live tmux session names whose agent is gone
 _ls_scan_live() {
   _LS_LIVE=$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
   _LS_ITERM_LIVE=""; _LS_ITERM_SCANNED=0
+  # One more tmux call for every pane, and one ps only when some pane sits at a shell:
+  # the listing must not fork per session.
+  _LS_SHELL=""
+  local panes sess dead pid cmd c parents="" asked=0 seen=$'\n'
+  panes=$(tmux list-panes -a -F '#{session_name}|#{pane_dead}|#{pane_pid}|#{pane_current_command}' 2>/dev/null || true)
+  while IFS='|' read -r sess dead pid cmd; do
+    [[ -n "$sess" && "$seen" != *$'\n'"$sess"$'\n'* ]] || continue   # the first pane of each session
+    seen+="$sess"$'\n'
+    c="${cmd##*/}"; c="${c#-}"
+    if [[ "$dead" != 1 && "$AMUX_SHELL_NAMES" == *" $c "* && $asked -eq 0 ]]; then
+      parents=$(ps -A -o ppid= 2>/dev/null | tr -d ' ' | sort -u || true); asked=1
+    fi
+    [[ "$(_pane_state_of "$dead" "$cmd" "$pid" "$parents")" == shell ]] && _LS_SHELL+="$sess"$'\n'
+  done <<<"$panes"
+  return 0
+}
+# State for the listing, into _LS_ST: agent | shell | stopped (same answer as session_state).
+_ls_state() {  # $1 name, $2 stored iTerm2 id
+  if ! _ls_running "$1" "$2"; then _LS_ST=stopped
+  elif [[ -z "$2" ]] && _ls_in_list "amux-$1" "$_LS_SHELL"; then _LS_ST=shell
+  else _LS_ST=agent; fi
 }
 _ls_in_list() { [[ $'\n'"$2"$'\n' == *$'\n'"$1"$'\n'* ]]; }   # $1 item, $2 newline list
 _iterm2_live_ids() {  # every live iTerm2 pane id, one per line; never launches iTerm2
@@ -1551,7 +1610,7 @@ cmd_start() {
     esac
   done
 
-  local tname
+  local tname _respawn=0
   tname=$(tmux_name "$name")
 
   if is_running "$name"; then
@@ -1562,6 +1621,13 @@ cmd_start() {
     if [[ "$(tmux display-message -t "=$tname:" -p '#{pane_dead}' 2>/dev/null)" == "1" ]]; then
       echo "${YELLOW}dead pane detected${RESET} — replacing stale tmux session"
       tmux kill-session -t "=$tname" 2>/dev/null || true
+    elif [[ "$(session_state "$name")" == shell ]]; then
+      # The tmux session is open but the agent has left it (a bare shell prompt, the
+      # "~" of amux ls). Attaching would land on that shell. Start the agent again in
+      # the same pane, so whoever is attached keeps their window; the auto-resume
+      # block below recovers the conversation. The server's start does the same.
+      echo "${YELLOW}the agent had exited${RESET} — starting it again in the same tmux session"
+      _respawn=1
     else
       # SUSPENDED AGENT (2026-09-29): a Ctrl-Z'd agent leaves the pane at a shell
       # prompt with the agent as a stopped job — attaching would land on bash. fg it.
@@ -2163,7 +2229,12 @@ PYEOF
   if [[ "$provider" == "claude" && "$cmd" != *"--name"* && "$cmd" != *" -n "* ]]; then
     cmd="$cmd --name $(printf '%q' "$name")"
   fi
-  tmux new-session -d -s "$tname" -n "$name" -c "$dir" "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
+  if (( _respawn )) && tmux respawn-pane -k -t "=$tname:" -c "$dir" "${shell_setup}cd $(printf '%q' "$dir"); $cmd" 2>/dev/null; then
+    :
+  else
+    (( _respawn )) && { tmux kill-session -t "=$tname" 2>/dev/null || true; }
+    tmux new-session -d -s "$tname" -n "$name" -c "$dir" "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
+  fi
   [[ "$provider" == "claude" ]] && record_last_account "$name" "$account"
   # RESUME-LIVENESS (2026-09-17): preserve a CRASHED launch for diagnosis, matching the
   # server path's remain-on-exit=failed (45fa20b, 2026-08-04). A clean `/exit`
@@ -2434,9 +2505,24 @@ cmd_send() {
   fi
 }
 
+# How long `amux stop` waits for an agent to leave after asking it to (the server waits the same).
+AMUX_STOP_WAIT="${AMUX_STOP_WAIT:-15}"
+
 cmd_stop() {
-  local name
-  name=$(resolve_session "${1:-}")
+  # amux stop [--now] <name>
+  # Ask the agent to exit first, so it can save its state; end the tmux session once it
+  # has left, or after $AMUX_STOP_WAIT seconds if it has not. --now ends the session at
+  # once. `amux -H <box> stop` does the same through that box's server.
+  local name now=0 a rest=()
+  for a in "$@"; do
+    case "$a" in
+      --now|--force|-f) now=1 ;;
+      -*) die "amux stop: unknown option '$a' — usage: amux stop [--now] <name>" ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  (( ${#rest[@]} <= 1 )) || die "amux stop takes one session — every session: amux stop-all"
+  name=$(resolve_session "${rest[0]:-}")
 
   # iTerm2-provider session: there is no tmux to kill. Ask the agent in the
   # tab to exit gracefully (/exit); the tab itself stays open (it's the
@@ -2456,12 +2542,27 @@ cmd_stop() {
 
   local tname
   tname=$(tmux_name "$name")
-  if is_running "$name"; then
-    tmux kill-session -t "=$tname"
-    echo "${RED}stopped${RESET} $name"
-  else
+  if ! is_running "$name"; then
     echo "${DIM}$name is not running${RESET}"
+    return
   fi
+  local how=""
+  if (( ! now )) && [[ "$(session_state "$name")" == agent ]]; then
+    # the same keys the server sends: clear the input line, /exit, Enter
+    tmux send-keys -t "=$tname:" C-u 2>/dev/null || true
+    sleep 0.1
+    tmux send-keys -t "=$tname:" -l "/exit" 2>/dev/null || true
+    sleep 0.15
+    tmux send-keys -t "=$tname:" Enter 2>/dev/null || true
+    local i tries=$(( AMUX_STOP_WAIT * 2 ))
+    how=" ${DIM}(it did not leave within ${AMUX_STOP_WAIT}s; ended)${RESET}"
+    for (( i = 0; i < tries; i++ )); do
+      sleep 0.5
+      if [[ "$(session_state "$name")" != agent ]]; then how=" ${DIM}(the agent exited)${RESET}"; break; fi
+    done
+  fi
+  tmux kill-session -t "=$tname" 2>/dev/null || true
+  echo "${RED}stopped${RESET} $name$how"
 }
 
 cmd_rm() {
@@ -2591,8 +2692,55 @@ cmd_rename() {
 }
 
 cmd_info() {
+  # amux info <name> | amux info --dir <folder>   [--porcelain]
+  # --dir lists every session registered for that folder. --porcelain prints one
+  # line per session for scripts (the offload tool reads it), tab-separated:
+  #   name  state(agent|shell|stopped)  provider  account  folder  flags
+  local _porc=0 _dir="" _has_dir=0 _rest=()
+  while (( $# )); do
+    case "$1" in
+      --porcelain) _porc=1 ;;
+      --dir)   shift; _has_dir=1; _dir="${1:-}" ;;
+      --dir=*) _has_dir=1; _dir="${1#--dir=}" ;;
+      *) _rest+=("$1") ;;
+    esac
+    shift || true
+  done
+  if (( _has_dir )); then
+    [[ -n "$_dir" ]] || die "--dir needs a folder: amux info --dir <path>"
+    local _want _f _n _d _hit=0
+    _want=$(cd "$_dir" 2>/dev/null && pwd -P) || die "no such folder: $_dir"
+    _session_files
+    for _f in ${_SESSION_FILES[@]+"${_SESSION_FILES[@]}"}; do
+      [[ -f "$_f" ]] || continue
+      _n="${_f##*/}"; _n="${_n%.env}"
+      _ls_read_env "$_f"
+      [[ -n "$_E_DIR" ]] || continue
+      _d=$(cd "$_E_DIR" 2>/dev/null && pwd -P) || continue
+      [[ "$_d" == "$_want" ]] || continue
+      _hit=1
+      _info_one "$_n" "$_porc"
+    done
+    if (( ! _hit )); then
+      (( _porc )) || echo "no session is registered for $_want"
+      return 1
+    fi
+    return 0
+  fi
   local name
-  name=$(resolve_session "${1:-}")
+  name=$(resolve_session "${_rest[0]:-}")
+  _info_one "$name" "$_porc"
+}
+_info_one() {  # $1 name, $2 1 = one tab-separated line
+  local name="$1"
+  if [[ "$2" == 1 ]]; then
+    local _st _an=""
+    _ls_read_env "$CC_SESSIONS/$name.env"
+    _st=$(session_state "$name" 2>/dev/null) || true
+    provider_uses_account "$_E_PROVIDER" && _an=$(stored_account "$CC_SESSIONS/$name.env" "")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${_st:-stopped}" "$_E_PROVIDER" "$_an" "$_E_DIR" "$_E_FLAGS"
+    return 0
+  fi
   load_session "$name"
 
   echo "${BOLD}$name${RESET}"
@@ -2606,11 +2754,26 @@ cmd_info() {
     [[ -n "$_an" ]] || { _an=personal; _note="  (not stored; a start follows the launching terminal)"; }
     echo "  account:  $_an ($(account_badge "$_an"))$_note"
   fi
-  if is_running "$name" 2>/dev/null; then
-    echo "  status: ${GREEN}running${RESET}"
-  else
-    echo "  status: ${DIM}stopped${RESET}"
+  case "$(session_state "$name" 2>/dev/null)" in
+    agent) echo "  status: ${GREEN}running${RESET}" ;;
+    shell) echo "  status: ${YELLOW}no agent${RESET} ${DIM}(its tmux session is open at a shell; amux start $name starts the agent again)${RESET}" ;;
+    *)     echo "  status: ${DIM}stopped${RESET}" ;;
+  esac
+}
+
+# amux offload <args...> — the offload tool under the amux name. `amux offload claude
+# <folder|session>` moves a session's work to another machine: the session here writes
+# a handoff note, the folder is copied, and a new amux session starts there.
+cmd_offload() {
+  local p
+  p=$(command -v offload 2>/dev/null) || p=""
+  if [[ -z "$p" ]]; then
+    for p in "$HOME/scripts/offload" "$HOME/.local/bin/offload" "$HOME/bin/offload" ""; do
+      [[ -n "$p" && -x "$p" ]] && break
+    done
   fi
+  [[ -n "$p" ]] || die "offload is not installed on this machine (it is a separate small tool: https://git.nuilab.org/f.ortega/offload)"
+  exec "$p" "$@"
 }
 
 cmd_ls() {
@@ -2638,9 +2801,13 @@ cmd_ls() {
     has_any=true
     name="${f##*/}"; name="${name%.env}"
     _ls_read_env "$f"
-    running=0; _ls_running "$name" "$_E_ITERM" && running=1
-    if (( running )); then status_icon="*"; status_color="$GREEN"
-    else status_icon=" "; status_color="$DIM"; fi
+    _ls_state "$name" "$_E_ITERM"
+    running=0; [[ "$_LS_ST" == agent ]] && running=1
+    case "$_LS_ST" in
+      agent) status_icon="*"; status_color="$GREEN" ;;
+      shell) status_icon="~"; status_color="$YELLOW" ;;   # tmux session open, agent gone
+      *)     status_icon=" "; status_color="$DIM" ;;
+    esac
 
     # Build flag summary
     flag_summary=""
@@ -2717,7 +2884,7 @@ cmd_pick() {
   name=$(printf '%s\n' "$grid" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | python3 -c '
 import re,sys
 n=sys.argv[1]
-for m in re.finditer(r"(?:^|\s)(\d+) [\u25cf\u25cb] (\S+)", sys.stdin.read()):
+for m in re.finditer(r"(?:^|\s)(\d+) [\u25cf\u25cb\u25d0] (\S+)", sys.stdin.read()):
     if m.group(1)==n: print(m.group(2).rsplit(":",1)[-1]); break' "$sid")
   [[ -n "$name" ]] || die "no row $sid on ${box} — see: $( [[ $box == local ]] && echo 'amux ls -c' || echo "amux -H $box ls -c")"
   echo "${DIM}row $sid on $box → $name${RESET}"
@@ -2736,7 +2903,7 @@ for m in re.finditer(r"(?:^|\s)(\d+) [\u25cf\u25cb] (\S+)", sys.stdin.read()):
 
 cmd_ls_compact() {   # $1 = 1: no banner line (--bare)
   local names=() run=() accts=() pcols=()
-  local f name maxw=0 running_count=0
+  local f name maxw=0 running_count=0 shell_count=0
   _ls_scan_live
   _session_files
   for f in ${_SESSION_FILES[@]+"${_SESSION_FILES[@]}"}; do
@@ -2744,11 +2911,12 @@ cmd_ls_compact() {   # $1 = 1: no banner line (--bare)
     name="${f##*/}"; name="${name%.env}"
     names+=("$name")
     _ls_read_env "$f"
-    if _ls_running "$name" "$_E_ITERM"; then
-      run+=(1); running_count=$((running_count + 1))
-    else
-      run+=(0)
-    fi
+    _ls_state "$name" "$_E_ITERM"
+    case "$_LS_ST" in
+      agent) run+=(1); running_count=$((running_count + 1)) ;;
+      shell) run+=(2); shell_count=$((shell_count + 1)) ;;
+      *)     run+=(0) ;;
+    esac
     # Prefix (2026-09-05): "P:cc:"/"T:cc:" for claude sessions, "cx:"/"oc:"/
     # "ag:"/"gm:" for the rest. Cell width = widest prefix+name pair.
     _ls_prefix "$_E_PROVIDER" "$_E_ACCOUNT"
@@ -2763,8 +2931,10 @@ cmd_ls_compact() {   # $1 = 1: no banner line (--bare)
   fi
 
   if [[ "${1:-0}" != 1 ]]; then
-    printf "${BOLD}${BLUE}amux${RESET} ${DIM}·${RESET} %d sessions ${DIM}·${RESET} ${GREEN}%d ●${RESET} running\n\n" \
-      "$total" "$running_count"
+    local _shell_note=""
+    (( shell_count > 0 )) && _shell_note=" ${DIM}·${RESET} ${YELLOW}${shell_count} ◐${RESET} no agent"
+    printf "${BOLD}${BLUE}amux${RESET} ${DIM}·${RESET} %d sessions ${DIM}·${RESET} ${GREEN}%d ●${RESET} running%s\n\n" \
+      "$total" "$running_count" "$_shell_note"
   fi
 
   # Cell = "NN ● name" padded, plus a 2-space gutter.
@@ -2786,11 +2956,11 @@ cmd_ls_compact() {   # $1 = 1: no banner line (--bare)
     for (( c=0; c<ncols; c++ )); do
       idx=$(( c * nrows + r ))
       (( idx >= total )) && continue
-      if (( run[idx] )); then
-        mark="${GREEN}●${RESET}"; namecolor="$BOLD"
-      else
-        mark="${DIM}○${RESET}"; namecolor="$DIM"
-      fi
+      case "${run[idx]}" in
+        1) mark="${GREEN}●${RESET}"; namecolor="$BOLD" ;;
+        2) mark="${YELLOW}◐${RESET}"; namecolor="" ;;      # tmux session open, agent gone
+        *) mark="${DIM}○${RESET}"; namecolor="$DIM" ;;
+      esac
       # Prefix is colored separately (escape codes would break %-Ns padding),
       # so pad the NAME by the width the prefix did not use.
       local _pre="${accts[idx]}" _pw
@@ -2890,14 +3060,23 @@ cmd_defaults() {
 }
 
 cmd_stop_all() {
+  # amux stop-all [--now] — every session is asked at the same time, so the whole
+  # thing takes as long as the slowest agent, not the sum.
+  local now="" a f name
+  for a in "$@"; do
+    case "$a" in
+      --now|--force|-f) now=--now ;;
+      *) die "amux stop-all: unknown argument '$a' — usage: amux stop-all [--now]" ;;
+    esac
+  done
   for f in "$CC_SESSIONS"/*.env; do
     [[ -f "$f" ]] || continue
-    local name
     name=$(basename "$f" .env)
     if is_running "$name" 2>/dev/null; then
-      cmd_stop "$name"
+      ( cmd_stop $now "$name" ) &
     fi
   done
+  wait
 }
 
 cmd_start_all() {
@@ -2905,7 +3084,7 @@ cmd_start_all() {
     [[ -f "$f" ]] || continue
     local name
     name=$(basename "$f" .env)
-    if ! is_running "$name" 2>/dev/null; then
+    if [[ "$(session_state "$name" 2>/dev/null)" != agent ]]; then
       # --no-attach: an attaching start parked the loop inside the first session
       # (and ended it outright when there was no terminal). A subshell per
       # session, so one that cannot start (folder gone, agent missing) is
@@ -3318,7 +3497,8 @@ for fn in sorted(os.listdir(work)):
         continue
     for s in data if isinstance(data, list) else []:
         if isinstance(s, dict) and s.get("name") == name:
-            print(fn[:-5], 1 if s.get("running") else 0)
+            st = s.get("state") or ("agent" if s.get("running") else "stopped")
+            print(fn[:-5], {"agent": 1, "shell": 2}.get(st, 0))
 PY
 )
   silent=""
@@ -3335,7 +3515,11 @@ PY
   while read -r b r; do mbox+=("$b"); mrun+=("$r"); done <<<"$found"
   local i
   for i in "${!mbox[@]}"; do
-    if [[ "${mrun[$i]}" == 1 ]]; then r="${GREEN}● running${RESET}"; else r="${DIM}○ stopped${RESET}"; fi
+    case "${mrun[$i]}" in
+      1) r="${GREEN}● running${RESET}" ;;
+      2) r="${YELLOW}◐ no agent${RESET}" ;;
+      *) r="${DIM}○ stopped${RESET}" ;;
+    esac
     printf '  %d) %-12s %s\n' "$((i + 1))" "${mbox[$i]}" "$r" >&2
   done
   [[ -n "$note" ]] && echo "${DIM}  …$note${RESET}" >&2
@@ -3376,7 +3560,7 @@ PY
     start)  exec amux-up "$b" "$name" "$@" ;;
     attach) exec amux-remote "$b" attach "$name" "$@" ;;
     peek)   exec amux-remote "$b" peek "$name" "$@" ;;
-    stop)   exec amux-remote "$b" stop "$name" ;;
+    stop)   exec amux-remote "$b" stop "$name" "$@" ;;
   esac
 }
 
@@ -3576,7 +3760,8 @@ ${BOLD}amux${RESET} — phone-friendly Claude Code session manager ${DIM}v${CC_V
 
 ${BOLD}Key commands:${RESET}
   amux                           Interactive dashboard (phone-friendly)
-  amux ls [-c]                   List sessions with status + preview (-c: compact grid);
+  amux ls [-c]                   List sessions with status + preview (-c: compact grid). Marks: * running,
+                                 ~ tmux session open but the agent has left, blank stopped (● ◐ ○ with -c);
                                  by name, on every machine: amux search --sessions <text>
   amux exec <name> --provider <p> [--dir <path> | --pwd] [--full-access | --net-sandbox | --full-sandbox] [--autoprompt]
                                  Register + start in one step (--provider REQUIRED for a new session:
@@ -3587,7 +3772,8 @@ ${BOLD}Key commands:${RESET}
   amux up [<box>] <name> [flags] Start if needed, THEN attach (== amux-up; also amux -H <box> up <name>)
   amux peek <name> [lines]       Last N lines without attaching (default: 30)
   amux send <name> <text>        Send text + Enter;  amux send <name> --keys 'C-c' sends raw keys
-  amux stop <name>               Stop a running session (its tmux session ends at once)
+  amux stop [--now] <name>       Stop a session: the agent is asked to exit, and the tmux session ends
+                                 once it has left, or after 15 s. --now ends it at once
   amux pick [<box>|-A|-R]        fzf picker, live preview (no arg = this box; -A = every box)
   amux -H <box> <args...>        Run any command on another box (-H FIRST); e.g. amux -H myhost ls -c
   amux -A [-v|-p]                Every box at once (busiest first); -v verbose, -p pick
@@ -3618,11 +3804,17 @@ ${BOLD}Sessions:${RESET}
                                  amux color palette | --mode hash|distinct|row|random; amux recolor repaints
                                  open tabs; all options: amux-color -h
   amux start-all | stop-all      Start every registered session (without attaching) / stop every running one
+                                 (stop-all asks them all at the same time; stop-all --now ends them at once)
   amux start|attach|peek|stop <name> --find
                                  Not on this box? Look on the other boxes and act there after a yes
+  amux offload claude <folder|name> [-b <box>]
+                                 Move (transfer) a session's work to another machine: the session here writes a
+                                 handoff note, the folder is copied, and a new amux session starts there and
+                                 reads the note. amux offload <anything> runs the offload tool (amux offload -h)
 
 ${BOLD}Info:${RESET}
   amux info <name>               Session config details
+  amux info --dir <folder>       The sessions registered for a folder (--porcelain: one line each, for scripts)
   amux origin [<name>] [--host]  Box/user/lane you last attached FROM (key=value; inside a session = this one)
   amux models [provider]         Models each agent accepts for --model (default marked *)
   amux defaults [show|edit|reset] Global default flags
@@ -3674,13 +3866,14 @@ ${BOLD}Another box (remote):${RESET}
   amux -A --showall              ...and give every empty/offline box its own block too
   amux -A -v | -p | -h           verbose rows · pick a session from any box · full -A help
 
-  ${BOLD}The same verb here and there:${RESET} on another box its server does the work, and two
-  verbs differ on purpose. ${BOLD}stop${RESET} there asks the agent to exit first (here the tmux session
-  ends at once). ${BOLD}ls${RESET} there marks a session * only while its agent is alive (here: while
-  its tmux session exists, even if the agent has exited to a shell). peek shows 30 lines
-  on both sides; rm removes the registration and its state file on both sides, and the
-  server also deletes the session's memory file and log. A session pinned in the
-  dashboard is refused by rm on both sides (here: amux rm --force). A codex session
+  ${BOLD}The same verb here and there:${RESET} on another box its server does the work, by the
+  same rules as here. ${BOLD}stop${RESET} asks the agent to exit and ends the tmux session once it has
+  left, or after 15 s (--now: at once). ${BOLD}ls${RESET} marks a session * while something runs in
+  its pane, ~ when its tmux session is open but the agent has left (amux start brings
+  the agent back in that pane), and leaves it blank when it is stopped; in the compact
+  grid these are ● ◐ ○. peek shows 30 lines. rm removes the registration and its state
+  file; the server also deletes the session's memory file and log. A session pinned in
+  the dashboard is refused by rm on both sides (here: amux rm --force). A codex session
   resumes the same conversation whoever starts it. Row numbers are that box's own.
 EOF
     ;;
@@ -4001,6 +4194,7 @@ _amux() {
     'color:show or pin a session tab + status-line color'
     'recolor:repaint the open tabs of running sessions'
     'info:session details'
+    'offload:move (transfer) work to another machine (the offload tool)'
     'origin:where the session was last attached from'
     'models:models each agent accepts'
     'defaults:show or set defaults'
@@ -4072,9 +4266,11 @@ _amux() {
     color|recolor)     _amux_name_then --reroll ;;
     up)                _amux_name_then --fresh --full-access --net-sandbox --full-sandbox --account --mosh --cc --plain ;;
     peek|p)            _amux_name_then --find $rawopt ;;
-    stop|kill)         _amux_name_then --find ;;
+    stop|kill)         _amux_name_then --now --find ;;
     send)              _amux_name_then --keys ;;
-    rm|remove|del|info) _amux_name_then ;;
+    rm|remove|del)     _amux_name_then ;;
+    info)              _amux_name_then --dir --porcelain ;;
+    offload)           _amux_opts claude run put get fetch box redirect version -b -y --no-handoff --name --no-attach ;;
     rename|mv)         _amux_name_then -n ;;
     rmnum)             _amux_opts -y ;;
     search|find)       _amux_opts --corefleet --mainfleet --fleetall --fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t -e --and --since --show -n --agentic --local --continue --provider --model --effort --account --raw --sessions -c --compact --regex --matchstring ;;
@@ -4162,7 +4358,7 @@ _amux_companion_complete() {
 _amux_complete() {
   local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
   local i=1 remote=0 rbox="" cmd pos
-  local cmds="start stop attach up peek send ls pick register exec rm rmnum search rename provider account color recolor info origin models defaults start-all stop-all serve board help version completion"
+  local cmds="start stop attach up peek send ls pick register exec rm rmnum search rename provider account color recolor info offload origin models defaults start-all stop-all serve board help version completion"
   local providers="claude codex gemini opencode iterm2 agy" accounts="P T X personal team team2"
   COMPREPLY=()
 
@@ -4217,9 +4413,11 @@ _amux_complete() {
     color|recolor)     words="--reroll" ;;
     up)                words="--fresh --full-access --net-sandbox --full-sandbox --account --mosh --cc --plain" ;;
     peek|p)            words="--find $rawopt" ;;
-    stop|kill)         words="--find" ;;
+    stop|kill)         words="--now --find" ;;
     send)              words="--keys" ;;
-    rm|remove|del|info) words="" ;;
+    rm|remove|del)     words="" ;;
+    info)              words="--dir --porcelain" ;;
+    offload)           words="claude run put get fetch box redirect version -b -y --no-handoff --name --no-attach" ;;
     rename|mv)         words="-n" ;;
     rmnum)             words="-y" ;;
     search|find)       words="--corefleet --mainfleet --fleetall --fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t -e --and --since --show -n --agentic --local --continue --provider --model --effort --account --raw --sessions -c --compact --regex --matchstring" ;;
@@ -4376,11 +4574,12 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     ls|list)          shift; cmd_ls "$@" ;;
     pick|choose)      shift; cmd_pick "$@" ;;
     info)             shift; cmd_info "$@" ;;
+    offload)          shift; cmd_offload "$@" ;;
     origin)           shift; cmd_origin "$@" ;;
     models|model)     shift; cmd_models "$@" ;;
     defaults|config)  shift; cmd_defaults "$@" ;;
     start-all)        cmd_start_all ;;
-    stop-all)         cmd_stop_all ;;
+    stop-all)         shift; cmd_stop_all "$@" ;;
     serve|web)        shift; cmd_serve "$@" ;;
     board|b)          shift; cmd_board "$@" ;;
     completion)       shift; cmd_completion "$@" ;;

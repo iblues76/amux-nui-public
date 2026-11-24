@@ -2,6 +2,19 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.5 — 2026-11-24
+
+The command line and the server each had their own answer to "is this session running" and their own way to stop one. They now share one rule. Update the server on every machine: the list a new `amux` draws for another machine is best with a new server there (an older one still works).
+
+- **Three states, the same everywhere.** `amux ls` marks a session `*` while something runs in its pane, `~` when its tmux session is open but the agent has left, and leaves it blank when it is stopped. The compact grid shows `●`, `◐` and `○`. Before, `*` on this machine meant "the tmux session exists", while through `amux -H <box>` it meant "the agent is alive", judged from the text on the screen (a line that ended in `$` or `%` counted as a shell prompt). Both sides now look at the pane's processes. `amux info`, `amux search --sessions`, `amux -A` and the picker show the same states.
+- **`amux start` brings the agent back in place.** On a `~` session it used to attach you to the bare shell. It now starts the agent again in that same pane, and the conversation is resumed as usual.
+- **`amux stop` asks first.** It asks the agent to exit, so it can save its state, and ends the tmux session once the agent has left, or after 15 seconds. It used to end the session at once, while `amux -H <box> stop` asked first and then left a shell behind. Both now end in the same state: stopped. `amux stop --now <name>` ends a session at once, also through `-H`. `amux stop-all` asks every session at the same time, and `amux stop-all --now` ends them all at once.
+- **macOS: only your own user skips the token.** On a Mac, every local user could reach the dashboard server without the token. The server now checks who owns the other end of a same-machine connection there too (with `lsof`, 10 to 20 ms per connection), as it already did on Linux. On macOS root needs the token as well. `AMUX_LOCAL_TRUST=any` in `~/.amux/server.env` restores the old behavior.
+- **`amux offload`: move a session's work to another machine.** `amux offload claude <folder or session>` runs the [offload](https://git.nuilab.org/f.ortega/offload) tool (0.2.0 or newer, installed separately): the session working in the folder writes a handoff note, the folder is copied, and a new amux session starts on the other machine and reads the note. Any other `amux offload <args>` goes to the same tool. `amux help` lists it under the words move and transfer.
+- **`amux info --dir <folder>`** lists the sessions registered for a folder. `--porcelain` prints one tab-separated line per session (name, state, agent, account, folder, flags) for scripts.
+- Stopping a codex, opencode or other non-Claude session through the server no longer types Claude's `/rename` command into it first.
+- `amux-ls` and `amux -H <box> ls -c` use the row number the server sends.
+
 ## 0.7.4 — 2026-11-23
 
 Update the server on every machine that runs one: the first two items are security fixes.

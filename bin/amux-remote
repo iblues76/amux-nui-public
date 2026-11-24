@@ -350,7 +350,11 @@ url     = os.environ.get("AMUX_LS_URL","")
 compact = os.environ.get("AMUX_LS_COMPACT","0") == "1"
 bare    = os.environ.get("AMUX_LS_BARE","0")  == "1"
 total   = len(data)
-running = sum(1 for s in data if s.get("running"))
+# agent | shell | stopped, as that machine`s server reports it (an older server sends
+# only "running"). shell = its tmux session is open but the agent has left.
+def state(s): return s.get("state") or ("agent" if s.get("running") else "stopped")
+running = sum(1 for s in data if state(s) == "agent")
+shells  = sum(1 for s in data if state(s) == "shell")
 
 def short_model(s):
     m = ""
@@ -369,7 +373,8 @@ def short_dir(s):
     return re.sub(r"^/(Users|home)/[^/]+/", "~/", s.get("dir","") or "")
 
 if not bare:
-    print(f"{BOLD}{label}{R} {DIM}(remote){R} {DIM}·{R} {total} sessions {DIM}·{R} {GREEN}{running} ●{R} running")
+    noagent = f" {DIM}·{R} {YELLOW}{shells} ◐{R} no agent" if shells else ""
+    print(f"{BOLD}{label}{R} {DIM}(remote){R} {DIM}·{R} {total} sessions {DIM}·{R} {GREEN}{running} ●{R} running{noagent}")
     if url:
         extra = f"  {DIM}· ssh {label}{R}" if (label and not label[0].isdigit()) else ""
         print(D(url) + extra)
@@ -410,7 +415,7 @@ PROV_COL = {"cc:": "\033[1;38;5;51m",  "it:": "\033[1;38;5;45m",  "cx:": "\033[1
 
 if compact:
     names = [s.get("name","") for s in data]
-    runs  = [bool(s.get("running")) for s in data]
+    runs  = [state(s) for s in data]
     pres  = [acct_prefix(s) for s in data]
     maxw  = max(len(p) + len(n) for p, n in zip(pres, names))
     # The number is the one that machine`s own "amux ls" shows. A server that sends
@@ -432,8 +437,10 @@ if compact:
         for c in range(ncols):
             idx = c * nrows + r
             if idx >= total: continue
-            if runs[idx]:
+            if runs[idx] == "agent":
                 mark = f"{GREEN}●{R}"; nc = BOLD
+            elif runs[idx] == "shell":
+                mark = f"{YELLOW}◐{R}"; nc = ""
             else:
                 mark = f"{DIM}○{R}"; nc = DIM
             pw = maxw - len(pres[idx])
@@ -442,7 +449,7 @@ if compact:
 else:
     namew = min(max((len(s.get("name","")) for s in data), default=4), 22)
     for s in data:
-        icon  = f"{GREEN}*{R}" if s.get("running") else " "
+        icon  = {"agent": f"{GREEN}*{R}", "shell": f"{YELLOW}~{R}"}.get(state(s), " ")
         name  = s.get("name","")
         model = short_model(s)
         sdir  = short_dir(s)
@@ -624,15 +631,28 @@ cmd_rm() {
   echo "${GREEN}✓${RESET} removed ${BOLD}${name}${RESET}"
 }
 
-cmd_simple_post() {  # stop/clear — take NO flags; error loudly on extras
+cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; error loudly on extras
   require_config
-  local action="$1" name="${2:-}"
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX ${action} <name>"
+  local action="$1"; shift
+  local name="" now=0 a
+  for a in "$@"; do
+    case "$a" in
+      --now|--force|-f) [[ "$action" == stop ]] || die "unexpected argument '$a' — 'amux-remote $BOX $action' takes no flags"
+                        now=1 ;;
+      -*) die "unexpected argument '$a' — usage: amux-remote $BOX ${action}$([[ $action == stop ]] && echo ' [--now]') <name>" ;;
+      *)  [[ -z "$name" ]] || die "unexpected extra arguments after '$name': $a — 'amux-remote $BOX $action' takes one session"
+          name="$a" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: amux-remote $BOX ${action}$([[ $action == stop ]] && echo ' [--now]') <name>"
   validate_remote_name "$name"
-  shift 2
-  [[ $# -eq 0 ]] || die "unexpected extra arguments after '$name': $* — 'amux-remote $BOX $action' takes no flags"
   local resp ok
-  resp=$(api POST "/api/sessions/${name}/${action}")
+  if (( now )); then
+    # --now: the box ends the tmux session at once, without asking the agent to exit
+    resp=$(api POST "/api/sessions/${name}/${action}" -H 'Content-Type: application/json' -d '{"now": true}')
+  else
+    resp=$(api POST "/api/sessions/${name}/${action}")
+  fi
   ok=$(_resp_ok_msg "$resp")
   local good="${ok%%$'\n'*}" msg="${ok#*$'\n'}"
   if [[ "$good" != "1" ]]; then
@@ -647,17 +667,17 @@ cmd_simple_post() {  # stop/clear — take NO flags; error loudly on extras
   # AMUX_NO_WAIT=1 skips the wait for scripts that only want to fire the request.
   if [[ "$action" == "stop" && -z "${AMUX_NO_WAIT:-}" ]]; then
     local i rc
-    for i in 1 2 3 4 5 6 7 8; do
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
       sleep 2
       # `|| rc=$?` is REQUIRED: under `set -e` a bare call returning non-zero
       # (which is exactly the "not running" answer we want) would abort the script.
       rc=0; _session_running "$name" || rc=$?
       case $rc in
-        1) echo "${GREEN}✓${RESET} stopped ${DIM}(agent exited cleanly; 'start' resumes the conversation)${RESET}"; return 0 ;;
+        1) echo "${GREEN}✓${RESET} stopped ${DIM}('start' resumes the conversation)${RESET}"; return 0 ;;
         2) echo "${GREEN}✓${RESET} stop requested ${DIM}(could not confirm — server unreachable)${RESET}"; return 0 ;;
       esac
     done
-    echo "${DIM}stop requested — still winding down after 16s; check with 'amux-remote $BOX ls'${RESET}"
+    echo "${DIM}stop requested — still winding down after 30s; check with 'amux-remote $BOX ls'${RESET}"
     return 0
   fi
   echo "${GREEN}✓${RESET} ${action}"

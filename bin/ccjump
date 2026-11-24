@@ -45,7 +45,11 @@ row(){ # loc tagged-name run hint -> colored, aligned; loc(field1)+name(field3) 
   # `amux ls` prints names as P:cc:foo / cx:foo (account+provider tag); names never contain ':'
   local loc="$1" name="${2##*:}" tag="" run="$3" hint="$4" mark
   case "$2" in *:*) tag="${2%:*}" ;; esac
-  if [ -n "$run" ]; then mark=$'\033[32m●\033[0m'; else mark=$'\033[2m○\033[0m'; fi
+  case "$run" in
+    r) mark=$'\033[32m●\033[0m' ;;
+    s) mark=$'\033[33m◐\033[0m' ;;   # its tmux session is open, the agent has left
+    *) mark=$'\033[2m○\033[0m' ;;
+  esac
   printf '%-9s %b  %-24s \033[2m%-5s %s\033[0m\n' "$loc" "$mark" "$name" "$tag" "${hint:0:48}"
 }
 # scope: CCJ_SCOPE="all" (remote boxes, then this one), "remote" (remote boxes only) or a
@@ -63,8 +67,9 @@ box_rows(){
   local box="$1" line run rest
   if [ "$box" = local ]; then
     "$AMUX" ls 2>/dev/null | strip | while IFS= read -r line; do
-      if [[ "$line" =~ ^[[:space:]]*[0-9]+(\*?)[[:space:]]+([^[:space:]]+)[[:space:]]*(.*)$ ]]; then
-        row local "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]:+r}" "${BASH_REMATCH[3]}"
+      if [[ "$line" =~ ^[[:space:]]*[0-9]+([*~]?)[[:space:]]+([^[:space:]]+)[[:space:]]*(.*)$ ]]; then
+        run=""; case "${BASH_REMATCH[1]}" in '*') run=r ;; '~') run=s ;; esac
+        row local "${BASH_REMATCH[2]}" "$run" "${BASH_REMATCH[3]}"
       fi
     done
     return
@@ -72,7 +77,11 @@ box_rows(){
   tmo 8 "$AMUXBOX" "$box" ls --bare 2>/dev/null | strip | while IFS= read -r line; do
     line="${line#"${line%%[![:space:]]*}"}"; [ -n "$line" ] || continue
     case "$line" in *" sessions"|*sessions|"No "*|"no "*|error*|ERROR*) continue ;; esac
-    run=""; if [ "${line:0:1}" = "*" ]; then run="r"; line="${line#\*}"; line="${line#"${line%%[![:space:]]*}"}"; fi
+    run=""
+    case "${line:0:1}" in
+      '*') run="r"; line="${line#\*}"; line="${line#"${line%%[![:space:]]*}"}" ;;
+      '~') run="s"; line="${line#\~}"; line="${line#"${line%%[![:space:]]*}"}" ;;
+    esac
     rest="${line#*[[:space:]]}"; [ "$rest" = "$line" ] && rest=""
     row "$box" "${line%%[[:space:]]*}" "$run" "${rest#"${rest%%[![:space:]]*}"}"
   done
@@ -154,7 +163,7 @@ machines(){
     if [ ! -s "$work/$b" ] && [ "$(cat "$work/$b.rc" 2>/dev/null)" != 0 ]; then
       printf '3 0 0 %s\n' "$b"; continue           # offline
     fi
-    r=$(grep -o '●' "$work/$b" | wc -l | tr -d ' '); t=$(( r + $(grep -o '○' "$work/$b" | wc -l | tr -d ' ') ))
+    r=$(grep -o '●' "$work/$b" | wc -l | tr -d ' '); t=$(( r + $(grep -o -e '○' -e '◐' "$work/$b" | wc -l | tr -d ' ') ))
     if [ "$t" -gt 0 ]; then printf '1 %s %s %s\n' "$r" "$t" "$b"; else printf '2 0 0 %s\n' "$b"; fi
   done | sort -k1,1n -k2,2nr -k3,3nr -k4,4 | while read -r grp r t b; do
     case "$grp" in
@@ -218,7 +227,7 @@ hwrap(){ # hwrap WIDTH item...
   done
   printf '%s' "$line"
 }
-HKEYS_MACHINES=("↵ open (○ starts it)" "F1 remote (again: +this)" "F2 this machine" "F3 machine list"
+HKEYS_MACHINES=("↵ open (○ ◐ starts it)" "F1 remote (again: +this)" "F2 this machine" "F3 machine list"
   "F4 next machine" "↵ on a ━━ row: that machine")
 HKEYS_TAIL=("^r reload" "esc quit")
 header(){
@@ -378,7 +387,7 @@ if [ "$MODE" = machines ]; then SRC="$SELF --machines-feed"; PROMPT="machines �
 else SRC="$SELF --feed"
   case "$CCJ_SCOPE" in all) PROMPT="remote + this ▸ " ;; remote) PROMPT="remote machines ▸ " ;; *) PROMPT="$CCJ_SCOPE ▸ " ;; esac
 fi
-HDR='↵ open (○ starts it)   ^r reload   esc cancel · click or type to filter'
+HDR='↵ open (○ ◐ starts it)   ^r reload   esc cancel · click or type to filter'
 KEYS=()
 # Machine switching needs fzf's become action (0.38+); older fzf just loses the keys.
 _fzv="$(fzf --version 2>/dev/null | sed -E 's/^([0-9]+)\.([0-9]+).*/\1 \2/')"

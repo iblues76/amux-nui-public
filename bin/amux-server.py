@@ -1031,9 +1031,11 @@ _SHELL_NAMES = {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"}
 # carries the token itself. So on Linux the skip now applies only when the
 # connection's client end belongs to this server's user, or to root (who can read
 # the token file anyway). /proc/net/tcp names the owner of every TCP socket.
-# Anything else falls through to the ordinary token check. Where the table does
-# not exist (macOS) the old rule stands. AMUX_LOCAL_TRUST=any in
-# ~/.amux/server.env restores it everywhere.
+# Anything else falls through to the ordinary token check. macOS has no such
+# file; there `lsof`, run by this server, lists the sockets of this user's own
+# processes (10 to 20 ms, once per connection), so a client of this user is
+# found and anyone else's is not. Only a system with neither keeps the old rule.
+# AMUX_LOCAL_TRUST=any in ~/.amux/server.env restores it everywhere.
 _PROC_TCP = {False: "/proc/net/tcp", True: "/proc/net/tcp6"}
 _LOOPBACK_HEX = {False: "0100007F", True: "00000000000000000000000001000000"}
 
@@ -1046,6 +1048,8 @@ def _loopback_peer_uid(client_ip: str, client_port: int, server_port: int, table
     v6 = ":" in client_ip
     path = table or _PROC_TCP[v6]
     if not os.path.exists(path):
+        if not table and sys.platform == "darwin":
+            return _darwin_peer_uid(client_ip, client_port, server_port)
         return "unsupported"
     want = "%s:%04X" % (_LOOPBACK_HEX[v6], client_port)
     tail = ":%04X" % server_port
@@ -1062,6 +1066,46 @@ def _loopback_peer_uid(client_ip: str, client_port: int, server_port: int, table
     except (OSError, ValueError):
         return None
     return None
+
+
+def _darwin_owner_uid(lsof_text: str, client_ip: str, client_port: int, server_port: int):
+    """The uid that owns the client end of a loopback connection, read from the output
+    of `lsof -nP -iTCP:<client port> -Fpun` on macOS: per process a p<pid> line, a
+    u<uid> line, then f<fd> / n<name> pairs, where a socket's name reads
+        n127.0.0.1:52344->127.0.0.1:8822        (local end -> far end)
+    Both ends of a loopback connection are listed (the server holds the other one),
+    so the name must run from the client port to the server port. None when it is
+    not there."""
+    ip = "[%s]" % client_ip if ":" in client_ip else client_ip
+    want = "n%s:%d->%s:%d" % (ip, client_port, ip, server_port)
+    uid = None
+    for line in lsof_text.splitlines():
+        if line.startswith("p"):
+            uid = None
+        elif line.startswith("u"):
+            try:
+                uid = int(line[1:])
+            except ValueError:
+                uid = None
+        elif line == want:
+            return uid
+    return None
+
+
+def _darwin_peer_uid(client_ip: str, client_port: int, server_port: int):
+    """macOS: lsof run by this server sees the sockets of this user's own processes
+    (10 to 20 ms). A client that belongs to this user is found; one that belongs to
+    someone else is not, and falls through to the token check. (root's processes
+    are not visible either, so on macOS root needs the token; it can read the
+    token file.) netstat was tried first and printed nothing under a service."""
+    try:
+        r = subprocess.run(["/usr/sbin/lsof", "-nP", "-iTCP:%d" % client_port, "-Fpun"],
+                           capture_output=True, text=True, timeout=5)
+    except FileNotFoundError:
+        return "unsupported"
+    except Exception:
+        return None
+    return _darwin_owner_uid(r.stdout, client_ip, client_port, server_port)
 
 
 def _host_is_this_machine(host_header: str) -> bool:
@@ -1581,65 +1625,56 @@ def _suspended_agent_pid(session: str) -> str:
     return ""
 
 
-def is_running(session: str) -> bool:
-    """Check if Claude is running in this session's tmux pane."""
+_launching: dict = {}   # {session name: time this server began launching its agent}
+
+
+def _pane_state_of(dead, cmd, pid, has_child=None) -> str:
+    """ONE RULE for what a tmux pane holds, the same as _pane_state_of in bin/amux
+    (keep the two equal; tools/selftest feeds both the same cases):
+      shell  the pane is dead, or its foreground is a shell with no process under it
+      agent  anything else: the agent, or whatever else runs in the foreground
+    A Ctrl-Z'd agent is a child of the shell, so it still counts as present."""
+    if str(dead).strip() == "1":
+        return "shell"
+    c = os.path.basename((cmd or "").strip()).lstrip("-")
+    if c not in _SHELL_NAMES:
+        return "agent"
+    if has_child is None:
+        try:
+            r = subprocess.run(["pgrep", "-P", str(pid).strip()], capture_output=True, text=True, timeout=5)
+            has_child = bool(r.stdout.strip())
+        except Exception:
+            has_child = True   # cannot tell: never call a live session gone
+    return "agent" if has_child else "shell"
+
+
+def _session_state(session: str) -> str:
+    """agent | shell | stopped — what `amux ls` prints as "*", "~" and blank.
+    stopped = no tmux session (for an iTerm2 session: no such tab)."""
     iterm2_id = _session_iterm2_id(session)
     if iterm2_id:
-        return _iterm2_session_exists(iterm2_id)
+        return "agent" if _iterm2_session_exists(iterm2_id) else "stopped"
     try:
         r = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True,
-        )
-        tmux_sess = tmux_name(session)
-        if tmux_sess not in r.stdout.splitlines():
-            return False
-        # Dead pane (remain-on-exit after a manual shell `exit`) — the session
-        # exists but nothing is running and send-keys are silent no-ops.
-        try:
-            r_pd = subprocess.run(
-                ["tmux", "display-message", "-t", tmux_target(session), "-p", "#{pane_dead}"],
-                capture_output=True, text=True, timeout=5)
-            if r_pd.stdout.strip() == "1":
-                return False
-        except Exception:
-            pass
-        # Tmux exists -- check if Claude is actually running (not at shell prompt)
-        output = tmux_capture(session, 10)
-        if not output:
-            return True  # empty output but tmux exists -- assume running (startup)
-        if _at_shell_prompt(output):
-            return False
-        # Terminal-based check can false-positive when Claude's status bar text
-        # leaks into scrollback after a SIGKILL. Cross-check by verifying the
-        # shell actually has a child process (Claude).
-        try:
-            r_pp = subprocess.run(
-                ["tmux", "list-panes", "-t", f"={tmux_sess}:", "-F", "#{pane_pid}"],
-                capture_output=True, text=True, timeout=5)
-            if r_pp.returncode == 0 and r_pp.stdout.strip():
-                shell_pid = r_pp.stdout.strip().split("\n")[0]
-                r_ch = subprocess.run(
-                    ["pgrep", "-P", shell_pid],
-                    capture_output=True, text=True, timeout=5)
-                if not r_ch.stdout.strip():
-                    # A CLI-started pane (`amux start`) holds the AGENT as the
-                    # pane process itself — no shell layer, so no child. This
-                    # said "not running" for a live opencode, the reuse branch
-                    # in start_session C-c'd it, and the REST start acked 200 on
-                    # a destroyed session (2026-09-30). A
-                    # childless pane is idle only when the pane process is a shell.
-                    r_cc = subprocess.run(
-                        ["tmux", "display-message", "-t", f"={tmux_sess}:", "-p",
-                         "#{pane_current_command}"],
-                        capture_output=True, text=True, timeout=5)
-                    if os.path.basename(r_cc.stdout.strip()).lstrip("-") in _SHELL_NAMES:
-                        return False
-        except Exception:
-            pass
-        return True
-    except FileNotFoundError:
-        return False
+            ["tmux", "list-panes", "-t", f"={tmux_name(session)}:", "-F",
+             "#{pane_dead}|#{pane_pid}|#{pane_current_command}"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return "stopped"
+    rows = r.stdout.strip().splitlines() if r.returncode == 0 else []
+    if not rows:
+        return "stopped"
+    dead, pid, cmd = (rows[0].split("|", 2) + ["", ""])[:3]
+    return _pane_state_of(dead, cmd, pid)
+
+
+def is_running(session: str) -> bool:
+    """True while an agent (or anything else) runs in this session's pane. Decided
+    from the pane's processes, not from the text on screen: the old test read a
+    line ending in "$" or "%" as a shell prompt, and the command line used a
+    third rule (the tmux session exists), so the same session could be running
+    on one side and stopped on the other."""
+    return _session_state(session) == "agent"
 
 
 def tmux_capture(session: str, lines: int = 500) -> str:
@@ -6432,23 +6467,24 @@ def _tmux_info_map() -> dict:
     try:
         r = subprocess.run(
             ["tmux", "list-panes", "-a", "-F",
-             "#{session_name}\t#{window_activity}\t#{session_created}\t#{pane_title}"],
+             "#{session_name}\t#{window_activity}\t#{session_created}\t#{pane_dead}\t#{pane_pid}\t#{pane_current_command}\t#{pane_title}"],
             capture_output=True, text=True, timeout=5,
         )
         if r.returncode != 0:
             return {}
         for line in r.stdout.strip().splitlines():
-            parts = line.split("\t", 3)
-            if len(parts) >= 3:
+            parts = line.split("\t", 6)
+            if len(parts) >= 6:
                 name = parts[0]
                 # Only keep first pane per session
                 if name not in result:
-                    title = parts[3].strip() if len(parts) >= 4 else ""
+                    title = parts[6].strip() if len(parts) >= 7 else ""
                     # Strip leading braille/dingbat status chars from pane title
                     clean_title = re.sub(r'^[\u2800-\u28ff\u2700-\u27bf\s]+', '', title).strip()
                     result[name] = {
                         "activity": int(parts[1]),
                         "created": int(parts[2]),
+                        "dead": parts[3], "pid": parts[4], "cmd": parts[5],
                         "pane_title": clean_title,
                     }
         return result
@@ -6785,15 +6821,20 @@ def list_sessions() -> list:
             strip_ansi = lambda t: re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\]8;[^\x1b]*\x1b\\|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][A-Z0-9]|\x1b[\x20-\x2f]*[\x40-\x7e]', '', t)
             lines = [l for l in raw.splitlines() if l.strip()]
             preview = strip_ansi(lines[-1][:120]) if lines else ""
-            # amux-fix v2: graceful stop leaves the tmux shell alive, so "tmux exists" is
-            # NOT the same as "Claude is running". Apply the same shell-prompt test
-            # is_running() uses, or a gracefully stopped session reads as running forever.
-            # Grace window: while the agent is still booting the pane legitimately shows
-            # the launch/shell line, so do not call a just-started session stopped.
-            if running and _at_shell_prompt(strip_ansi(raw)):
-                _started = max(meta.get("last_started", 0) or 0, session_created or 0)
-                if not _started or (time.time() - _started) > 30:
-                    running = False
+        # ONE RULE (see _pane_state_of): agent | shell | stopped, from the pane's
+        # processes. "running" is the agent state. Grace window: a session THIS SERVER
+        # is launching shows a bare shell for a moment before the launch line runs
+        # (_launching). Any other bare shell is one, however new its tmux session is.
+        if _it_sid:
+            state = "agent" if running else "stopped"
+        elif not running:
+            state = "stopped"
+        else:
+            state = _pane_state_of(tinfo.get("dead", ""), tinfo.get("cmd", ""), tinfo.get("pid", ""))
+            if state == "shell" and (time.time() - _launching.get(name, 0)) <= 30:
+                state = "agent"
+        running = state == "agent"
+        if raw:
             if running:
                 status = _detect_claude_status(raw)
             # Detect session becoming idle → auto-complete board issue, then pick up next queued task
@@ -6873,6 +6914,7 @@ def list_sessions() -> list:
             "provider": cfg.get("CC_PROVIDER", "claude"),
             "account": _session_account(cfg),
             "running": running,
+            "state": state,
             "status": status,
             "preview": preview,
             "preview_lines": preview_lines,
@@ -6908,6 +6950,7 @@ def get_session_info(name: str) -> dict | None:
         "provider": cfg.get("CC_PROVIDER", "claude"),
         "account": _session_account(cfg),
         "running": is_running(name),
+        "state": _session_state(name),
         "raw": f.read_text(),
     }
 
@@ -8626,12 +8669,10 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
         return _start_iterm2_session_tab(name, _it_cfg, fresh=fresh,
                                          account=_select_start_account(account_override, _it_cfg))
     with _get_session_lock(name):
-        if is_running(name):
-            return True, "already running"
-        # SUSPENDED AGENT (2026-09-29): a Ctrl-Z leaves the pane at a
-        # shell prompt with the agent as a STOPPED job, so is_running() says no and the
-        # reuse branch below would type a second `claude --resume` next to it. Bring the
-        # original back with `fg` instead — same process, same conversation.
+        # SUSPENDED AGENT: a Ctrl-Z leaves the pane at a shell prompt with the agent as a
+        # STOPPED job. Bring the original back with `fg`: same process, same conversation.
+        # Checked BEFORE is_running: a stopped job is still a process under the shell, so
+        # the pane counts as holding an agent.
         _susp = _suspended_agent_pid(name)
         if _susp:
             print(f"[start] {name}: agent pid {_susp} is suspended (Ctrl-Z) — resuming it with fg")
@@ -8640,6 +8681,9 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
             subprocess.run(["tmux", "send-keys", "-t", tmux_target(name), "Enter"],
                            capture_output=True, timeout=5)
             return True, "resumed a suspended agent (it had been stopped with Ctrl-Z)"
+        if is_running(name):
+            return True, "already running"
+        _launching[name] = time.time()
         cfg = parse_env_file(f)
         if cfg.get("CC_ARCHIVED") == "1":
             return False, "session is archived; wake it first"
@@ -9762,9 +9806,36 @@ def _hard_kill_claude(name: str):
             pass
 
 
-def stop_session(name: str, wait_secs: int = 15,
-                 hard_kill_on_timeout: bool = True) -> tuple[bool, str]:
-    """Gracefully stop Claude in this session. Tmux stays alive.
+def stop_session(name: str, wait_secs: int = 15, hard_kill_on_timeout: bool = True,
+                 end_tmux: bool = False, now: bool = False) -> tuple[bool, str]:
+    """Stop a session: ask the agent to exit, wait, and end it if it has not left.
+
+    end_tmux: also end the tmux session afterwards, so the session reads as
+    stopped (blank in `amux ls`) and not as an open shell. This is what a person
+    means by "stop": the API's stop and delete pass it, and `amux stop` on the
+    command line ends the same way. The recycle and restart paths leave it off,
+    because they start the agent again in the same pane.
+    now: skip the asking and end the tmux session at once (`amux stop --now`)."""
+    if not _VALID_SESSION_NAME_RE.match(name):
+        return False, "invalid session name"
+    if now:
+        # No session lock here: a graceful stop still waiting for the agent holds it,
+        # and "at once" must not queue behind that. Ending the tmux session is one
+        # tmux call; the waiting stop then sees the session gone and returns.
+        if not _tmux_session_exists(name):
+            return True, "not running"
+        _kill_tmux_session(name)
+        return True, "stopped (at once)"
+    ok, msg = _stop_agent(name, wait_secs, hard_kill_on_timeout)
+    if end_tmux and ok:
+        with _get_session_lock(name):
+            _kill_tmux_session(name)
+    return ok, msg
+
+
+def _stop_agent(name: str, wait_secs: int = 15,
+                hard_kill_on_timeout: bool = True) -> tuple[bool, str]:
+    """Gracefully stop the agent in this session. Tmux stays alive.
 
     wait_secs: how long to wait for the agent to reach a shell prompt after
     /exit (default 15s — the historical behavior). hard_kill_on_timeout:
@@ -9787,8 +9858,8 @@ def stop_session(name: str, wait_secs: int = 15,
         output = tmux_capture(name, 10)
         meta = _load_meta(name)
     
-        # Already at shell prompt -- Claude is not running
-        if _at_shell_prompt(output):
+        # No agent in the pane (a bare shell, or a dead pane) -- nothing to ask
+        if _session_state(name) != "agent":
             if not meta.get("cc_session_name"):
                 meta["cc_session_name"] = name
                 _save_meta(name, meta)
@@ -9798,8 +9869,17 @@ def stop_session(name: str, wait_secs: int = 15,
         claude_pid = _find_claude_pid(name)
         existing_name = _read_claude_session_name(claude_pid) if claude_pid else ""
     
+        try:
+            _stop_provider = parse_env_file(CC_SESSIONS / f"{name}.env").get("CC_PROVIDER", "") or "claude"
+        except Exception:
+            _stop_provider = "claude"
         if existing_name and _validate_cc_session_name(existing_name):
             session_name = existing_name
+        elif _stop_provider != "claude":
+            # /rename is a Claude Code command. Typed into codex, opencode or another
+            # agent it is a prompt for the model, sent just before /exit, and it cost
+            # up to 8 s of waiting for a Claude prompt that never comes.
+            session_name = name
         else:
             session_name = name
             # Wait for Claude prompt before sending /rename
@@ -9850,8 +9930,7 @@ def stop_session(name: str, wait_secs: int = 15,
             if not _tmux_session_exists(name):
                 print(f"[graceful-stop] {name}: exited gracefully, tmux session gone (name={session_name})")
                 return True, "stopped"
-            out = tmux_capture(name, 10)
-            if _at_shell_prompt(out):
+            if _session_state(name) != "agent":
                 print(f"[graceful-stop] {name}: exited gracefully (name={session_name})")
                 return True, "stopped"
 
@@ -42010,9 +42089,14 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     threading.Thread(target=_send_after_ready, args=(name, initial_prompt), daemon=True).start()
                 return self._json({"ok": ok, "message": msg, "resumed": bool(meta.get("cc_session_name") or meta.get("cc_conversation_id"))}, 200 if ok else 500)
             if action == "stop":
+                if bool((self._read_body() or {}).get("now")):
+                    # at once: one tmux call, answered directly (the pool below may be
+                    # busy with stops that are still waiting for their agents)
+                    ok, msg = stop_session(name, now=True)
+                    return self._json({"ok": ok, "message": msg}, 200 if ok else 500)
                 def _bg_stop(sname=name):
                     try:
-                        ok, msg = stop_session(sname)
+                        ok, msg = stop_session(sname, end_tmux=True)
                         if ok:
                             _complete_session_board_issue(sname)
                     except Exception as e:
@@ -42146,8 +42230,8 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     slog(f"[delete-blocked] {name}: pinned session, rejecting delete from {self.client_address[0]}")
                     return self._json({"error": "cannot delete pinned session — unpin first"}, 403)
                 slog(f"[delete] {name}: delete request from {self.client_address[0]}")
-                if is_running(name):
-                    stop_session(name)
+                if _session_state(name) != "stopped":
+                    stop_session(name, end_tmux=True)
                 # Clean up worktree if this session used one
                 if cfg_del.get("CC_WORKTREE") == "1":
                     wt_repo = cfg_del.get("CC_WORKTREE_REPO", "")

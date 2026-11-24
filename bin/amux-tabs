@@ -74,14 +74,14 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$ALL" = 1 ]; then
-  # name column from `amux ls`: col 1 is the row number (with a * when running), col 2
+  # name column from `amux ls`: col 1 is the row number (with a * when running, a ~ when only its shell is left), col 2
   # is the account/agent tag glued to the name — P:cc:myname, cx:myname. Names never
   # contain ':', so the name is what follows the last one. (Taking the whole of
   # col 2 as the name made the box:name split below read "T:cc:acm" as session
   # cc:acm on a box called T.)
   # with --host, list the REMOTE box's sessions.
   LSCMD="amux ls"; [ -n "$HOST" ] && LSCMD="ssh $HOST amux ls"
-  NAMES=$($LSCMD 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 ~ /^[0-9]+\*?$/ {n=$2; sub(/^.*:/,"",n); if (n ~ /^[A-Za-z0-9_]/) print n}')
+  NAMES=$($LSCMD 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 ~ /^[0-9]+[*~]?$/ {n=$2; sub(/^.*:/,"",n); if (n ~ /^[A-Za-z0-9_]/) print n}')
 fi
 NAMES=$(printf '%s\n' $NAMES | sed '/^$/d')
 [ -n "$NAMES" ] || { echo "no session names given (and --all found none)"; exit 1; }

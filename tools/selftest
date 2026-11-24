@@ -25,6 +25,9 @@
 #       re-register keeps a session, rename/rm/start-all, same-user dashboard access
 #   7f. dashboard text cannot run as a command; cross-site requests are told apart;
 #       pinned sessions, one codex resume rule, row numbers, a client-only install
+#   7g. one rule for running / open shell / stopped in amux and in the server, the
+#       three marks, one stop (ask, wait, end; --now), the same-user rule on macOS
+#   7h. amux offload hands over to the offload tool; amux info --dir / --porcelain
 #   8. the audit catches a planted secret
 #
 # Usage:
@@ -1041,6 +1044,149 @@ if BINDIR="$CB" AMUX_CORE_BINDIR="$CB" run ./install.sh --client && [ -L "$CB/am
 else
   bad "install.sh --client" "$(ls "$CB" 2>&1 | tr '\n' ' ')"
 fi
+
+# ── 7g. one rule for running / open shell / stopped; one stop ─────────────────
+sect "7g. The same state and the same stop, here and through a server"
+# the same panes through the command line's rule and the server's rule
+cases='0|claude|100|1 0|node|100|0 0|zsh|100|0 0|-zsh|100|0 0|/bin/bash|100|1 0|sh|100|0 1|claude|100|1 1|bash|100|0 0|python3|100|0 0||100|0 0|fish|100|1'
+shrule=$(sed -n '/^AMUX_SHELL_NAMES=/,/^session_state() {/p' bin/amux | sed '$d')
+a=$(bash -c "$shrule"'
+for c in $1; do IFS="|" read -r dead cmd pid kid <<<"$c"; kids=""; [ "$kid" = 1 ] && kids="$pid"
+  printf "%s " "$(_pane_state_of "$dead" "$cmd" "$pid" "$kids")"; done' _ "$cases" 2>&1)
+b=$(python3 - bin/amux-server.py "$cases" <<'PYT' 2>&1
+import os, subprocess, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+ns = {"os": os, "subprocess": subprocess,
+      "_SHELL_NAMES": eval(src[src.index("_SHELL_NAMES = ") + len("_SHELL_NAMES = "):].split("\n", 1)[0])}
+exec(src[src.index("def _pane_state_of("):src.index("def _session_state(")], ns)
+print("".join(ns["_pane_state_of"](d, c, p, k == "1") + " " for d, c, p, k in (x.split("|") for x in sys.argv[2].split())))
+PYT
+)
+want="agent agent shell shell agent shell shell shell agent agent agent "
+[ "$a" = "$want" ] && [ "$b" = "$want" ] \
+  && ok "amux and the server give the same state for the same 11 panes (agent / shell / stopped)" || bad "the two rules differ" "amux:   $a | server: $b"
+
+# the three marks, against a tmux that reports one pane of each kind
+cat > "$E/mock/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >> "${AMUX_TEST_TMUX_LOG:?}"
+case "${1:-}" in
+  list-sessions) printf 'amux-m-agent\namux-m-shell\namux-m-dead\n' ;;
+  list-panes)
+    case "$*" in
+      *" -a "*)       printf 'amux-m-agent|0|999991|node\namux-m-shell|0|999992|zsh\namux-m-dead|1|999993|node\n' ;;
+      *amux-m-agent*) printf '0|999991|node\n' ;;
+      *amux-m-shell*) printf '0|999992|zsh\n' ;;
+      *amux-m-dead*)  printf '1|999993|node\n' ;;
+      *) exit 1 ;;
+    esac ;;
+  has-session) case "$*" in *amux-m-agent*|*amux-m-shell*|*amux-m-dead*) exit 0 ;; *) exit 1 ;; esac ;;
+  display-message) case "$*" in *amux-m-dead*) echo 1 ;; *) echo 0 ;; esac ;;
+esac
+exit 0
+SH
+chmod +x "$E/mock/tmux"
+# (the suite's stand-in pgrep always names a child; these panes have none)
+printf '#!/bin/sh\nexit 1\n' > "$E/mock/pgrep"; chmod +x "$E/mock/pgrep"
+for n in m-agent m-shell m-dead m-off; do A register $n --provider codex --dir "$E/d1" >/dev/null; done
+o=$(A ls)
+mk() { printf '%s\n' "$o" | awk -v n="$1" '{x=$2; sub(/^.*:/,"",x); if (x==n) { m=$1; gsub(/[0-9]/,"",m); print "[" m "]" }}'; }
+[ "$(mk m-agent)" = "[*]" ] && [ "$(mk m-shell)" = "[~]" ] && [ "$(mk m-dead)" = "[~]" ] && [ "$(mk m-off)" = "[]" ] \
+  && ok "amux ls: * for a live agent, ~ for an open shell or a dead pane, blank for stopped" || bad "amux ls marks" "$(mk m-agent) $(mk m-shell) $(mk m-dead) $(mk m-off)"
+o=$(COLUMNS=250 A ls -c)
+has "● cx:m-agent" "$o" && has "◐ cx:m-shell" "$o" && has "◐ cx:m-dead" "$o" && has "○ cx:m-off" "$o" && has "2 ◐ no agent" "$o" \
+  && ok "amux ls -c: ● ◐ ○, and the open shells are counted apart" || bad "amux ls -c marks" "$o"
+o=$(A info m-shell); has "no agent" "$o" && ok "amux info names the state" || bad "amux info state" "$o"
+printf '#!/bin/sh\nexit 0\n' > "$E/mock/codex"; chmod +x "$E/mock/codex"
+: > "$TMUX_LOG"
+o=$(A start m-shell --no-attach)
+has "starting it again in the same tmux session" "$o" && has "respawn-pane" "$(out_of sed -n '1,400p' "$TMUX_LOG")" && ! has "new-session" "$(out_of sed -n '1,400p' "$TMUX_LOG")" \
+  && ok "amux start on a ~ session starts the agent again in the same pane" || bad "start on an open shell" "$o"
+: > "$TMUX_LOG"
+o=$(A stop m-shell)
+has "stopped m-shell" "$o" && has "kill-session" "$(out_of sed -n '1,200p' "$TMUX_LOG")" && ! has "/exit" "$(out_of sed -n '1,200p' "$TMUX_LOG")" \
+  && ok "amux stop on an open shell ends it without typing /exit into the shell" || bad "stop on an open shell" "$o"
+: > "$TMUX_LOG"
+o=$(A stop --now m-agent)
+has "stopped m-agent" "$o" && ! has "/exit" "$(out_of sed -n '1,200p' "$TMUX_LOG")" && ok "amux stop --now ends the session at once" || bad "stop --now" "$o"
+: > "$TMUX_LOG"
+o=$(AMUX_STOP_WAIT=1 A stop m-agent)
+has "/exit" "$(out_of sed -n '1,200p' "$TMUX_LOG")" && has "did not leave within 1s" "$o" && has "kill-session" "$(out_of sed -n '1,200p' "$TMUX_LOG")" \
+  && ok "amux stop asks the agent to exit, waits, then ends the session" || bad "graceful stop" "$o"
+o=$(A stop --bogus m-agent); has "unknown option '--bogus'" "$o" && ok "amux stop refuses an option it does not know" || bad "stop --bogus" "$o"
+o=$(A stop-all x); has "unknown argument 'x'" "$o" && ok "amux stop-all refuses an argument it does not know" || bad "stop-all x" "$o"
+rm -f "$E/mock/tmux" "$E/mock/codex" "$E/mock/pgrep"
+for n in m-agent m-shell m-dead m-off; do A rm $n >/dev/null; done
+
+# the list a server sends, drawn by the renderer and by amux-remote
+ST='[{"name":"a","state":"agent","running":true},{"name":"b","state":"shell","running":false},{"name":"c","running":false}]'
+o=$(printf '%s' "$ST" | AMUX_LS_LABEL=host AMUX_LS_COMPACT=1 COLUMNS=200 python3 lib/amux-render.py 2>&1 | tr -s ' ')
+has "1 ● P:cc:a 2 ◐ P:cc:b 3 ○ P:cc:c" "$o" && has "1 ◐ no agent" "$o" \
+  && ok "the renderer draws the three states, and falls back to running for an older server" || bad "renderer states" "$o"
+has '"state": state,' "$(out_of grep -n '"state": state,' bin/amux-server.py)" && has 's.get("state") or' "$(out_of grep -n 'get("state") or' bin/amux-remote)" \
+  && has 'x.get("state") or' "$(out_of grep -n 'get("state") or' bin/amux-search)" \
+  && ok "the server sends each session's state; amux-remote and amux search read it" || bad "state field"
+n=$(grep -c 'stop_session(name, now=True)\|stop_session(sname, end_tmux=True)\|stop_session(name, end_tmux=True)' bin/amux-server.py)
+[ "$n" = 3 ] && ok "the server's stop and delete end the tmux session too, and take \"now\"" || bad "server stop paths" "$n"
+
+# macOS: who owns the other end of a same-machine connection
+o=$(python3 - bin/amux-server.py <<'PYT' 2>&1
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+ns = {}
+exec(src[src.index("def _darwin_owner_uid("):src.index("def _darwin_peer_uid(")], ns)
+f = ns["_darwin_owner_uid"]
+t = "p38157\nu501\nf4\nn127.0.0.1:62503->127.0.0.1:8822\nf5\nn127.0.0.1:8822->127.0.0.1:62503\np400\nu502\nf9\nn127.0.0.1:60001->127.0.0.1:8822\nf3\nn[::1]:60002->[::1]:8822\n"
+print([f(t, "127.0.0.1", 62503, 8822), f(t, "127.0.0.1", 60001, 8822), f(t, "::1", 60002, 8822), f(t, "127.0.0.1", 60009, 8822), f(t, "127.0.0.1", 8822, 62503)])
+PYT
+)
+has "[501, 502, 502, None, 501]" "$o" \
+  && ok "macOS: the owner is read from the client end of the connection; an unknown one gets no pass" || bad "macOS owner lookup" "$o"
+
+# ── 7h. amux offload; the sessions of a folder ───────────────────────────────
+sect "7h. amux offload, and which sessions work in a folder"
+o=$(PATH="$E/mock:$BINDIR:/usr/bin:/bin" "$BINDIR/amux" offload version 2>&1 | plain); rc=0
+PATH="$E/mock:$BINDIR:/usr/bin:/bin" "$BINDIR/amux" offload version >/dev/null 2>&1 || rc=$?
+[ "$rc" != 0 ] && has "offload is not installed on this machine" "$o" && has "f.ortega/offload" "$o" \
+  && ok "amux offload without the offload tool: says so, and where to get it" || bad "amux offload, tool missing" "rc=$rc $o"
+printf '#!/bin/sh\nprintf "offload got:"; for a in "$@"; do printf " [%%s]" "$a"; done; echo\n' > "$E/mock/offload"; chmod +x "$E/mock/offload"
+o=$(A offload -b otherbox claude "my folder" --no-attach)
+[ "$o" = "offload got: [-b] [otherbox] [claude] [my folder] [--no-attach]" ] \
+  && ok "amux offload <args> hands every argument to the offload tool unchanged" || bad "amux offload passthrough" "$o"
+o=$(A help); has "amux offload claude" "$o" && has "transfer" "$o" \
+  && ok "amux help lists it under the words move and transfer" || bad "amux help: offload"
+mkdir -p "$E/d7h"
+# a stand-in tmux again: one live agent, one open shell
+cat > "$E/mock/tmux" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  list-sessions) printf 'amux-m-agent\namux-m-shell\n' ;;
+  list-panes)
+    case "$*" in
+      *" -a "*)       printf 'amux-m-agent|0|999991|node\namux-m-shell|0|999992|zsh\n' ;;
+      *amux-m-agent*) printf '0|999991|node\n' ;;
+      *amux-m-shell*) printf '0|999992|zsh\n' ;;
+      *) exit 1 ;;
+    esac ;;
+  has-session) case "$*" in *amux-m-agent*|*amux-m-shell*) exit 0 ;; *) exit 1 ;; esac ;;
+  display-message) echo 0 ;;
+esac
+exit 0
+SH
+chmod +x "$E/mock/tmux"
+printf '#!/bin/sh\nexit 1\n' > "$E/mock/pgrep"; chmod +x "$E/mock/pgrep"
+for n in m-agent m-shell m-off; do A register $n --provider codex --dir "$E/d7h" >/dev/null; done   # the stand-in tmux of 7g still reports their panes
+o=$(PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux" info --dir "$E/d7h" --porcelain 2>&1)
+has "$(printf 'm-agent\tagent\tcodex\t\t%s\t' "$E/d7h")" "$o" && has "$(printf 'm-shell\tshell\tcodex\t\t%s\t' "$E/d7h")" "$o" && has "$(printf 'm-off\tstopped\tcodex\t\t%s\t' "$E/d7h")" "$o" \
+  && ok "amux info --dir <folder> --porcelain: one line per session there, with its state" || bad "info --dir --porcelain" "$o"
+o=$(A info --dir "$E/d7h"); has "m-agent" "$o" && has "status: running" "$o" && has "no agent" "$o" \
+  && ok "amux info --dir <folder>: the same sessions, readable" || bad "info --dir" "$o"
+o=$(A info --dir "$E/mock"); rc=0; PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux" info --dir "$E/mock" >/dev/null 2>&1 || rc=$?
+[ "$rc" = 1 ] && has "no session is registered for" "$o" && ok "a folder with no session: says so, exit 1" || bad "info --dir, none" "rc=$rc $o"
+o=$(PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux" info --porcelain m-shell 2>&1)
+[ "$o" = "$(printf 'm-shell\tshell\tcodex\t\t%s\t' "$E/d7h")" ] && ok "amux info --porcelain <name>: the one line" || bad "info --porcelain name" "$o"
+rm -f "$E/mock/tmux" "$E/mock/pgrep" "$E/mock/offload"
+for n in m-agent m-shell m-off; do A rm $n >/dev/null; done
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"

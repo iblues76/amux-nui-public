@@ -3,8 +3,9 @@
 # only shows the ones actually running.
 #
 # "Stopped" = registered in ~/.amux/sessions/<name>.env but with NO live tmux
-# session `amux-<name>` (the same test amux itself uses). Those are the `○`
-# entries in `amux ls -c` / the ones with no `*` in `amux ls`.
+# session `amux-<name>`. Those are the `○` entries in `amux ls -c` / the blank
+# ones in `amux ls`. A `◐` / `~` session (its tmux session is open but the agent
+# has left) still has a tmux session and is left alone.
 #
 # Removal is `amux rm <name>`, which deletes the registration (.env) and the
 # session's state file (.meta.json); its memory file and pane log stay.
