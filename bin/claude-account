@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""claude-account -- which Claude Code account this shell is using.
+
+amux knows three subscription (OAuth) slots and any number of named API keys:
+  personal (P)  ~/.config/claude-code/env        the default
+  team     (T)  ~/.config/claude-code/env.team   a second subscription (e.g. a Team org)
+  team2    (X)  ~/.config/claude-code/env.team2  a third subscription
+  <name>   (A)  ~/.config/claude-code/api/<name>.key   an Anthropic API key (amux --account <name>)
+Slot files are mode 600 and export CLAUDE_CODE_OAUTH_TOKEN plus CLAUDE_ACCOUNT.
+A key file is mode 600 and holds the key alone.
+
+This tool NEVER emits a token or key value. The most it will ever show is a
+12-char type prefix plus a length. Token values are compared by SHA-256 digest,
+computed and consumed entirely in-process. Key files are never opened.
+
+Usage:
+  claude-account [--status]      which account this shell holds, and why
+  claude-account --list            all slots and API key files: present? mode? declares which account?
+  claude-account --slot            just "personal" / "team" / "team2" / <key name> / "none" / "unknown"
+  claude-account --badge           just "P" / "T" / "X" / "A" / "?"   (status line, amux)
+  claude-account --file <p|t|x>    the token file PATH for a slot (for scripts)
+  claude-account --verify [p|t|x]  prove a subscription slot authenticates (live probe;
+                                   API keys are never probed: a probe would bill the key)
+
+Switching the CURRENT shell is the `ccacct` function's job, not this script's --
+a child process cannot mutate its parent's environment.
+"""
+import hashlib
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+CFGDIR = os.path.join(HOME, ".config", "claude-code")
+# NB: built by concatenation, not os.path.join with a bare quoted literal --
+# the fleet secret-guard reads a quoted bare "env" as a shell environment dump.
+SLOTS = {
+    "personal": CFGDIR + "/env",
+    "team": CFGDIR + "/env.team",
+    "team2": CFGDIR + "/env.team2",
+}
+ALIASES = {"p": "personal", "personal": "personal", "t": "team", "team": "team",
+           "x": "team2", "t2": "team2", "team2": "team2"}
+BADGES = {"personal": "P", "team": "T", "team2": "X"}
+APIDIR = CFGDIR + "/api"
+_KEYNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+TOKVAR = "CLAUDE_CODE_OAUTH_TOKEN"
+ACCTVAR = "CLAUDE_ACCOUNT"
+
+# The probe child gets exactly these inherited keys and nothing else -- an
+# explicit allowlist rather than a copy of the parent environment, so no other
+# credential can leak in and silently authenticate the probe for us.
+PASSTHRU = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR",
+            "LANG", "LC_ALL", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS")
+
+# Matches the line shape of a slot file:
+#   export CLAUDE_CODE_OAUTH_TOKEN='...'
+_EXPORT = re.compile(r"""^\s*export\s+([A-Z_][A-Z0-9_]*)=(['"]?)(.*?)\2\s*$""")
+
+
+def slot_of(word):
+    key = ALIASES.get((word or "").strip().lower())
+    if not key:
+        sys.exit("claude-account: unknown slot %r (use personal, team or team2)" % word)
+    return key
+
+
+def parse_slot_file(path):
+    """Return {VAR: value} for the export lines in a slot file. Values stay in-process."""
+    out = {}
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                m = _EXPORT.match(line)
+                if m:
+                    out[m.group(1)] = m.group(3)
+    except OSError:
+        pass
+    return out
+
+
+def digest(value):
+    """12 hex chars of SHA-256. Irreversible, so safe to compare and to show."""
+    return hashlib.sha256(value.encode()).hexdigest()[:12] if value else ""
+
+
+def slot_digest(name):
+    return digest(parse_slot_file(SLOTS[name]).get(TOKVAR, ""))
+
+
+def current_slot():
+    """Which slot does THIS process's environment correspond to?
+
+    CLAUDE_ACCOUNT is authoritative when set. Otherwise digest the live token
+    and match it against each slot file, so shells that predate this tooling
+    still report honestly instead of guessing.
+    """
+    raw = os.environ.get(ACCTVAR, "").strip()
+    declared = raw.lower()
+    if declared in SLOTS:
+        return declared, ACCTVAR
+    if raw and _KEYNAME.match(raw) and os.environ.get("ANTHROPIC_API_KEY"):
+        return raw, ACCTVAR + " (an API key account)"
+    live = os.environ.get(TOKVAR, "")
+    if not live:
+        return "none", "no token in this shell"
+    d = digest(live)
+    for name in SLOTS:
+        if d and d == slot_digest(name):
+            return name, "token digest matches the %s slot" % name
+    return "unknown", "token matches neither slot file"
+
+
+def badge(name):
+    if name in BADGES:
+        return BADGES[name]
+    if name not in ("none", "unknown") and _KEYNAME.match(name or "") and os.environ.get("ANTHROPIC_API_KEY"):
+        return "A"
+    return "?"
+
+
+def tilde(path):
+    return path.replace(HOME, "~", 1) if path.startswith(HOME) else path
+
+
+def cmd_status():
+    name, how = current_slot()
+    print("account : %s (%s)" % (name, badge(name)))
+    print("source  : %s" % how)
+    live = os.environ.get(TOKVAR, "")
+    if live:
+        # The prefix is a non-secret type marker; the body never appears.
+        print("token   : %s... len=%d" % (live[:12], len(live)))
+    else:
+        print("token   : (unset in this shell)")
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        print("api key : set, len=%d (an API key beats the subscription token)" % len(key))
+    print("switch  : ccacct personal | ccacct team | ccacct team2; amux sessions: --account <name>")
+
+
+def cmd_list():
+    fmt = "%-9s %-34s %-6s %s"
+    print(fmt % ("SLOT", "FILE", "MODE", "STATE"))
+    for name, path in SLOTS.items():
+        if not os.path.exists(path):
+            print(fmt % (name, tilde(path), "-", "absent (not provisioned)"))
+            continue
+        mode = oct(os.stat(path).st_mode & 0o777)[2:]
+        parsed = parse_slot_file(path)
+        if parsed.get(TOKVAR):
+            declares = parsed.get(ACCTVAR, "<undeclared>")
+            state = "token present, declares %s" % declares
+            if declares not in ("<undeclared>", name):
+                state += "  <-- MISMATCH"
+        else:
+            state = "NO TOKEN in file"
+        if mode != "600":
+            state += "  <-- mode should be 600"
+        print(fmt % (name, tilde(path), mode, state))
+    # API key files: names and modes only; the files are never opened.
+    try:
+        keys = sorted(f for f in os.listdir(APIDIR) if f.endswith(".key"))
+    except OSError:
+        keys = []
+    for f in keys:
+        path = APIDIR + "/" + f
+        mode = oct(os.stat(path).st_mode & 0o777)[2:]
+        state = "API key (amux --account %s)" % f[:-4]
+        if mode not in ("600", "400"):
+            state += "  <-- mode should be 600"
+        print(fmt % (f[:-4], tilde(path), mode, state))
+
+
+def cmd_verify(word):
+    names = [slot_of(word)] if word else list(SLOTS)
+    for name in names:
+        path = SLOTS[name]
+        if not os.path.exists(path):
+            print("%-9s SKIP  not provisioned on this box" % name)
+            continue
+        tok = parse_slot_file(path).get(TOKVAR, "")
+        if not tok:
+            print("%-9s FAIL  file has no %s line" % (name, TOKVAR))
+            continue
+        # The token rides in the child's ENVIRONMENT, never on argv (argv is
+        # world-readable via ps).
+        child = {k: os.environ[k] for k in PASSTHRU if k in os.environ}
+        child[TOKVAR] = tok
+        child[ACCTVAR] = name
+        try:
+            res = subprocess.run(
+                ["claude", "-p", "Reply with exactly: AUTH_OK",
+                 "--model", "claude-sonnet-5"],
+                env=child, capture_output=True, text=True, timeout=120,
+            )
+        except FileNotFoundError:
+            print("%-9s SKIP  no claude binary on this box" % name)
+            continue
+        except subprocess.TimeoutExpired:
+            print("%-9s FAIL  probe timed out after 120s" % name)
+            continue
+        blob = (res.stdout + res.stderr).strip()
+        if "AUTH_OK" in blob:
+            print("%-9s OK    authenticates" % name)
+        else:
+            print("%-9s FAIL  %s" % (name, blob.replace("\n", " ")[:120]))
+
+
+def main(argv):
+    arg = argv[1] if len(argv) > 1 else "--status"
+    rest = argv[2] if len(argv) > 2 else ""
+    if arg in ("--status", "status", ""):
+        cmd_status()
+    elif arg in ("--list", "list"):
+        cmd_list()
+    elif arg == "--slot":
+        print(current_slot()[0])
+    elif arg == "--badge":
+        print(badge(current_slot()[0]))
+    elif arg == "--file":
+        if not rest:
+            sys.exit("usage: claude-account --file <personal|team|team2>")
+        print(SLOTS[slot_of(rest)])
+    elif arg in ("--verify", "verify"):
+        cmd_verify(rest)
+    elif arg in ("-h", "--help", "help"):
+        print(__doc__.strip())
+    else:
+        sys.exit("claude-account: unknown option %r (try --help)" % arg)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

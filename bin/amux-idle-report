@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""amux-idle-report [days=28] — read-only: for every registered amux session on this box, when a
+human last typed into it. Prints TSV: name, provider, dir, days-since-last-use | never | unknown, flag.
+  claude   last non-meta, non-tool-result user message in ~/.claude/projects/<enc(dir)>/*.jsonl
+  opencode last user message for that directory in ~/.local/share/opencode/opencode.db
+  codex    newest ~/.codex/sessions rollout whose cwd is that directory
+  other    unknown (never removed on that basis)
+flag = IDLE when days >= threshold or never used; KEEP otherwise; ? when unknown.
+Run remotely: ssh box 'python3 - 28' < amux-idle-report
+"""
+import os, re, sys, glob, json, sqlite3, subprocess, time, datetime
+H = os.path.expanduser('~'); NOW = time.time()
+if sys.argv[1:2] and sys.argv[1] in ('-h', '--help', 'help'):
+    print(__doc__.strip()); sys.exit(0)
+try:
+    TH = float(sys.argv[1]) if len(sys.argv) > 1 else 28
+except ValueError:
+    sys.exit('usage: amux-idle-report [days]   (days must be a number; -h for help)')
+_HERE = os.path.dirname(os.path.realpath(__file__)) if '__file__' in globals() and os.path.isfile(__file__) else ''
+AMUX = next((p for p in ((_HERE + '/amux') if _HERE else '', '/usr/local/bin/amux', H + '/.local/bin/amux', '/opt/homebrew/bin/amux')
+             if p and os.path.exists(p)), 'amux')
+
+def info(name):
+    out = subprocess.run([AMUX, 'info', name], capture_output=True, text=True).stdout
+    d = re.search(r'^\s*dir:\s*(.+)$', out, re.M); p = re.search(r'^\s*provider:\s*(\S+)', out, re.M)
+    return (d.group(1).strip() if d else ''), (p.group(1) if p else 'claude')
+
+def ts(s):
+    try: return datetime.datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+    except Exception: return 0
+
+def claude_last(di):
+    best = 0
+    for j in glob.glob(H + '/.claude/projects/' + re.sub(r'[^A-Za-z0-9]', '-', di) + '/*.jsonl'):
+        try:
+            with open(j, encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    if '"type":"user"' not in line: continue
+                    try: r = json.loads(line)
+                    except Exception: continue
+                    if r.get('isMeta') or r.get('isSidechain'): continue
+                    c = r.get('message', {}).get('content')
+                    if isinstance(c, list):
+                        if any(isinstance(x, dict) and x.get('type') == 'tool_result' for x in c): continue
+                        c = ' '.join(x.get('text', '') for x in c if isinstance(x, dict))
+                    c = (c or '').lstrip()
+                    if not c or c.startswith(('<command-', '<local-command', '<system-reminder', 'Caveat:', '[Request interrupted')): continue
+                    best = max(best, ts(r.get('timestamp', '')))
+        except OSError: pass
+    return best
+
+_oc = None
+def opencode_last(di):
+    global _oc
+    if _oc is None:
+        _oc = {}
+        db = H + '/.local/share/opencode/opencode.db'
+        if os.path.exists(db):
+            try:
+                con = sqlite3.connect('file:%s?mode=ro' % db, uri=True)
+                for d, t in con.execute("select s.directory, max(m.time_created) from message m join session s "
+                                        "on s.id=m.session_id where json_extract(m.data,'$.role')='user' group by s.directory"):
+                    _oc[d] = (t or 0) / 1000
+            except Exception: pass
+    return _oc.get(di, 0)
+
+_cx = None
+def codex_last(di):
+    global _cx
+    if _cx is None:
+        _cx = {}
+        for f in glob.glob(H + '/.codex/sessions/*/*/*/*.jsonl'):
+            try:
+                with open(f, encoding='utf-8', errors='replace') as fh: head = fh.read(20000)
+                m = re.search(r'"cwd"\s*:\s*"([^"]+)"', head)
+                if m: _cx[m.group(1)] = max(_cx.get(m.group(1), 0), os.path.getmtime(f))
+            except OSError: pass
+    return _cx.get(di, 0)
+
+SESS = os.environ.get('CC_HOME') or os.environ.get('AMUX_HOME') or (H + '/.amux')
+for f in sorted(glob.glob(SESS + '/sessions/*.env')):
+    name = os.path.basename(f)[:-4]
+    di, prov = info(name)
+    di = os.path.expanduser(di)
+    fn = {'claude': claude_last, 'opencode': opencode_last, 'codex': codex_last}.get(prov)
+    if fn is None:
+        print('%s\t%s\t%s\tunknown\t?' % (name, prov, di)); continue
+    t = fn(di)
+    if not t: print('%s\t%s\t%s\tnever\tIDLE' % (name, prov, di)); continue
+    days = (NOW - t) / 86400
+    print('%s\t%s\t%s\t%.0f\t%s' % (name, prov, di, days, 'IDLE' if days >= TH else 'KEEP'))

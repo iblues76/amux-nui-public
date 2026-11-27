@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# set-amux-cpu <off|5-95>      (Linux with systemd and cgroups v2; no root)
+# Cap the CPU of every amux agent session on this machine, via a systemd *user* amux.slice CPUQuota.
+#   off   -> uncapped (remove the quota)
+#   5-95  -> amux may use up to N% of THIS machine's total CPU (N% x nproc cores)
+# The cap only reaches the agents when the tmux server was STARTED inside amux.slice: tmux
+# puts every pane under its server's cgroup, and a running server cannot be moved in later.
+# systemd/amux-cap.service (in the amux tree) starts that server at login; set it up once:
+#   cp <amux tree>/systemd/amux-cap.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable amux-cap.service
+#   loginctl enable-linger "$USER"          # so it starts at boot, before any session
+# then reboot, or stop every tmux session and run: systemctl --user start amux-cap.service
+# Applies live. Idempotent. Prints the resulting cpu.max, and warns when tmux is outside the slice.
+set -euo pipefail
+case "${1:-}" in -h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+command -v systemctl >/dev/null 2>&1 || { echo "set-amux-cpu: needs Linux with systemd (no systemctl here)" >&2; exit 1; }
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+DROP="$HOME/.config/systemd/user/amux.slice.d"
+CONF="$DROP/cap.conf"
+CG="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/amux.slice"
+NPROC="$(nproc)"
+HOST="$(hostname -s)"
+arg="${1:-}"
+
+usage() { echo "usage: $(basename "$0") <off|5-95>   (-h for help)" >&2; exit 2; }
+
+# Is the tmux server inside amux.slice? Otherwise the quota is set but caps nothing.
+slice_note() {
+  local pid
+  pid=$(tmux display-message -p '#{pid}' 2>/dev/null) || return 0
+  [ -n "$pid" ] && [ -r "/proc/$pid/cgroup" ] || return 0
+  grep -q 'amux.slice' "/proc/$pid/cgroup" && return 0
+  echo "note: the tmux server (pid $pid) is NOT in amux.slice, so this cap does not reach the agents yet." >&2
+  echo "      Set up amux-cap.service once (set-amux-cpu -h), then restart tmux inside it." >&2
+}
+[ -n "$arg" ] || usage
+mkdir -p "$DROP"
+
+if [ "$arg" = off ]; then
+  rm -f "$CONF"
+  systemctl --user daemon-reload
+  systemctl --user set-property amux.slice CPUQuota="" 2>/dev/null || true
+  echo "amux-cpu: OFF (uncapped) on $HOST [$NPROC cores]"
+  exit 0
+fi
+
+case "$arg" in ''|*[!0-9]*) usage ;; esac
+if [ "$arg" -lt 5 ] || [ "$arg" -gt 95 ]; then
+  echo "error: value must be 'off' or 5-95 (got '$arg')" >&2; exit 2
+fi
+
+QUOTA=$(( arg * NPROC ))          # % of one core; = arg% of the whole box across nproc cores
+printf '[Slice]\nCPUQuota=%s%%\n' "$QUOTA" > "$CONF"
+systemctl --user daemon-reload
+systemctl --user start amux.slice 2>/dev/null || true
+CPUMAX="$(cat "$CG/cpu.max" 2>/dev/null || echo 'n/a (slice not materialized yet)')"
+echo "amux-cpu: ${arg}% -> CPUQuota=${QUOTA}% (cpu.max=${CPUMAX}) on $HOST [$NPROC cores]"
+slice_note

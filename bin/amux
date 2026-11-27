@@ -8,8 +8,8 @@
 
 set -euo pipefail
 
-CC_VERSION="0.9.20"
-CC_RELEASE="0.7.6"   # this repository's release: the VERSION file (tools/selftest checks they agree)
+CC_VERSION="0.9.23"
+CC_RELEASE="0.7.7"   # this repository's release: the VERSION file (tools/selftest checks they agree)
 _RESUME_TARGET=""
 _RESUME_SKIPPED=""
 
@@ -570,12 +570,39 @@ normalize_account() {
   esac
 }
 
+# API-KEY ACCOUNTS (2026-11-26): any other name is an Anthropic API key, kept as a
+# mode-600 file <name>.key in one of AMUX_API_KEY_DIRS. The session then bills that
+# key (per token), not a subscription: the launch exports ANTHROPIC_API_KEY from the
+# file (the value never reaches argv or the screen) and drops the OAuth token.
+AMUX_API_KEY_DIRS=("$HOME/.config/claude-code/api")
+
+is_api_account() {
+  [[ -n "$1" && " $AMUX_ACCOUNTS " != *" $1 "* && "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+# The key file of an API account: the first that exists, else the first place looked.
+api_key_file() {
+  local d
+  for d in "${AMUX_API_KEY_DIRS[@]}"; do
+    [[ -f "$d/$1.key" ]] && { printf '%s' "$d/$1.key"; return; }
+  done
+  printf '%s' "${AMUX_API_KEY_DIRS[0]}/$1.key"
+}
+
+# Octal permission bits of a file (Linux and macOS stat differ).
+_file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null; }
+
 validate_account() {
-  local a="$1"
+  local a="$1" f m
   case " $AMUX_ACCOUNTS " in
-    *" $a "*) ;;
-    *) die "unknown account '$a' (valid: $AMUX_ACCOUNTS — or P / T / X)" ;;
+    *" $a "*) return 0 ;;
   esac
+  is_api_account "$a" \
+    || die "unknown account '$a' (valid: $AMUX_ACCOUNTS — or P / T / X — or the name of an API key)"
+  f=$(api_key_file "$a")
+  [[ -f "$f" ]] || die "unknown account '$a': no API key file $f (P / T / X are the subscriptions; an API key account needs its key in that file, mode 600)"
+  m=$(_file_mode "$f")
+  [[ "$m" == 600 || "$m" == 400 ]] || die "the API key file $f is mode $m; make it private first: chmod 600 $f"
 }
 
 # The account a session gets when nobody said: the terminal's own identity.
@@ -584,7 +611,7 @@ default_account() {
   a=$(normalize_account "${CLAUDE_ACCOUNT:-}")
   case " $AMUX_ACCOUNTS " in
     *" $a "*) printf '%s' "$a" ;;
-    *) printf 'personal' ;;
+    *) if is_api_account "$a" && [[ -f "$(api_key_file "$a")" ]]; then printf '%s' "$a"; else printf 'personal'; fi ;;
   esac
 }
 
@@ -593,12 +620,13 @@ provider_uses_account() {
   [[ "$1" == "claude" || "$1" == "iterm2" ]]
 }
 
-# One-letter badge for listings: P / T / X.
+# One-letter badge for listings: P / T / X, and A for an API-key account.
 account_badge() {
   case "$1" in
     team)  printf 'T' ;;
     team2) printf 'X' ;;
-    *)     printf 'P' ;;
+    ""|personal) printf 'P' ;;
+    *)     if is_api_account "$1"; then printf 'A'; else printf 'P'; fi ;;
   esac
 }
 
@@ -607,7 +635,7 @@ account_badge() {
 # personal; pass "" to learn whether anything is stored at all).
 stored_account() {
   local a
-  a=$(sed -n 's/^CC_ACCOUNT="\{0,1\}\([a-z0-9]*\)"\{0,1\}$/\1/p' "$1" 2>/dev/null | head -1)
+  a=$(sed -n 's/^CC_ACCOUNT="\{0,1\}\([A-Za-z0-9._-]*\)"\{0,1\}$/\1/p' "$1" 2>/dev/null | head -1)
   [[ -n "$a" ]] || a="${2-personal}"
   printf '%s' "$a"
 }
@@ -674,6 +702,7 @@ account_col_prefix() {
     X:) printf '%s' "${BMAGENTA}X:${RESET}" ;;
     T:) printf '%s' "${BYELLOW}T:${RESET}" ;;
     P:) printf '%s' "${BBLUE}P:${RESET}" ;;
+    A:) if [[ -n "$BOLD" ]]; then printf '%s' $'\033[1;38;5;214m'"A:${RESET}"; else printf 'A:'; fi ;;
     *)  printf '%s' "$1" ;;
   esac
 }
@@ -722,7 +751,10 @@ _ls_prefix() {
     case "$2" in
       team)  badge=T; bcol="$BYELLOW" ;;
       team2) badge=X; bcol="$BMAGENTA" ;;
-      *)     badge=P; bcol="$BBLUE" ;;
+      ""|personal) badge=P; bcol="$BBLUE" ;;
+      *)     if is_api_account "$2"; then   # an API-key account (billed per token)
+               badge=A; [[ -n "$BOLD" ]] && bcol=$'\033[1;38;5;214m'
+             else badge=P; bcol="$BBLUE"; fi ;;
     esac ;;
   esac
   if [[ -n "$badge" ]]; then
@@ -801,7 +833,7 @@ _ls_read_env() {
   _E_PROVIDER="$CC_PROVIDER" _E_ACCOUNT="$CC_ACCOUNT" _E_ITERM="$CC_ITERM2_SESSION_ID"
   _E_FLAGS="$CC_FLAGS" _E_DIR="$CC_DIR"
   case "$_E_PROVIDER" in ''|*[!a-z0-9]*) _E_PROVIDER=claude ;; esac
-  case "$_E_ACCOUNT"  in ''|*[!a-z0-9]*) _E_ACCOUNT=personal ;; esac
+  case "$_E_ACCOUNT"  in ''|*[!A-Za-z0-9._-]*) _E_ACCOUNT=personal ;; esac
 }
 # Running test for the listing (same answer as is_running, no per-row probes):
 # the iTerm2 pane when one is stored, else the tmux session — including the
@@ -845,6 +877,14 @@ account_slot_file() {
 # personal would run org work on the wrong subscription.
 account_shell_setup() {
   local acct="$1" f
+  if is_api_account "$acct"; then
+    # An API key: exported from its file by the shell itself ($(<file) is a builtin, so
+    # the value is in no process's argv), with the subscription token dropped.
+    f=$(api_key_file "$acct")
+    [[ -f "$f" ]] || die "the API key account '$acct' has no key file here ($f)"
+    printf 'unset CLAUDE_CODE_OAUTH_TOKEN; export ANTHROPIC_API_KEY="$(<%q)"; export CLAUDE_ACCOUNT=%q; ' "$f" "$acct"
+    return 0
+  fi
   f=$(account_slot_file "$acct")
   if [[ ! -f "$f" ]]; then
     # A box with NO personal slot uses claude's own browser /login: the slot
@@ -966,7 +1006,7 @@ parse_claude_flags() {
       # Which Claude subscription identity (personal | team | team2, or P | T | X) — stored
       # as CC_ACCOUNT in the session .env for claude/iterm2 sessions only.
       --account)
-        [[ -n "${2:-}" ]] || die "--account needs a value (one of: $AMUX_ACCOUNTS)"
+        [[ -n "${2:-}" ]] || die "--account needs a value (one of: $AMUX_ACCOUNTS, P / T / X, or the name of an API key)"
         CC_ACCOUNT_OPT=$(normalize_account "$2")
         validate_account "$CC_ACCOUNT_OPT"
         shift 2
@@ -1165,7 +1205,7 @@ resolve_account_for_write() {
   fi
   account="${CC_ACCOUNT_OPT:-}"
   if [[ -z "$account" && -f "$file" ]]; then
-    account=$(sed -n 's/^CC_ACCOUNT="\{0,1\}\([a-z0-9]*\)"\{0,1\}$/\1/p' "$file" | head -1)
+    account=$(sed -n 's/^CC_ACCOUNT="\{0,1\}\([A-Za-z0-9._-]*\)"\{0,1\}$/\1/p' "$file" | head -1)
   fi
   [[ -n "$account" ]] || account=$(default_account)
   validate_account "$account"
@@ -1349,7 +1389,7 @@ cmd_account() {
   new="${2:-}"
   case "$new" in
     --account)   new="${3:-}"
-                 [[ -n "$new" ]] || die "--account needs a value: amux account $name --account personal|team|team2 (or P|T|X)" ;;
+                 [[ -n "$new" ]] || die "--account needs a value: amux account $name --account personal|team|team2|<api key name> (or P|T|X)" ;;
     --account=*) new="${new#--account=}" ;;
   esac
   if ! provider_uses_account "$prov"; then
@@ -1377,7 +1417,7 @@ cmd_account() {
   # be absent on browser-/login boxes and still works.
   local slot
   slot=$(account_slot_file "$new")
-  if [[ "$new" != "personal" && ! -f "$slot" ]]; then
+  if ! is_api_account "$new" && [[ "$new" != "personal" && ! -f "$slot" ]]; then
     die "the $new account is not set up on this box (missing $slot). Create it: see docs/accounts.md (claude setup-token, then a mode-600 slot file)"
   fi
   python3 - "$file" "$new" <<'PYEOF' || die "failed to update $file"
@@ -1468,7 +1508,7 @@ _start_iterm2_session() {
   local shell_setup="unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; "
   announce_start_account "$name" "$_acct"
   shell_setup="${shell_setup}$(account_shell_setup "$_acct")"
-  if [[ -f "$HOME/.claude.json" ]] && grep -q '"oauthAccount"' "$HOME/.claude.json" 2>/dev/null; then
+  if ! is_api_account "$_acct" && [[ -f "$HOME/.claude.json" ]] && grep -q '"oauthAccount"' "$HOME/.claude.json" 2>/dev/null; then
     shell_setup="${shell_setup}unset ANTHROPIC_API_KEY; "
   fi
   if (( ${AMUX_AUTOPROMPT:-0} )); then
@@ -1547,7 +1587,7 @@ cmd_start() {
     validate_provider "$provider_override"
     CC_PROVIDER="$provider_override"
   fi
-  (( _acct_next )) && die "--account needs a value (one of: $AMUX_ACCOUNTS)"
+  (( _acct_next )) && die "--account needs a value (one of: $AMUX_ACCOUNTS, P / T / X, or the name of an API key)"
   (( _color_next )) && die "--color needs a value (a palette name, #rrggbb, next, auto or none — see: amux color palette)"
   if [[ -n "${AMUX_COLOR_ONESHOT:-}" ]]; then
     [[ "$AMUX_COLOR_ONESHOT" =~ ^#?[A-Za-z0-9]+$ ]] || die "invalid --color '$AMUX_COLOR_ONESHOT' (see: amux color palette)"
@@ -1828,16 +1868,18 @@ PYEOF
       done
       set -- ${_oc_rest[@]+"${_oc_rest[@]}"}
     fi
-    # COMPLIANCE: the OpenCode lane runs LOCAL models ONLY (Ollama on the
-    # loopback/tailnet) — NEVER the Claude subscription. Build the whole launch
-    # command in python: translate claude-style flags, pin a verified-local
-    # -m provider/model, resume the stored (or newest-for-dir) session.
-    cmd=$(python3 - "$meta_file" "$dir" "${CC_FLAGS:-}" "$_oc_oneshot" "$_fresh" <<'PYEOF'
+    # COMPLIANCE: the OpenCode lane runs LOCAL models (Ollama on the loopback/
+    # tailnet), or a DeepInfra model the session names — NEVER the Claude
+    # subscription. Build the whole launch command in python: translate
+    # claude-style flags, pin a verified -m provider/model, resume the stored
+    # (or newest-for-dir) session.
+    cmd=$(python3 - "$meta_file" "$dir" "${CC_FLAGS:-}" "$_oc_oneshot" "$_fresh" "${_partners:-0}" <<'PYEOF'
 import json, os, re, shlex, subprocess, sys
 from pathlib import Path
 mf, wdir, flags = sys.argv[1], sys.argv[2], sys.argv[3]
 oneshot = sys.argv[4] if len(sys.argv) > 4 else ""
 fresh = (sys.argv[5] == "1") if len(sys.argv) > 5 else False
+partners = (sys.argv[6] == "1") if len(sys.argv) > 6 else False
 
 def local_providers():
     for cfg in ("opencode.jsonc", "opencode.json"):
@@ -1863,6 +1905,31 @@ def is_local(model):
     pid = model.partition("/")[0].strip().lower()
     return pid not in CLOUD and pid in local_providers()
 
+# DeepInfra (2026-11-26): a cloud provider amux also accepts, but only when the
+# session NAMES the model (--model on exec, a one-shot --model on start, or
+# AMUX_OPENCODE_MODEL); the default stays the first local model. The name is
+# checked against OpenCode's own list, read with the OPENCODE_PARTNERS value this
+# launch gets, so a model a plugin hides from OpenCode is refused here too.
+NAMED_CLOUD = {"deepinfra"}
+def is_named_cloud(model):
+    if not model or "/" not in model: return False
+    pid, _, rest = model.partition("/")
+    return pid.strip().lower() in NAMED_CLOUD and bool(rest.strip())
+def cloud_listed(model):
+    """True / False when OpenCode's list could be read, None when it could not."""
+    pid = model.partition("/")[0]
+    env = dict(os.environ)
+    if partners: env["OPENCODE_PARTNERS"] = "1"
+    else: env.pop("OPENCODE_PARTNERS", None)
+    try:
+        r = subprocess.run(["opencode", "models", pid], capture_output=True,
+                           text=True, timeout=30, env=env)
+    except Exception:
+        return None
+    names = {l.strip() for l in (r.stdout or "").splitlines() if l.strip()}
+    if r.returncode != 0 or not names: return None
+    return model in names
+
 # translate claude-style flags
 model, yolo, keep = "", False, []
 try: toks = shlex.split(flags)
@@ -1883,14 +1950,23 @@ if oneshot:
 
 if not model:
     env_m = os.environ.get("AMUX_OPENCODE_MODEL","").strip()
-    if env_m and is_local(env_m): model = env_m
+    if env_m and (is_local(env_m) or is_named_cloud(env_m)): model = env_m
     else:
         for pid, ms in local_providers().items():
             if ms: model = f"{pid}/{ms[0]}"; break
 if not model:
     print("ERR:opencode: no LOCAL model available — set AMUX_OPENCODE_MODEL or add a local Ollama provider to ~/.config/opencode/opencode.json[c] (the OpenCode lane never uses the Claude subscription)"); sys.exit(0)
-if not is_local(model):
-    print(f"ERR:opencode: model '{model}' is not a verified LOCAL provider/model — compliance requires a loopback/tailnet provider from ~/.config/opencode/opencode.json[c]"); sys.exit(0)
+if is_named_cloud(model):
+    _pid = model.partition("/")[0]
+    _listed = cloud_listed(model)
+    if _listed is False:
+        _hint = "" if partners else " If it is a partner model, add --partners."
+        print(f"ERR:opencode: model '{model}' is not in OpenCode's {_pid} list (opencode models {_pid}).{_hint}"); sys.exit(0)
+    if _listed is None:
+        print(f"  note: could not read 'opencode models {_pid}'; starting {model} unchecked", file=sys.stderr)
+    print(f"  model: {model} (cloud: {_pid}, named for this session)", file=sys.stderr)
+elif not is_local(model):
+    print(f"ERR:opencode: model '{model}' is neither a verified LOCAL provider/model (a loopback/tailnet provider in ~/.config/opencode/opencode.json[c]) nor a DeepInfra model (deepinfra/<model>)"); sys.exit(0)
 
 sid = ""
 if not fresh:
@@ -2231,7 +2307,7 @@ PYEOF
     # ACCOUNTS (2026-09-05): the slot sourced is the session's ACCOUNT (personal,
     # team or team2); a missing slot is a hard error, not a silent fallback.
     shell_setup="${shell_setup}$(account_shell_setup "$account")"
-    if [[ -f "$HOME/.claude.json" ]] && grep -q '"oauthAccount"' "$HOME/.claude.json" 2>/dev/null; then
+    if ! is_api_account "$account" && [[ -f "$HOME/.claude.json" ]] && grep -q '"oauthAccount"' "$HOME/.claude.json" 2>/dev/null; then
       shell_setup="${shell_setup}unset ANTHROPIC_API_KEY; "
     fi
     if (( ${AMUX_AUTOPROMPT:-0} )); then
@@ -2803,8 +2879,8 @@ _info_one() {  # $1 name, $2 1 = one tab-separated line
   esac
 }
 
-# amux offload <args...> — the offload tool under the amux name. `amux offload claude
-# <folder|session>` moves a session's work to another machine: the session here writes
+# amux offload <args...> — the offload tool (bin/offload) under the amux name. `amux offload
+# <session|folder>` moves a session's work to another machine: the session here writes
 # a handoff note, the folder is copied, and a new amux session starts there.
 cmd_offload() {
   local p
@@ -2815,7 +2891,7 @@ cmd_offload() {
     done
   fi
   [[ -n "$p" ]] || die "offload is not installed on this machine (it is a separate small tool: https://git.nuilab.org/f.ortega/offload)"
-  exec "$p" "$@"
+  OFFLOAD_PROG="amux offload" exec "$p" "$@"
 }
 
 cmd_ls() {
@@ -2906,6 +2982,7 @@ cmd_pick() {
     local ccj="$HOME/.local/bin/ccjump"; [[ -x "$ccj" ]] || ccj="$(command -v ccjump || true)"
     [[ -n "$ccj" ]] \
       || die "pick needs ccjump, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
+    export AMUX_PROG="amux pick"
     if [[ ${#scope[@]} -eq 0 ]]; then exec "$ccj" local; else exec "$ccj" "${scope[@]}"; fi
   fi
 
@@ -2919,7 +2996,7 @@ cmd_pick() {
     grid=$(AMUX_FORCE_COLOR=0 cmd_ls_compact 2>/dev/null)
   else
     command -v amux-remote >/dev/null 2>&1 || die "pick <box> needs amux-remote on PATH"
-    grid=$(amux-remote "$box" ls -c --bare 2>&1) || die "could not list $box: $grid"
+    grid=$(AMUX_PROG="amux -H" amux-remote "$box" ls -c --bare 2>&1) || die "could not list $box: ${grid#error: }"
   fi
   # grid cells read "19 ● P:cc:name"; the tag before the last ':' is display-only
   local name
@@ -2939,7 +3016,7 @@ for m in re.finditer(r"(?:^|\s)(\d+) [\u25cf\u25cb\u25d0] (\S+)", sys.stdin.read
     cmd_start "$name"            # attaches if running, else starts (auto-resume) + attaches
   else
     command -v amux-up >/dev/null 2>&1 || die "pick <box> --sessionid needs amux-up on PATH"
-    exec amux-up "$box" "$name"  # start-if-needed, then attach
+    AMUX_PROG="amux up" exec amux-up "$box" "$name"  # start-if-needed, then attach
   fi
 }
 
@@ -3523,7 +3600,7 @@ cmd_find() {
     ( AMUX_API_CONNECT_TIMEOUT=4 AMUX_API_MAX_TIME=8 amux-remote "$box" curl /api/sessions \
         >"$work/$box.json" 2>/dev/null || rm -f "$work/$box.json" ) &
   done
-  [[ $n -gt 0 ]] || die "session '$name' not found here, and no other boxes are configured (amux-remote add <box>)"
+  [[ $n -gt 0 ]] || die "session '$name' not found here, and no other boxes are configured (add one: amux -H add <box>)"
   echo "${DIM}'$name' is not on this box — asking $n other boxes…${RESET}" >&2
   wait
 
@@ -3568,14 +3645,14 @@ PY
 
   local extra=""; [[ $# -gt 0 ]] && extra=" $*"
   _find_cmd() { case "$verb" in
-      start)  echo "amux-up $1 $name$extra" ;;
-      attach) echo "amux-remote $1 attach $name$extra" ;;
-      peek)   echo "amux-remote $1 peek $name$extra" ;;
-      stop)   echo "amux-remote $1 stop $name" ;;
+      start)  echo "amux up $1 $name$extra" ;;
+      attach) echo "amux -H $1 attach $name$extra" ;;
+      peek)   echo "amux -H $1 peek $name$extra" ;;
+      stop)   echo "amux -H $1 stop $name$extra" ;;
     esac; }
   # One match for a read-only peek needs no yes, terminal or not.
   if [[ "$verb" == peek && ${#mbox[@]} -eq 1 ]]; then
-    rm -rf "$work"; exec amux-remote "${mbox[0]}" peek "$name" "$@"
+    rm -rf "$work"; AMUX_PROG="amux -H" exec amux-remote "${mbox[0]}" peek "$name" "$@"
   fi
   if [[ ! -t 0 || ! -t 1 ]] || ! { : </dev/tty; } 2>/dev/null; then
     for b in "${mbox[@]}"; do echo "  run: $(_find_cmd "$b")" >&2; done
@@ -3599,10 +3676,10 @@ PY
   echo "${DIM}→ $(_find_cmd "$b")${RESET}" >&2
   rm -rf "$work"
   case "$verb" in
-    start)  exec amux-up "$b" "$name" "$@" ;;
-    attach) exec amux-remote "$b" attach "$name" "$@" ;;
-    peek)   exec amux-remote "$b" peek "$name" "$@" ;;
-    stop)   exec amux-remote "$b" stop "$name" "$@" ;;
+    start)  AMUX_PROG="amux up" exec amux-up "$b" "$name" "$@" ;;
+    attach) AMUX_PROG="amux -H" exec amux-remote "$b" attach "$name" "$@" ;;
+    peek)   AMUX_PROG="amux -H" exec amux-remote "$b" peek "$name" "$@" ;;
+    stop)   AMUX_PROG="amux -H" exec amux-remote "$b" stop "$name" "$@" ;;
   esac
 }
 
@@ -3712,7 +3789,7 @@ def codex():
 
 CLOUD = {"anthropic","claude","openai","google","gemini","openrouter","azure","bedrock","vertex","xai","groq","mistral","deepseek"}
 def opencode():
-    head("opencode", "amux --provider opencode --model <local-provider>/<model>   LOCAL ONLY")
+    head("opencode", "amux --provider opencode --model <local-provider>/<model> or deepinfra/<model>")
     cfg = None
     for name in ("opencode.jsonc", "opencode.json"):
         p = Path.home() / ".config" / "opencode" / name
@@ -3733,6 +3810,8 @@ def opencode():
         models = list((pdef.get("models") or {}).keys())
         if local and pid.lower() not in CLOUD:
             ok += [(f"{pid}/{m}", (pdef.get("models") or {}).get(m, {}).get("name", "") or pdef.get("name", "")) for m in models]
+        elif pid.lower() == "deepinfra":
+            pass   # listed by name below: accepted with --model, never the default
         else:
             why = "cloud provider id" if pid.lower() in CLOUD else f"not loopback/tailnet ({host or 'no baseURL'})"
             refused += [(f"{pid}/{m}", why) for m in models]
@@ -3744,10 +3823,14 @@ def opencode():
         print(f"    {Y}no local provider in {cfg.name} - amux refuses to start opencode here{R}")
     oc_default = data.get("model")
     if oc_default and oc_default not in [m for m, _ in ok]:
-        refused.insert(0, (oc_default, "opencode's own default; cloud, used by plain 'opencode', never by amux"))
+        if oc_default.lower().startswith("deepinfra/"):
+            print(f"    {D}~ {oc_default:<34} opencode's own default; amux uses it only when named with --model{R}")
+        else:
+            refused.insert(0, (oc_default, "opencode's own default; cloud, used by plain 'opencode', never by amux"))
     for m, why in refused:
         print(f"    {D}x {m:<34} refused: {why}{R}")
-    print(f"    {D}default = AMUX_OPENCODE_MODEL if local, else the first local model above (from {cfg}){R}")
+    print(f"    {D}+ deepinfra/<model>                 accepted when named with --model; checked against 'opencode models deepinfra'{R}")
+    print(f"    {D}default = AMUX_OPENCODE_MODEL if local or deepinfra/..., else the first local model above (from {cfg}){R}")
 
 def run(cmd, timeout=20):
     try:
@@ -3849,10 +3932,11 @@ ${BOLD}Sessions:${RESET}
                                  (stop-all asks them all at the same time; stop-all --now ends them at once)
   amux start|attach|peek|stop <name> --find
                                  Not on this box? Look on the other boxes and act there after a yes
-  amux offload claude <folder|name> [-b <box>]
-                                 Move (transfer) a session's work to another machine: the session here writes a
-                                 handoff note, the folder is copied, and a new amux session starts there and
-                                 reads the note. amux offload <anything> runs the offload tool (amux offload -h)
+  amux offload <session|folder> [-b <box>]
+                                 Move (transfer) a session to another machine: the session here writes a handoff
+                                 note, its folder is copied, and an amux session of the same name, agent and
+                                 options starts there and reads the note. The offload tool's other commands
+                                 (run, put, get, fetch, redirect, box): amux offload -h
 
 ${BOLD}Info:${RESET}
   amux info <name>               Session config details
@@ -3898,7 +3982,8 @@ cmd_help_topic() {
   case "$1" in
     remote) cat <<EOF
 ${BOLD}Another box (remote):${RESET}
-  amux -H <box> <args...>        Run any amux command on <box> instead (== amux-remote <box> <args...>)
+  amux -H <box> <cmd> [args]     Run a command on <box>: ls, attach, peek, send, exec, start, stop,
+                                 rm, info, provider, account, model, full-access (amux -H <box> help)
                                  e.g. amux -H myhost ls -c · amux -H myhost start api
                                  -H must come FIRST; everything after the box is passed through untouched.
                                  Only --mosh / --cc / --plain may lead it: amux --mosh -H myhost exec …
@@ -3982,8 +4067,10 @@ ${BOLD}Providers — which agent a session runs:${RESET}
                         config for ls/peek/send/attach/stop
 
   ${DIM}opencode is the LOCAL-MODEL lane: amux pins a verified local (Ollama/tailnet)
-  provider/model from ~/.config/opencode/opencode.json[c] or AMUX_OPENCODE_MODEL and
-  REFUSES anything else — it never runs on the Claude subscription (compliance).
+  provider/model from ~/.config/opencode/opencode.json[c] or AMUX_OPENCODE_MODEL.
+  The one cloud exception is DeepInfra, only when named: --model deepinfra/<model>
+  (checked against 'opencode models deepinfra'; the default stays local). Anything
+  else is REFUSED — it never runs on the Claude subscription (compliance).
   --partners (opencode only) starts it with OPENCODE_PARTNERS=1: amux help flags.${RESET}$(_provider_avail_note)
   See also: amux help access · amux models [provider]
 EOF
@@ -4019,6 +4106,13 @@ ${BOLD}Accounts — which Claude subscription a claude session bills to (2026-09
   can show it too (it reads \$CLAUDE_ACCOUNT). P / T / X are accepted as short spellings everywhere.
   A session whose slot is not provisioned on the box refuses to start rather
   than silently bill the other subscription.
+  ${BOLD}API-key accounts:${RESET} any other name is an Anthropic API key, and the session
+  bills that key per token instead of a subscription:
+    amux exec <name> --provider claude ${BOLD}--account <key name>${RESET}   ${DIM}(or amux start <name> --account <key name>)${RESET}
+  The key is a mode-600 file ${BOLD}~/.config/claude-code/api/<key name>.key${RESET}. At launch amux
+  exports ANTHROPIC_API_KEY from that file (never on a command line) and drops the
+  subscription token. The badge is ${BOLD}A${RESET}. Claude Code may ask once, in the pane, to
+  approve a new key.
 EOF
     ;;
     access) cat <<EOF
@@ -4320,7 +4414,7 @@ _amux() {
     send)              _amux_name_then --keys ;;
     rm|remove|del)     _amux_name_then ;;
     info)              _amux_name_then --dir --porcelain ;;
-    offload)           _amux_opts claude run put get fetch box redirect version -b -y --no-handoff --name --no-attach ;;
+    offload)           _amux_opts session run put get fetch box redirect version -b -y --no-handoff --handoff-wait --name --no-attach ;;
     rename|mv)         _amux_name_then -n ;;
     rmnum)             _amux_opts -y ;;
     search|find)       _amux_opts --corefleet --mainfleet --fleetall --fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t -e --and --since --show -n --agentic --local --continue --provider --model --effort --account --raw --sessions -c --compact --regex --matchstring ;;
@@ -4467,7 +4561,7 @@ _amux_complete() {
     send)              words="--keys" ;;
     rm|remove|del)     words="" ;;
     info)              words="--dir --porcelain" ;;
-    offload)           words="claude run put get fetch box redirect version -b -y --no-handoff --name --no-attach" ;;
+    offload)           words="session run put get fetch box redirect version -b -y --no-handoff --handoff-wait --name --no-attach" ;;
     rename|mv)         words="-n" ;;
     rmnum)             words="-y" ;;
     search|find)       words="--corefleet --mainfleet --fleetall --fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t -e --and --since --show -n --agentic --local --continue --provider --model --effort --account --raw --sessions -c --compact --regex --matchstring" ;;
@@ -4551,17 +4645,21 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       --host=*) _rbox="${1#--host=}"; shift ;;
       *)        _rbox="${2:-}"; shift 2 2>/dev/null || shift ;;
     esac
-    [[ -n "$_rbox" ]] || die "-H needs a box: amux -H <box> <args...>   (e.g. amux -H myhost ls -c)"
     command -v amux-remote >/dev/null 2>&1 \
       || die "-H needs amux-remote, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
+    # AMUX_PROG (2026-11-26): the companion prints the words the user typed ("amux -H"),
+    # not its own file name, in every usage line, hint and error.
+    # `amux -H` alone: the configured boxes and how to add one.
+    [[ -n "$_rbox" ]] || AMUX_PROG="amux -H" exec amux-remote
     # `amux -H <box> up <name>` -> amux-up <box> <name> (start-if-needed, then attach)
     if [[ "${1:-}" == up ]]; then
       shift
       command -v amux-up >/dev/null 2>&1 \
         || die "up needs amux-up, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
-      exec amux-up "$_rbox" "$@"
+      [[ -n "${1:-}" && "${1:-}" != -* ]] || die "usage: amux -H $_rbox up <name> [flags]"
+      AMUX_PROG="amux up" exec amux-up "$_rbox" "$@"
     fi
-    exec amux-remote "$_rbox" "$@"
+    AMUX_PROG="amux -H" exec amux-remote "$_rbox" "$@"
   fi
 
   # ALL-BOXES SHORTHAND (2026-09-22): `amux -A [args...]` == `amux-all [args...]`, the
@@ -4572,7 +4670,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     shift
     command -v amux-all >/dev/null 2>&1 \
       || die "-A needs amux-all, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
-    exec amux-all "$@"
+    AMUX_PROG="amux -A" exec amux-all "$@"
   fi
 
   # --find anywhere after start/attach/peek/stop <name> → cmd_find (see there).
@@ -4586,7 +4684,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
   # `amux peek --help` → just peek's entry. pick/serve parse -h themselves.
   if [[ $# -ge 2 && ( "$2" == "-h" || "$2" == "--help" ) ]]; then
     case "$1" in
-      pick|choose|serve|web|help|-h|--help) : ;;
+      pick|choose|serve|web|help|-h|--help|offload) : ;;   # offload -h: the offload tool's own help
       *) cmd_subhelp "$1" && exit 0 ;;
     esac
   fi
@@ -4599,7 +4697,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     up)               shift
                       command -v amux-up >/dev/null 2>&1 \
                         || die "up needs amux-up, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
-                      exec amux-up "$@" ;;
+                      AMUX_PROG="amux up" exec amux-up "$@" ;;
     peek|p)           shift; cmd_peek "$@" ;;
     send)             shift; cmd_send "$@" ;;
     stop|kill)        shift; cmd_stop "$@" ;;

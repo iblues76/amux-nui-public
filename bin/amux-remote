@@ -73,6 +73,25 @@ fi
 # selected + sourced in the dispatch block at the bottom (once die()/usage() exist).
 AMUX_REMOTES_DIR="${CC_HOME:-$HOME/.amux}/remotes"
 BOX="" BOX_ENV=""   # set by the dispatch block once a box is chosen
+# The name the user typed for this tool: amux sets AMUX_PROG="amux -H" when `amux -H <box> ...`
+# hands off here, so every usage line, hint and error says what to type again. Read once and
+# unset, so a tool started from here does not inherit the wrong name.
+ME="${AMUX_PROG:-amux-remote}"; unset AMUX_PROG
+BOX_ARG=""   # the box as typed (before alias resolution), for hints
+
+# Account spellings, the same list as the local amux: P/T/X (any case, t2) are the
+# subscriptions; any other plain name is an API key name, checked by the box's server
+# (its key file lives on that machine). Prints the normalized name.
+_norm_account() {
+  case "$1" in
+    p|P|personal|PERSONAL)  printf 'personal' ;;
+    t|T|team|TEAM)          printf 'team' ;;
+    x|X|team2|TEAM2|t2|T2)  printf 'team2' ;;
+    *) [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && { printf '%s' "$1"; return 0; }
+       echo "${RED}error:${RESET} unknown account '${1:-}' (valid: personal team team2, or P / T / X, or the name of an API key)" >&2
+       return 1 ;;
+  esac
+}
 
 # space-padded list of configured box names — for --help and error messages.
 # MUST NOT fail: with `set -euo pipefail`, a bare `ls` on a missing remotes dir
@@ -294,7 +313,7 @@ cmd_ls() {
       --bare|--no-header)  bare=1 ;;
       --names)             names=1 ;;
       -*)                  die "unknown ls option: $1 (try: -c/--compact, --bare, --names)" ;;
-      *)                   die "unexpected argument: $1 (usage: amux-remote $BOX ls [-c] [--bare])" ;;
+      *)                   die "unexpected argument: $1 (usage: $ME $BOX_ARG ls [-c] [--bare])" ;;
     esac
     shift
   done
@@ -465,13 +484,13 @@ cmd_peek() {
   for a in "$@"; do
     case "$a" in
       --raw) raw=1 ;;
-      -*)    die "unknown peek option: $a (usage: amux-remote $BOX peek [--raw] <name> [lines])" ;;
+      -*)    die "unknown peek option: $a (usage: $ME $BOX_ARG peek [--raw] <name> [lines])" ;;
       *)     if [[ -z "$name" ]]; then name="$a"
              elif [[ -z "$lines" ]]; then lines="$a"
-             else die "unexpected argument: $a (usage: amux-remote $BOX peek [--raw] <name> [lines])"; fi ;;
+             else die "unexpected argument: $a (usage: $ME $BOX_ARG peek [--raw] <name> [lines])"; fi ;;
     esac
   done
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX peek [--raw] <name> [lines]"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG peek [--raw] <name> [lines]"
   lines="${lines:-30}"   # same default as the local `amux peek`
   validate_remote_name "$name"
   [[ "$lines" =~ ^[0-9]+$ ]] || die "lines must be a number, got: $lines"
@@ -503,7 +522,7 @@ cmd_send() {
   require_config
   local name="${1:-}"; shift || true
   local text="$*"
-  [[ -n "$name" && -n "$text" ]] || die "usage: amux-remote $BOX send <name> <text...>"
+  [[ -n "$name" && -n "$text" ]] || die "usage: $ME $BOX_ARG send <name> <text...>"
   validate_remote_name "$name"
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$text")
@@ -545,7 +564,7 @@ print(str((d.get("error") or d.get("message","failed")) if isinstance(d,dict) el
 cmd_start() {
   require_config
   local name="${1:-}"; shift || true
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX start <name> [flags...]"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG start <name> [flags...]"
   validate_remote_name "$name"
   # Split amux-level options from one-shot launch flags. --no-attach and the
   # attach-lane flags (--cc/--plain/--mosh) are OURS, never forwarded to the server.
@@ -562,11 +581,11 @@ cmd_start() {
     # --dir …` reached claude's argv → `error: unknown option '--dir'`).
     case "${_a%%=*}" in
       --pwd)
-        die "--pwd is local-only: your current directory exists on THIS machine, not on $BOX (use: amux-remote $BOX exec $name --dir <path>)" ;;
+        die "--pwd is local-only: your current directory exists on THIS machine, not on $BOX (use: $ME $BOX_ARG exec $name --dir <path>)" ;;
       --dir)
-        die "--dir is an exec/register option; 'start' launches the session in its registered dir (change it with: amux-remote $BOX exec $name --dir <path>)" ;;
+        die "--dir is an exec/register option; 'start' runs the session in its registered folder ($ME $BOX_ARG info $name shows it)" ;;
       --worktree|--desc)
-        die "${_a%%=*} is an exec/register option, not a start flag (use: amux-remote $BOX exec $name ${_a%%=*} …)" ;;
+        die "${_a%%=*} is an exec/register option, not a start flag (it is set when the session is created: $ME $BOX_ARG exec <new name> ${_a%%=*} …)" ;;
     esac
     fwd+=("$_a")
   done
@@ -594,7 +613,7 @@ cmd_start() {
   fi
   # No attach happened — say what the next step is, unless a wrapper
   # (amux-up) set AMUX_NO_HINT=1 because it attaches right after.
-  [[ -n "${AMUX_NO_HINT:-}" ]] || echo "${DIM}  attach: amux-up $BOX $name${RESET}"
+  [[ -n "${AMUX_NO_HINT:-}" ]] || echo "${DIM}  attach: $ME $BOX_ARG attach $name${RESET}"
 }
 
 # amux-remote <box> rm <name> — remove a session on the remote box (server
@@ -615,10 +634,10 @@ cmd_start() {
 cmd_rm() {
   require_config
   local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX rm <name>"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG rm <name>"
   validate_remote_name "$name"
   shift
-  [[ $# -eq 0 ]] || die "unexpected extra arguments after '$name': $* — 'amux-remote $BOX rm' takes no flags"
+  [[ $# -eq 0 ]] || die "unexpected extra arguments after '$name': $* — '$ME $BOX_ARG rm' takes no flags"
   local resp ok
   resp=$(api POST "/api/sessions/${name}/delete" \
     -H @<(python3 -c 'import hashlib, os; print("X-Amux-UI-Token: " + hashlib.sha256(("amux-ui-guard:" + os.environ["AMUX_TOKEN"]).encode()).hexdigest()[:40])'))
@@ -637,14 +656,14 @@ cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; err
   local name="" now=0 a
   for a in "$@"; do
     case "$a" in
-      --now|--force|-f) [[ "$action" == stop ]] || die "unexpected argument '$a' — 'amux-remote $BOX $action' takes no flags"
+      --now|--force|-f) [[ "$action" == stop ]] || die "unexpected argument '$a' — '$ME $BOX_ARG $action' takes no flags"
                         now=1 ;;
-      -*) die "unexpected argument '$a' — usage: amux-remote $BOX ${action}$([[ $action == stop ]] && echo ' [--now]') <name>" ;;
-      *)  [[ -z "$name" ]] || die "unexpected extra arguments after '$name': $a — 'amux-remote $BOX $action' takes one session"
+      -*) die "unexpected argument '$a' — usage: $ME $BOX_ARG ${action}$([[ $action == stop ]] && echo ' [--now]') <name>" ;;
+      *)  [[ -z "$name" ]] || die "unexpected extra arguments after '$name': $a — '$ME $BOX_ARG $action' takes one session"
           name="$a" ;;
     esac
   done
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX ${action}$([[ $action == stop ]] && echo ' [--now]') <name>"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG ${action}$([[ $action == stop ]] && echo ' [--now]') <name>"
   validate_remote_name "$name"
   local resp ok
   if (( now )); then
@@ -677,7 +696,7 @@ cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; err
         2) echo "${GREEN}✓${RESET} stop requested ${DIM}(could not confirm — server unreachable)${RESET}"; return 0 ;;
       esac
     done
-    echo "${DIM}stop requested — still winding down after 30s; check with 'amux-remote $BOX ls'${RESET}"
+    echo "${DIM}stop requested — still winding down after 30s; check with '$ME $BOX_ARG ls'${RESET}"
     return 0
   fi
   echo "${GREEN}✓${RESET} ${action}"
@@ -697,7 +716,7 @@ cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; err
 cmd_exec() {
   require_config
   local name="${1:-}"; shift || true
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--partners] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--partners] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
   validate_remote_name "$name"
   local dir="" model="" desc="" provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0 sandbox="" partners=0
   local attach_flags=()
@@ -713,20 +732,10 @@ cmd_exec() {
       # Claude account (2026-09-05): personal|team|team2 (P/T/X). Claude/iterm2 only;
       # the server accepts-and-ignores it for other providers.
       --account)  account="${2:-}"
-                  case "$account" in
-                    p|P|personal)  account=personal ;;
-                    t|T|team)      account=team ;;
-                    x|X|team2|t2)  account=team2 ;;
-                    *) die "unknown account '${account:-}' (valid: personal team team2, or P / T / X)" ;;
-                  esac
+                  account=$(_norm_account "$account") || exit 1
                   shift 2 ;;
       --account=*) account="${1#--account=}"
-                  case "$account" in
-                    p|P|personal)  account=personal ;;
-                    t|T|team)      account=team ;;
-                    x|X|team2|t2)  account=team2 ;;
-                    *) die "unknown account '${account:-}' (valid: personal team team2, or P / T / X)" ;;
-                  esac
+                  account=$(_norm_account "$account") || exit 1
                   shift ;;
       --no-attach) no_attach=1; shift ;;
       # Attach lane for the auto-attach after start — ours, handed to cmd_start.
@@ -757,7 +766,7 @@ cmd_exec() {
   # silent claude default. (The server enforces this too; failing here is just
   # a better error. exec on an EXISTING session errors "already exists" anyway,
   # so unlike local amux there is no stored-provider-preserving path to allow.)
-  [[ -n "$provider" ]] || die "--provider is required (no default): amux-remote $BOX exec $name --provider claude|codex|gemini|opencode|iterm2|agy [--dir <path>] ..."
+  [[ -n "$provider" ]] || die "--provider is required (no default): $ME $BOX_ARG exec $name --provider claude|codex|gemini|opencode|iterm2|agy [--dir <path>] ..."
   if (( partners )) && [[ "$provider" != "opencode" ]]; then
     die "--partners applies to the opencode provider only (this session would run $provider)"
   fi
@@ -806,7 +815,7 @@ print(str(d.get("error") or d.get("message") or "create failed"))' 2>/dev/null)
   if [[ "$ok" != "1" ]]; then
     echo "${RED}✗${RESET} ${msg:-create failed}" >&2
     case "$msg" in
-      *"already exists"*) echo "${DIM}  already registered — just start it: amux-remote $BOX start $name${RESET}" >&2 ;;
+      *"already exists"*) echo "${DIM}  already registered — just start it: $ME $BOX_ARG start $name${RESET}" >&2 ;;
     esac
     return 1
   fi
@@ -846,7 +855,7 @@ raise SystemExit(0 if isinstance(d, dict) and not d.get("error") else 1)' 2>/dev
 cmd_info() {
   require_config
   local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX info <name>"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG info <name>"
   validate_remote_name "$name"
   local body; body=$(api GET "/api/sessions/${name}/info")
   printf '%s' "$body" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$body"
@@ -856,13 +865,13 @@ cmd_info() {
 cmd_provider() {
   require_config
   local name="${1:-}" new="${2:-}"
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX provider <name> [claude|codex|gemini|opencode|agy]"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG provider <name> [claude|codex|gemini|opencode|agy]"
   validate_remote_name "$name"
   # Flag spelling accepted too (2026-08-12): exec teaches `--provider <p>`, so
   # typing it here must work instead of dying at name validation.
   case "$new" in
     --provider)   new="${3:-}"
-                  [[ -n "$new" ]] || die "--provider needs a value: amux-remote $BOX provider $name --provider claude|codex|gemini|opencode|agy" ;;
+                  [[ -n "$new" ]] || die "--provider needs a value: $ME $BOX_ARG provider $name --provider claude|codex|gemini|opencode|agy" ;;
     --provider=*) new="${new#--provider=}" ;;
   esac
   if [[ -z "$new" ]]; then
@@ -897,7 +906,7 @@ print("\033[32m✓\033[0m " + str(d.get("message", "provider updated")))'
 cmd_model() {
   require_config
   local name="${1:-}" new="${2:-}"
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX model <name> [<model>]"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG model <name> [<model>]"
   validate_remote_name "$name"
   if [[ -z "$new" ]]; then
     local body; body=$(api GET "/api/sessions/${name}/info")
@@ -926,7 +935,7 @@ print("\033[32m✓\033[0m " + str(d.get("message", "model updated")))'
 cmd_full_access() {
   require_config
   local name="${1:-}" new="${2:-}"
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX full-access <name> [on|off]"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG full-access <name> [on|off]"
   validate_remote_name "$name"
   if [[ -z "$new" ]]; then
     local body; body=$(api GET "/api/sessions/${name}/info")
@@ -962,11 +971,11 @@ print("\033[32m✓\033[0m " + str(d.get("message", "full access updated")))'
 cmd_account() {
   require_config
   local name="${1:-}" new="${2:-}"
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX account <name> [personal|team|team2|P|T|X]"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG account <name> [personal|team|team2|P|T|X|<api key name>]"
   validate_remote_name "$name"
   case "$new" in
     --account)   new="${3:-}"
-                 [[ -n "$new" ]] || die "--account needs a value: amux-remote $BOX account $name --account personal|team|team2" ;;
+                 [[ -n "$new" ]] || die "--account needs a value: $ME $BOX_ARG account $name --account personal|team|team2" ;;
     --account=*) new="${new#--account=}" ;;
   esac
   if [[ -z "$new" ]]; then
@@ -985,12 +994,7 @@ if not a:
 print(a if a else "(no account: not a claude/iterm2 session)")'
     return
   fi
-  case "$new" in
-    p|P|personal)  new=personal ;;
-    t|T|team)      new=team ;;
-    x|X|team2|t2)  new=team2 ;;
-    *) die "unknown account '$new' (valid: personal team team2, or P / T / X)" ;;
-  esac
+  new=$(_norm_account "$new") || exit 1
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"account": sys.argv[1]}))' "$new")
   local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload")
@@ -1005,7 +1009,7 @@ print("\033[32m✓\033[0m " + str(d.get("message", "account updated")))'
 cmd_curl() {
   require_config
   local path="${1:-}"; shift || true
-  [[ -n "$path" ]] || die "usage: amux-remote $BOX curl <path> [curl args...]"
+  [[ -n "$path" ]] || die "usage: $ME $BOX_ARG curl <path> [curl args...]"
   [[ "$path" == /* ]] || path="/$path"
   api GET "$path" "$@"
 }
@@ -1141,7 +1145,7 @@ cmd_attach() {
     esac
     shift
   done
-  [[ -n "$name" ]] || die "usage: amux-remote $BOX attach <name> [--cc|--plain|--mosh] [--color <c>]"
+  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG attach <name> [--cc|--plain|--mosh] [--color <c>]"
   # SECURITY: name is spliced into a remotely-parsed shell string below — the
   # whitelist is what prevents `attach "x'; rm -rf ~ #"` from escaping the quotes.
   validate_remote_name "$name"
@@ -1204,19 +1208,19 @@ subhelp() {
     k && /^ {20,}[^ ]/     { print; next }
                            { k = 0 }')
   [[ -n "$out" ]] || return 1
-  local lead="amux-remote <box> $c"; [[ "$c" == add ]] && lead="amux-remote add"
-  echo "${BOLD}$lead${RESET}  ${DIM}(full list: amux-remote help)${RESET}"
+  local lead="$ME <box> $c"; [[ "$c" == add ]] && lead="$ME add"
+  echo "${BOLD}$lead${RESET}  ${DIM}(full list: $ME help)${RESET}"
   printf '%s\n' "$out"
 }
 
 usage() {
   local boxes; boxes="$(list_boxes)"
   cat <<EOF
-${BOLD}amux-remote${RESET} — drive another machine's amux server over its REST API
+${BOLD}$ME${RESET} — drive another machine's amux server over its REST API
 
 ${BOLD}A box is always required${RESET} ${DIM}(there is no default remote)${RESET}
-  ${CYAN}amux-remote <box> <cmd> …${RESET}   ${DIM}drive that box; e.g. 'amux-remote example-host ls -c'${RESET}
-  ${CYAN}amux-remote${RESET}                 ${DIM}list configured boxes${RESET}
+  ${CYAN}$ME <box> <cmd> …${RESET}   ${DIM}drive that box; e.g. '$ME example-host ls -c'${RESET}
+  ${CYAN}$ME${RESET}                 ${DIM}list configured boxes${RESET}
 
 ${BOLD}Add a box${RESET} ${DIM}(the only way in: each box's URL + dashboard token)${RESET}
   ${CYAN}add${RESET} <box> [--ssh <alias>] [--url <url>] [--force]
@@ -1225,10 +1229,10 @@ ${BOLD}Add a box${RESET} ${DIM}(the only way in: each box's URL + dashboard toke
                           ${DIM}~/.amux/remotes/<box>.env (mode 600). The token is never printed.${RESET}
                           ${DIM}--ssh = SSH alias if not <box>; --url = skip address discovery;${RESET}
                           ${DIM}--force = replace an existing file (old one kept as .bak)${RESET}
-                          ${DIM}e.g. amux-remote add myhost${RESET}
+                          ${DIM}e.g. $ME add myhost${RESET}
 
 ${BOLD}Configured boxes${RESET} ${DIM}(~/.amux/remotes/<box>.env)${RESET}
-  ${GREEN}${boxes:-<none — add ~/.amux/remotes/<box>.env>}${RESET}
+  ${GREEN}${boxes:-<none — add one: $ME add <box>>}${RESET}
 
 ${BOLD}Per-box config${RESET} ${DIM}(~/.amux/remotes/<box>.env, chmod 600)${RESET}
   AMUX_URL       ${DIM}e.g. https://192.0.2.10:8822${RESET}
@@ -1256,8 +1260,9 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
   ${CYAN}exec${RESET} <name> --provider <p> [--account P|T|X] [--dir <p>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--partners] [--desc <t>] [--worktree] [--no-attach] [--cc|--plain|--mosh]
                           ${DIM}create + start in one step (like local 'amux exec'); attaches${RESET}
                           ${DIM}when interactive (--cc/--plain/--mosh pick the lane, as for attach). quote '~/…' so the REMOTE box expands it.${RESET}
-                          ${BOLD}--account personal|team|team2${RESET} ${DIM}(P/T/X) = which Claude subscription the${RESET}
-                          ${DIM}session bills to; claude/iterm2 only, default personal. 'ls'${RESET}
+                          ${BOLD}--account personal|team|team2|<api key name>${RESET} ${DIM}(P/T/X) = which Claude${RESET}
+                          ${DIM}subscription (or API key on that box) the session bills to; claude/iterm2${RESET}
+                          ${DIM}only, default personal. 'ls'${RESET}
                           ${DIM}prefixes rows P:cc:/T:cc: (claude), cx:/oc:/ag:/gm: (codex/${RESET}
                           ${DIM}opencode/antigravity/gemini). One-shot on start: --account T${RESET}
                           ${BOLD}--full-access${RESET} ${DIM}= no sandbox / no approvals, persisted in the${RESET}
@@ -1309,7 +1314,7 @@ ${BOLD}Last resort${RESET}
                           ${DIM}instead of the API — for when the dashboard is down or${RESET}
                           ${DIM}its port is unreachable but the box answers on 22.${RESET}
                           ${DIM}Works on either side of the box name. Never automatic.${RESET}
-                          ${DIM}e.g. 'amux-remote --ssh <box> ls -c'${RESET}
+                          ${DIM}e.g. '$ME --ssh <box> ls -c'${RESET}
 EOF
 }
 
@@ -1330,7 +1335,7 @@ cmd_add() {
       *)       [[ -z "$box" ]] || die "add takes one box name"; box="$1"; shift ;;
     esac
   done
-  [[ -n "$box" ]] || die "usage: amux-remote add <box> [--ssh <alias>] [--url <url>] [--force]"
+  [[ -n "$box" ]] || die "usage: $ME add <box> [--ssh <alias>] [--url <url>] [--force]"
   [[ "$box" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid box name '$box'"
   [[ -n "$ssh_alias" ]] || ssh_alias="$box"
   [[ "$ssh_alias" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || die "invalid SSH alias '$ssh_alias'"
@@ -1396,7 +1401,7 @@ cmd_add() {
   if [[ -e "$dest" ]]; then cp -p "$dest" "$dest.bak-add-$(date +%Y%m%d-%H%M%S)"; fi
   mv "$tmp" "$dest" && chmod 600 "$dest"
   echo "added $box → $ok  ($dest, mode 600)"
-  echo "try:  amux-remote $box ls -c"
+  echo "try:  $ME $box ls -c"
 }
 
 # ── Select the box (always required), then dispatch its command ──────────────
@@ -1407,6 +1412,7 @@ FORCE_SSH=0
 [[ "${1:-}" == "--ssh" ]] && { FORCE_SSH=1; shift; }
 
 BOX="${1:-}"; shift || true
+BOX_ARG="$BOX"
 case "$BOX" in
   ""|help|-h|--help) usage; exit 0 ;;
   add)               cmd_add "$@"; exit $? ;;   # needs no config yet — it makes one
@@ -1417,7 +1423,7 @@ BOX_ENV="$AMUX_REMOTES_DIR/$BOX.env"
 if [[ ! -f "$BOX_ENV" ]]; then
   # A leading subcommand (the common slip now that a box is mandatory) lands here.
   case " ls list pick choose attach a peek send exec start stop rm remove del info meta curl url provider account acct model full-access box resolve " in
-    *" $BOX "*) die "a box is required first: try 'amux-remote <box> $BOX …' — boxes: $(list_boxes)" ;;
+    *" $BOX "*) die "a box is required first: try '$ME <box> $BOX …' — boxes: $(list_boxes)" ;;
   esac
   # One machine has several SSH names — a LAN alias, a tailnet twin, a couple of
   # longer spellings — and they are all the SAME box. Rather than demand the one
@@ -1432,7 +1438,7 @@ if [[ ! -f "$BOX_ENV" ]]; then
     BOX="$_alias_box"
     BOX_ENV="$AMUX_REMOTES_DIR/$BOX.env"
   else
-    die "unknown box '$BOX'. configured: $(list_boxes)— add ~/.amux/remotes/$BOX.env"
+    die "unknown box '$BOX'. configured: $(list_boxes)— add it: $ME add $BOX"
   fi
 fi
 # shellcheck disable=SC1090
@@ -1486,5 +1492,5 @@ case "$cmd" in
   box|resolve)   echo "$BOX" ;;   # the configured name this spelling resolved to (myhost-01 -> myhost)
   url)           require_config; echo "$AMUX_URL" ;;
   ""|help|-h|--help) usage ;;
-  *)             die "unknown command: $cmd (try: amux-remote help)" ;;
+  *)             die "unknown command: $cmd (try: $ME help)" ;;
 esac

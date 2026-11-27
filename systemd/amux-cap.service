@@ -1,0 +1,29 @@
+[Unit]
+# amux-cap.service: starts the tmux server INSIDE amux.slice, with a hidden keepalive session,
+# so every amux pane inherits the slice's CPUQuota (set it with `set-amux-cpu <off|5-95>`).
+# tmux puts each pane under its server's cgroup, and a running server cannot be moved in later,
+# so this only works when no tmux server is running yet: at boot (with linger) or after every
+# tmux session has ended. Install as a USER unit:
+#   cp systemd/amux-cap.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable amux-cap.service
+#   loginctl enable-linger "$USER"
+# If tmux is not /usr/bin/tmux on this machine, change the two paths below.
+#
+# Restart=on-failure, not always: when a tmux server already exists, `tmux new-session -d` is
+# only a client, forks nothing into this cgroup and exits 0, and Restart=always would then loop
+# forever. StartLimit bounds every other case.
+Description=amux CPU-cap anchor: start the tmux server in amux.slice with a keepalive
+After=default.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=forking
+Slice=amux.slice
+ExecStart=/usr/bin/tmux new-session -d -s __amuxcap__ "exec sleep infinity"
+ExecStop=/usr/bin/tmux kill-session -t __amuxcap__
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

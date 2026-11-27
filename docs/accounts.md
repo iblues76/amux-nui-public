@@ -91,3 +91,21 @@ ccrun team2 claude     # run one command on another account; the terminal stays 
 ## Rotating a token
 
 Create a new token with `claude setup-token`, overwrite the slot file the same way, then restart the sessions that use it (`amux stop <name>; amux start <name>`). The conversation resumes. A new token does not revoke the old one. If the old one may have leaked, revoke it in your Claude account settings.
+
+## API-key accounts
+
+A session can also bill an Anthropic API key per token, instead of a subscription. Give each key a name and keep it in a file only you can read:
+
+```sh
+mkdir -p ~/.config/claude-code/api
+( umask 077; read -rs -p 'API key: ' k; printf '%s\n' "$k" > ~/.config/claude-code/api/lab.key; unset k; echo )
+```
+
+Paste the key at the silent prompt. Then use the name as the account:
+
+```sh
+amux exec research --provider claude --dir ~/research --account lab   # stored with the session
+amux start notes --account lab                                         # one launch only
+```
+
+At launch amux exports `ANTHROPIC_API_KEY` from that file, so the key never appears on a command line, and drops the subscription token for that session. `amux ls` marks the session `A:cc:`. The first time Claude Code sees a new key it may ask once, in the pane, whether to use it. A file that other users can read is refused: `chmod 600` it.

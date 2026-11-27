@@ -2,6 +2,22 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.7 — 2026-11-27
+
+This release bundles amux 0.9.23. Update the server on a machine you drive with `amux -H` to use API-key accounts or a DeepInfra start model there.
+
+- **API-key accounts.** `amux exec <name> --provider claude --account <key name>` runs a Claude Code session on an Anthropic API key, billed per token, instead of a subscription. The key is a file only you can read: `~/.config/claude-code/api/<key name>.key`, mode 600, holding the key alone. The session loads it inside its own shell, so the value never appears on a command line, and the subscription token is dropped for that session. `amux ls`, `amux info` and the status line mark it `A`. `amux start <name> --account <key name>` uses a key for one launch, and `amux account <name> <key name>` stores it. A missing key file, a file other users can read, or a bad name is refused; through `amux -H <box>`, the key file must be on that machine. The first launch with a new key may ask once, in the pane, to approve it. See [docs/accounts.md](docs/accounts.md).
+- **A DeepInfra model as OpenCode's start model.** An opencode session may name a `deepinfra/<model>` model to start on. amux checks it against `opencode models deepinfra` (with `--partners` when the session has it) and refuses a name that is not listed. The default stays a local model, and other cloud providers stay refused.
+- **Messages say what you typed.** Errors and usage lines from `amux -H`, `amux up`, `amux -A`, `amux pick` and `amux offload` now name that command, not the helper script behind it (`amux-remote`, `amux-up`, …). `amux -H` on its own prints its help. A helper called by its own name keeps its own name.
+- **Helpers in the bundle.** Five commands now ship in `bin/`, and `install.sh` links them like the other companions:
+  `offload` 0.1.2 (what `amux offload` runs; no separate install any more),
+  `claude-account` (which account this shell uses, including API keys; never prints a token),
+  `amux-idle-report` (when a person last typed into each session),
+  `set-amux-cpu` (caps the CPU of all amux sessions on Linux, with the new [`systemd/amux-cap.service`](systemd/amux-cap.service)) and
+  `claude-statusline-refresh` (redraws the status line every N seconds).
+  A new helper is one executable file in `bin/` and a re-run of `./install.sh`.
+- **`amux offload <session or folder>`** is the move command; the word `session` may be left out, and the old `amux offload claude …` still works. offload now starts the new session with amux, whatever agent it runs, and refuses a machine without amux.
+
 ## 0.7.6 — 2026-11-24
 
 - **`--partners` for opencode sessions.** `amux exec <name> --provider opencode --partners` starts OpenCode with `OPENCODE_PARTNERS=1` in its environment. This is for an OpenCode plugin that hides some models (a provider's partner models, for example) unless that variable is set. The flag is stored with the session, like `--autoprompt`, so a restart keeps it. `amux start <name> --partners` turns it on for one launch, and `amux start <name> --no-partners` leaves it out for one launch. Without the flag, amux unsets the variable for the agent, so a value in the shell you start from, in tmux or in the server's environment does not reach it. Other agents refuse the flag. It works the same through a server (`amux -H <box> exec … --partners`); update the server on a machine where you use it that way.

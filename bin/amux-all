@@ -21,6 +21,9 @@
 #           amux -H <box> ls     one other box
 #           amux pick [<box>]    interactive picker for this box / one box
 set -uo pipefail
+# The name the user typed (amux sets AMUX_PROG when it hands off, e.g. "amux up");
+# read once and unset so a tool started from here does not inherit it.
+ME="${AMUX_PROG:-amux-all}"; unset AMUX_PROG
 
 VERB=0 ALL=0
 for a in "$@"; do
@@ -30,7 +33,7 @@ for a in "$@"; do
     --showall|--show-all)   ALL=1 ;;
     -p|--pick)              c="$HOME/.local/bin/ccjump"; [ -x "$c" ] || c=ccjump; exec "$c" -A ;;
     -h|--help)              awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0"; exit 0 ;;
-    *) echo "amux-all: unknown option '$a' (see amux-all -h)" >&2; exit 2 ;;
+    *) echo "$ME: unknown option '$a' (see $ME -h)" >&2; exit 2 ;;
   esac
 done
 

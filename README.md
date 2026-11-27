@@ -4,7 +4,7 @@ amux-nui-public is a build of [**amux**](https://github.com/mixpeek/amux) that i
 
 It is the setup that I use every day, with the personal parts taken out. It contains no machine names, accounts, addresses or credentials, so you add your own.
 
-**Version 0.7.6**, which bundles a modified **amux 0.9.20** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
+**Version 0.7.7**, which bundles a modified **amux 0.9.23** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
 
 It runs on **macOS** and **Linux**, and on **Windows inside WSL2**. [What you need](#what-you-need) lists what each system needs.
 
@@ -184,10 +184,17 @@ With `--agentic`, a coding agent does the search, and you ask your question in p
 | [`amux-color`](bin/amux-color) | One color per session for its iTerm2 tab and status line square (what `amux color` runs) |
 | [`amux-sandbox`](bin/amux-sandbox) | Turns `--net-sandbox` / `--full-sandbox` into each agent's own controls ([docs/sandbox.md](docs/sandbox.md)) |
 | [`amux-termprobe`](bin/amux-termprobe) | Logs the terminal's real colors around each attach (debugging aid; `AMUX_TERMPROBE=0` disables) |
+| [`offload`](bin/offload) | Moves a session's work to another machine, and keeps heavy traffic off a metered link (what `amux offload` runs) |
+| [`claude-account`](bin/claude-account) | Which Claude account this shell uses: a subscription slot or a named API key. Never prints a token |
+| [`amux-idle-report`](bin/amux-idle-report) | When a person last typed into each session on this machine; flags the idle ones (read-only) |
+| [`set-amux-cpu`](bin/set-amux-cpu) | Caps the CPU of all amux sessions on a Linux machine (`off` or 5–95 %), with [`systemd/amux-cap.service`](systemd/amux-cap.service) |
+| [`claude-statusline-refresh`](bin/claude-statusline-refresh) | Makes Claude Code redraw the status line every N seconds, so quotas and countdowns move while idle |
 
 Every command prints its help with `-h`.
 
-**Moving a session's work to another machine.** `amux offload claude <folder or session>` hands over to [offload](https://git.nuilab.org/f.ortega/offload), a separate one-file tool: the session working in the folder writes a handoff note, the folder is copied over ssh, and a new amux session starts on the other machine and reads the note. `amux offload <anything else>` runs the same tool.
+**Adding a helper.** `install.sh` links every file in `bin/` into `~/.local/bin`, so a new helper is one executable file dropped into `bin/` and a re-run of `./install.sh`. Keep helpers free of secrets: they read credentials from mode-600 files at run time and never carry them.
+
+**Moving a session's work to another machine.** `amux offload <session or folder>` runs [offload](https://git.nuilab.org/f.ortega/offload), a one-file tool that ships in `bin/`: the session writes a handoff note, the folder is copied over ssh, and a new amux session with the same agent starts on the other machine and reads the note. The other machine needs amux. `amux offload -h` lists the rest (`redirect`, `run`, `put`, `get`, `fetch`).
 
 ## Docs
 

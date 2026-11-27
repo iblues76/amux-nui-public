@@ -1,0 +1,1648 @@
+#!/usr/bin/env python3
+"""offload — do the heavy work on another machine when you are on a metered link.
+
+  A laptop on a phone hotspot pays for every byte. offload moves the work to a
+  machine with a normal connection (reached over ssh) and sends only small,
+  compressed results across the metered link.
+
+  Usage:  offload [-H host[,host]] <command> [args]      (-h for this text)
+
+  Claude Code API traffic
+    offload redirect <box>     send Claude Code's API calls through <box>, deduplicated
+    offload redirect off       stop, and point Claude Code back at the API directly
+    offload redirect status    is it on, and how many bytes it saved
+
+  Work on the other machine (box = -b <box>, or the default box)
+    offload [session] [<session>|<dir>]
+                               move an amux session to the box: the session (or the one
+                               working in dir; default: this folder) writes a handoff
+                               note, its folder is copied, and an amux session of the
+                               same name, agent and options starts on the box and reads
+                               the note
+                                 --name <n>         name of the session on the box
+                                 --no-handoff       do not ask for a handoff note
+                                 --handoff-wait <s> how long to wait for the note (300)
+                                 --no-attach        start the session, do not attach
+    offload run <cmd...>       copy this dir to the box, run cmd there, bring changes back
+    offload put <path>         send a file or folder (changed parts only, compressed)
+    offload get <path>         bring a file or folder back (same)
+    offload fetch <url>        the box downloads the url and keeps the file
+
+  Setup
+    offload box [name]         show or set the default box
+    offload version
+
+  -H host[,host]   run the offload command on those hosts instead (over ssh).
+  -b box           which machine does the work, for this one command.
+  -y               do not ask before a large first copy.
+
+  offload is a helper for amux (https://amux.nuilab.org): amux runs the
+  sessions, and `amux offload ...` is the same command. Moving a session needs amux
+  on both machines. (`offload claude` is the old name of `offload session`.)
+
+  Paths map by home directory: ~/work/x here is ~/work/x on the box.
+  A .offloadignore file in a folder lists rsync exclude patterns for it.
+  Config: ~/.config/offload/config.json     State and logs: ~/.local/state/offload/
+"""
+import collections
+import hashlib
+import http.client
+import http.server
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import zlib
+
+VERSION = "0.1.2"
+# The name the user typed: `amux offload ...` runs this file with OFFLOAD_PROG="amux offload",
+# so every message and usage line says what to type again.
+CMD = os.environ.get("OFFLOAD_PROG", "").strip() or "offload"
+HOME = os.path.expanduser("~")
+CONF_DIR = os.path.join(HOME, ".config", "offload")
+CONF = os.path.join(CONF_DIR, "config.json")
+STATE = os.path.join(HOME, ".local", "state", "offload")
+STATS = os.path.join(STATE, "stats.json")
+LOG = os.path.join(STATE, "redirect.log")
+PIDFILE = os.path.join(STATE, "redirect.pid")
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+SERVICE = "offload-redirect"
+LAUNCHD_LABEL = "org.offload.redirect"
+DEFAULTS = {
+    "box": "",
+    "port": 8484,
+    "upstream": "https://api.anthropic.com",
+    "remote_cmd": 'PATH="$HOME/scripts:$HOME/.local/bin:$HOME/bin:$PATH" offload',
+    "launcher": "amux",
+    "claude_launch": "tmux new-session -A -s {name} -c {dir} claude {prompt}",
+    "handoff_wait": 300,
+    "confirm_mb": 50,
+}
+HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
+       "trailers", "transfer-encoding", "upgrade", "content-length", "host"}
+
+
+def typed(msg):
+    """Say commands the way the user typed them (`offload ...` or `amux offload ...`)."""
+    if CMD == "offload":
+        return msg
+    return re.sub(r"(?<![\w/.-])offload (?=-h\b|-b\b|[a-z])", CMD + " ", msg)
+
+
+def say(msg):
+    print(typed(msg))
+
+
+def die(msg, code=1):
+    PROG.stop()
+    sys.stderr.write("%s: %s\n" % (CMD, typed(msg)))
+    sys.exit(code)
+
+
+def config():
+    c = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            c.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return c
+
+
+def save_config(c):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    write_json(CONF, {k: v for k, v in c.items() if DEFAULTS.get(k) != v})
+
+
+def write_json(path, obj, mode=None):
+    tmp = path + ".tmp%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+    if mode is None:
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o600
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def state_dir():
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    return STATE
+
+
+def mb(n):
+    return "%.1f MB" % (n / 1e6)
+
+
+def clock(sec):
+    sec = int(sec)
+    return "%d:%02d" % (sec // 60, sec % 60)
+
+
+class Progress:
+    """One status line on stderr while a slow step runs. On a terminal the line is
+    redrawn in place and removed at the end. Elsewhere a plain line is written every
+    10 s, so a short step prints nothing."""
+
+    def __init__(self):
+        self.msg = self.detail = ""
+        self.t0 = self.last_plain = self.drawn = 0.0
+        self.on = False
+        self.thread = None
+        self.lock = threading.Lock()
+
+    def stage(self, msg):
+        with self.lock:
+            self.msg, self.detail, self.t0 = msg, "", time.time()
+            self.last_plain = self.t0
+        if not self.on:
+            self.on = True
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        self._draw()
+
+    def update(self, detail):
+        self.detail = detail
+        if time.time() - self.drawn >= 0.2:
+            self._draw()
+
+    def _run(self):
+        while self.on:
+            time.sleep(0.5)
+            if self.on:
+                self._draw()
+
+    def _draw(self):
+        with self.lock:
+            now = self.drawn = time.time()
+            line = "%s%s  %s" % (self.msg, ": " + self.detail if self.detail else " ...", clock(now - self.t0))
+            try:
+                if sys.stderr.isatty():
+                    cols = shutil.get_terminal_size((80, 24)).columns
+                    if cols < 40:       # a terminal that does not say how wide it is
+                        cols = 80
+                    sys.stderr.write("\r\033[K" + line[:cols - 1])
+                    sys.stderr.flush()
+                elif now - self.last_plain >= 10:
+                    self.last_plain = now
+                    sys.stderr.write("offload: %s\n" % line)
+                    sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+
+    def stop(self):
+        if not self.on:
+            return
+        self.on = False
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(2)
+        try:
+            if sys.stderr.isatty():
+                sys.stderr.write("\r\033[K")
+                sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+
+
+PROG = Progress()
+
+
+# ---------------------------------------------------------------- dedup codec
+# A request body is cut into chunks at JSON block boundaries. Both ends remember
+# the chunks they have seen, so a new request crosses the link as "the same run
+# of chunks as request N" plus the few chunks that are new.
+
+SPLIT = re.compile(rb'(?<=\},)(?=\{)|(?=,"cache_control")|(?<=")(?=\})|(?<=\\n\\n)')
+LINES = re.compile(rb'(?<=\\n)')
+BIG = 8192
+MAGIC = b"ZR1"
+NOREF = 0xFFFFFFFF
+OP_LIT, OP_REF, OP_COPY = 0, 1, 2
+
+
+def cut(body):
+    out = []
+    for c in SPLIT.split(body):
+        if len(c) > BIG:        # long text: cut at line ends too
+            out.extend(x for x in LINES.split(c) if x)
+        elif c:
+            out.append(c)
+    return out
+
+
+def h8(b):
+    return hashlib.blake2b(b, digest_size=8).digest()
+
+
+def h16(b):
+    return hashlib.blake2b(b, digest_size=16).digest()
+
+
+class Resync(Exception):
+    pass
+
+
+class Encoder:
+    """Client side: knows which chunks the server holds."""
+
+    def __init__(self, keep=12, max_known=2000000):
+        self.lock = threading.Lock()
+        self.keep, self.max_known = keep, max_known
+        self.reset()
+
+    def reset(self):
+        with self.lock:
+            self.known = collections.OrderedDict()
+            self.seqs = collections.OrderedDict()   # id -> (hash list, hash set)
+            self.next_id = 1
+
+    def encode(self, body, literal=False):
+        parts = cut(body)
+        hs = [h8(p) for p in parts]
+        with self.lock:
+            bid = self.next_id
+            self.next_id += 1
+            ref_id, ref, pos = NOREF, None, {}
+            if not literal and self.seqs:
+                new = set(hs)
+                best = 0
+                for sid, (seq, sset) in self.seqs.items():
+                    n = len(new & sset)
+                    if n >= best and n:
+                        best, ref_id, ref = n, sid, seq
+                if ref is not None:
+                    for i, x in enumerate(ref):
+                        pos.setdefault(x, i)
+            known = self.known
+            ops = []
+            i, n = 0, len(parts)
+            while i < n:
+                x = hs[i]
+                j = pos.get(x)
+                if j is not None:
+                    k = 1
+                    while i + k < n and j + k < len(ref) and hs[i + k] == ref[j + k]:
+                        k += 1
+                    ops.append(struct.pack(">BII", OP_COPY, j, k))
+                    i += k
+                    continue
+                if not literal and x in known and len(parts[i]) > 12:
+                    ops.append(struct.pack(">B", OP_REF) + x)
+                else:
+                    ops.append(struct.pack(">BI", OP_LIT, len(parts[i])) + parts[i])
+                i += 1
+        head = MAGIC + struct.pack(">II", bid, ref_id) + h16(body) + struct.pack(">I", len(ops))
+        return zlib.compress(head + b"".join(ops), 6), (bid, hs)
+
+    def commit(self, pending):
+        bid, hs = pending
+        with self.lock:
+            for x in hs:
+                self.known[x] = None
+            while len(self.known) > self.max_known:
+                self.known.popitem(last=False)
+            self.seqs[bid] = (hs, set(hs))
+            while len(self.seqs) > self.keep:
+                self.seqs.popitem(last=False)
+
+
+class Decoder:
+    """Server side: holds the chunks."""
+
+    def __init__(self, keep=24, max_bytes=512 * 1024 * 1024):
+        self.lock = threading.Lock()
+        self.keep, self.max_bytes = keep, max_bytes
+        self.store = collections.OrderedDict()
+        self.size = 0
+        self.seqs = collections.OrderedDict()
+
+    def decode(self, payload):
+        try:
+            raw = zlib.decompress(payload)
+        except zlib.error:
+            raise Resync("bad payload")
+        if raw[:3] != MAGIC:
+            raise Resync("bad magic")
+        bid, ref_id = struct.unpack_from(">II", raw, 3)
+        want = raw[11:27]
+        (nops,) = struct.unpack_from(">I", raw, 27)
+        o = 31
+        out, hs = [], []
+        with self.lock:
+            ref = self.seqs.get(ref_id) if ref_id != NOREF else None
+            for _ in range(nops):
+                op = raw[o]
+                o += 1
+                if op == OP_LIT:
+                    (ln,) = struct.unpack_from(">I", raw, o)
+                    o += 4
+                    part = raw[o:o + ln]
+                    o += ln
+                    out.append(part)
+                    hs.append(h8(part))
+                elif op == OP_REF:
+                    x = raw[o:o + 8]
+                    o += 8
+                    part = self.store.get(x)
+                    if part is None:
+                        raise Resync("missing chunk")
+                    out.append(part)
+                    hs.append(x)
+                elif op == OP_COPY:
+                    j, k = struct.unpack_from(">II", raw, o)
+                    o += 8
+                    if ref is None or j + k > len(ref):
+                        raise Resync("missing reference")
+                    for x in ref[j:j + k]:
+                        part = self.store.get(x)
+                        if part is None:
+                            raise Resync("missing chunk")
+                        out.append(part)
+                        hs.append(x)
+                else:
+                    raise Resync("bad op")
+            body = b"".join(out)
+            if h16(body) != want:
+                raise Resync("hash mismatch")
+            for x, part in zip(hs, out):
+                if x in self.store:
+                    self.store.move_to_end(x)
+                else:
+                    self.store[x] = part
+                    self.size += len(part)
+            while self.size > self.max_bytes and self.store:
+                _, old = self.store.popitem(last=False)
+                self.size -= len(old)
+            self.seqs[bid] = hs
+            while len(self.seqs) > self.keep:
+                self.seqs.popitem(last=False)
+        return body
+
+
+# ---------------------------------------------------------------- http plumbing
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path, timeout=600):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self._path)
+        self.sock = s
+
+
+def upstream_conn(url, timeout=600):
+    m = re.match(r"(https?)://([^/]+)", url)
+    if not m:
+        raise ValueError("bad upstream url")
+    cls = http.client.HTTPSConnection if m.group(1) == "https" else http.client.HTTPConnection
+    return cls(m.group(2), timeout=timeout), m.group(2)
+
+
+class Relay(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "offload/" + VERSION
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass
+
+    def address_string(self):
+        return "-"
+
+    def read_body(self):
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            out = []
+            while True:
+                line = self.rfile.readline()
+                n = int(line.split(b";")[0].strip() or b"0", 16)
+                if n == 0:
+                    while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                        pass
+                    break
+                out.append(self.rfile.read(n))
+                self.rfile.readline()
+            return b"".join(out)
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n else b""
+
+    def fwd_headers(self, drop_prefix="x-zr-"):
+        out = []
+        for k, v in self.headers.items():
+            kl = k.lower()
+            if kl in HOP or kl.startswith(drop_prefix):
+                continue
+            out.append((k, v))
+        return out
+
+    def stream_back(self, resp, transform=None, extra=()):
+        """Send resp to our client. Returns (bytes read from resp, bytes sent)."""
+        self.send_response_only(resp.status, resp.reason)
+        for k, v in resp.getheaders():
+            kl = k.lower()
+            if kl in HOP or kl.startswith("x-zr-"):
+                continue
+            self.send_header(k, v)
+        for k, v in extra:
+            self.send_header(k, v)
+        nobody = self.command == "HEAD" or resp.status in (204, 304) or 100 <= resp.status < 200
+        if nobody:
+            self.send_header("Content-Length", resp.getheader("Content-Length") or "0")
+            self.end_headers()
+            return 0, 0
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        rin = rout = 0
+        w = self.wfile
+        while True:
+            data = resp.read1(65536)
+            if not data:
+                break
+            rin += len(data)
+            if transform:
+                data = transform(data)
+                if not data:
+                    continue
+            rout += len(data)
+            w.write(b"%x\r\n" % len(data) + data + b"\r\n")
+            w.flush()
+        if transform:
+            tail = transform(None)
+            if tail:
+                rout += len(tail)
+                w.write(b"%x\r\n" % len(tail) + tail + b"\r\n")
+        w.write(b"0\r\n\r\n")
+        w.flush()
+        return rin, rout
+
+    def do_ANY(self):
+        try:
+            self.handle_one()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as e:  # never take the daemon down for one request
+            self.close_connection = True
+            log("error %s %s: %s" % (self.command, self.path.split("?")[0], type(e).__name__))
+            try:
+                self.send_error(502, "offload relay error")
+            except Exception:
+                pass
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_ANY
+
+
+class ThreadedTCP(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+
+
+class ThreadedUnix(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    request_queue_size = 64
+
+    def get_request(self):
+        req, _ = self.socket.accept()
+        return req, ("local", 0)
+
+
+_log_lock = threading.Lock()
+_log_file = None
+
+
+def log(msg):
+    line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    with _log_lock:
+        if _log_file:
+            _log_file.write(line)
+            _log_file.flush()
+        else:
+            sys.stderr.write(line)
+
+
+# ---------------------------------------------------------------- relay: server end (on the box)
+
+class ServerRelay(Relay):
+    decoder = None
+    upstream = DEFAULTS["upstream"]
+
+    def handle_one(self):
+        body = self.read_body()
+        if self.headers.get("x-zr-enc") == "1":
+            try:
+                body = self.decoder.decode(body)
+            except Resync:
+                self.send_response_only(409, "resync")
+                self.send_header("x-zr-status", "resync")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        conn, host = upstream_conn(self.upstream)
+        try:
+            headers = self.fwd_headers()
+            headers.append(("Host", host))
+            if body or self.command in ("POST", "PUT", "PATCH"):
+                headers.append(("Content-Length", str(len(body))))
+            conn.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+            for k, v in headers:
+                conn.putheader(k, v)
+            conn.endheaders(body or None)
+            resp = conn.getresponse()
+            extra = [("x-zr-status", "ok")]
+            transform = None
+            if not resp.getheader("Content-Encoding") and self.headers.get("x-zr-enc"):
+                z = zlib.compressobj(6)
+                extra.append(("x-zr-resp", "z"))
+
+                def transform(d, z=z):
+                    if d is None:
+                        return z.flush(zlib.Z_FINISH)
+                    return z.compress(d) + z.flush(zlib.Z_SYNC_FLUSH)
+            self.stream_back(resp, transform, extra)
+        finally:
+            conn.close()
+
+
+def cmd_serve(args):
+    """Runs on the box, started by the client over ssh. Lives as long as its stdin."""
+    if not args:
+        die("_serve needs a socket path")
+    path = args[0]
+    upstream = args[1] if len(args) > 1 else DEFAULTS["upstream"]
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    os.umask(0o077)
+    ServerRelay.decoder = Decoder()
+    ServerRelay.upstream = upstream
+    srv = ThreadedUnix(path, ServerRelay)
+
+    def watch_stdin():
+        try:
+            while sys.stdin.buffer.read(4096):
+                pass
+        except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=watch_stdin, daemon=True).start()
+    sys.stdout.write("READY\n")
+    sys.stdout.flush()
+    try:
+        srv.serve_forever()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- relay: client end (on the laptop)
+
+class Tunnel:
+    """Keeps `ssh -L local.sock:remote.sock box offload _serve` alive."""
+
+    def __init__(self, box, conf):
+        self.box, self.conf = box, conf
+        self.lsock = os.path.join(state_dir(), "up.sock")
+        self.up = False
+        self.epoch = 0
+        self.proc = None
+        self.rhome = None
+
+    def start(self):
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def ssh_base(self):
+        return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
+
+    def loop(self):
+        while True:
+            try:
+                self.run_once()
+            except Exception as e:
+                log("tunnel error: %s" % e)
+            self.up = False
+            time.sleep(3)
+
+    def run_once(self):
+        if not self.rhome:
+            r = subprocess.run(self.ssh_base() + [self.box, 'printf %s "$HOME"'],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+            home = r.stdout.decode().strip()
+            if r.returncode or not home.startswith("/"):
+                raise RuntimeError("cannot reach %s over ssh" % self.box)
+            self.rhome = home
+        rsock = "%s/.local/state/offload/s-%s.sock" % (self.rhome, os.urandom(5).hex())
+        try:
+            os.unlink(self.lsock)
+        except OSError:
+            pass
+        cmd = self.ssh_base() + [
+            "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
+            "-L", "%s:%s" % (self.lsock, rsock), self.box,
+            "%s _serve %s %s" % (self.conf["remote_cmd"], shlex.quote(rsock),
+                                 shlex.quote(self.conf["upstream"]))]
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+        self.proc = p
+        line = p.stdout.readline()
+        if line.strip() != b"READY":
+            p.kill()
+            raise RuntimeError("the box did not start its relay (is offload installed there?)")
+        self.epoch += 1
+        self.up = True
+        log("tunnel up to %s" % self.box)
+        p.wait()
+        log("tunnel down")
+
+
+class Stats:
+    KEYS = ("requests", "req_raw", "req_wire", "resp_raw", "resp_wire", "direct_requests",
+            "direct_bytes", "resyncs")
+
+    def __init__(self, box):
+        self.lock = threading.Lock()
+        self.d = {k: 0 for k in self.KEYS}
+        self.d["box"] = box
+        self.d["since"] = int(time.time())
+
+    def add(self, **kw):
+        with self.lock:
+            for k, v in kw.items():
+                self.d[k] += v
+
+    def flusher(self, tunnel):
+        while True:
+            with self.lock:
+                d = dict(self.d)
+            d["tunnel_up"] = tunnel.up
+            d["updated"] = int(time.time())
+            d["pid"] = os.getpid()
+            try:
+                write_json(STATS, d, 0o600)
+            except OSError:
+                pass
+            time.sleep(2)
+
+
+class ClientRelay(Relay):
+    tunnel = None
+    encoder = None
+    stats = None
+    upstream = DEFAULTS["upstream"]
+    seen_epoch = 0
+    epoch_lock = threading.Lock()
+
+    def handle_one(self):
+        body = self.read_body()
+        t = self.tunnel
+        self._started = False
+        if t.up:
+            with ClientRelay.epoch_lock:
+                if ClientRelay.seen_epoch != t.epoch:
+                    ClientRelay.seen_epoch = t.epoch
+                    self.encoder.reset()
+            try:
+                if self.via_tunnel(body):
+                    return
+            except (OSError, http.client.HTTPException) as e:
+                if self._started:
+                    raise
+                log("tunnel request failed (%s), going direct" % type(e).__name__)
+        self.direct(body)
+
+    def via_tunnel(self, body):
+        dump = os.environ.get("OFFLOAD_DUMP")   # debugging: keep request bodies in this folder
+        if dump and body:
+            with open(os.path.join(dump, "%d-%d.body" % (time.time() * 1000, len(body))), "wb") as f:
+                f.write(body)
+        for attempt in (0, 1):
+            payload, pending = self.encoder.encode(body, literal=bool(attempt))
+            conn = UnixHTTPConnection(self.tunnel.lsock)
+            try:
+                conn.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+                for k, v in self.fwd_headers():
+                    conn.putheader(k, v)
+                conn.putheader("Host", "offload")
+                conn.putheader("x-zr-enc", "1")
+                conn.putheader("Content-Length", str(len(payload)))
+                conn.endheaders(payload)
+                resp = conn.getresponse()
+                if resp.status == 409 and resp.getheader("x-zr-status") == "resync":
+                    resp.read()
+                    self.encoder.reset()
+                    self.stats.add(resyncs=1, req_wire=len(payload))
+                    continue
+                if resp.getheader("x-zr-status") == "ok":
+                    self.encoder.commit(pending)
+                transform = None
+                if resp.getheader("x-zr-resp") == "z":
+                    z = zlib.decompressobj()
+
+                    def transform(d, z=z):
+                        return z.flush() if d is None else z.decompress(d)
+                self._started = True
+                rin, rout = self.stream_back(resp, transform)
+                self.stats.add(requests=1, req_raw=len(body), req_wire=len(payload),
+                               resp_raw=rout, resp_wire=rin)
+                log("%s %s %d  request %d -> %d bytes, reply %d -> %d bytes" % (
+                    self.command, self.path.split("?")[0], resp.status,
+                    len(body), len(payload), rout, rin))
+                return True
+            finally:
+                conn.close()
+        return False
+
+    def direct(self, body):
+        conn, host = upstream_conn(self.upstream)
+        try:
+            conn.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+            for k, v in self.fwd_headers():
+                conn.putheader(k, v)
+            conn.putheader("Host", host)
+            if body or self.command in ("POST", "PUT", "PATCH"):
+                conn.putheader("Content-Length", str(len(body)))
+            conn.endheaders(body or None)
+            resp = conn.getresponse()
+            rin, rout = self.stream_back(resp)
+            self.stats.add(direct_requests=1, direct_bytes=len(body) + rin)
+            log("%s %s %d  DIRECT (tunnel down) %d bytes" % (
+                self.command, self.path.split("?")[0], resp.status, len(body) + rin))
+        finally:
+            conn.close()
+
+
+def cmd_redirectd(args):
+    """The background relay on the laptop. Started by `offload redirect <box>`."""
+    global _log_file
+    conf = config()
+    box = args[0]
+    port = int(args[1]) if len(args) > 1 else conf["port"]
+    state_dir()
+    _log_file = open(LOG, "a")
+    os.chmod(LOG, 0o600)
+    tunnel = Tunnel(box, conf)
+    stats = Stats(box)
+    ClientRelay.tunnel = tunnel
+    ClientRelay.encoder = Encoder()
+    ClientRelay.stats = stats
+    ClientRelay.upstream = conf["upstream"]
+    srv = ThreadedTCP(("127.0.0.1", port), ClientRelay)
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    tunnel.start()
+    threading.Thread(target=stats.flusher, args=(tunnel,), daemon=True).start()
+
+    def stop(*_):
+        if tunnel.proc:
+            try:
+                tunnel.proc.kill()
+            except Exception:
+                pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    log("relay listening on 127.0.0.1:%d for box %s" % (port, box))
+    srv.serve_forever()
+
+
+# ---------------------------------------------------------------- redirect on / off / status
+
+def claude_env(set_url=None):
+    """Set or remove env.ANTHROPIC_BASE_URL in Claude Code's user settings."""
+    try:
+        with open(CLAUDE_SETTINGS) as f:
+            s = json.load(f)
+    except OSError:
+        s = {}
+    except ValueError:
+        die("%s is not valid JSON; not touching it" % CLAUDE_SETTINGS)
+    env = s.get("env") or {}
+    if set_url:
+        env["ANTHROPIC_BASE_URL"] = set_url
+    else:
+        if "ANTHROPIC_BASE_URL" not in env:
+            return
+        del env["ANTHROPIC_BASE_URL"]
+    if env:
+        s["env"] = env
+    else:
+        s.pop("env", None)
+    os.makedirs(os.path.dirname(CLAUDE_SETTINGS), exist_ok=True)
+    write_json(CLAUDE_SETTINGS, s)
+
+
+def self_path():
+    return os.path.abspath(sys.argv[0])
+
+
+def launchd_plist():
+    return os.path.join(HOME, "Library", "LaunchAgents", LAUNCHD_LABEL + ".plist")
+
+
+def systemd_unit():
+    return os.path.join(HOME, ".config", "systemd", "user", SERVICE + ".service")
+
+
+def have_systemd_user():
+    if not shutil.which("systemctl"):
+        return False
+    r = subprocess.run(["systemctl", "--user", "daemon-reload"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def service_stop():
+    if sys.platform == "darwin":
+        subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            os.unlink(launchd_plist())
+        except OSError:
+            pass
+    elif os.path.exists(systemd_unit()):
+        subprocess.run(["systemctl", "--user", "disable", "--now", SERVICE],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            os.unlink(systemd_unit())
+        except OSError:
+            pass
+        subprocess.run(["systemctl", "--user", "daemon-reload"], stderr=subprocess.DEVNULL)
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    for p in (PIDFILE, STATS):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def service_start(box, port):
+    argv = ["/usr/bin/env", "python3", self_path(), "_redirectd", box, str(port)]
+    path = os.environ.get("PATH", "/usr/bin:/bin")
+    if sys.platform == "darwin":
+        def x(s):
+            return s.replace("&", "&amp;").replace("<", "&lt;")
+        plist = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                 '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                 '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n'
+                 "<key>Label</key><string>%s</string>\n<key>ProgramArguments</key><array>%s</array>\n"
+                 "<key>EnvironmentVariables</key><dict><key>PATH</key><string>%s</string></dict>\n"
+                 "<key>KeepAlive</key><true/>\n<key>RunAtLoad</key><true/>\n"
+                 "<key>StandardErrorPath</key><string>%s</string>\n</dict></plist>\n") % (
+            LAUNCHD_LABEL, "".join("<string>%s</string>" % x(a) for a in argv), x(path),
+            x(os.path.join(STATE, "service.err")))
+        os.makedirs(os.path.dirname(launchd_plist()), exist_ok=True)
+        with open(launchd_plist(), "w") as f:
+            f.write(plist)
+        r = subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), launchd_plist()],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if r.returncode:
+            die("launchctl could not start the relay: %s" % r.stdout.decode().strip())
+    elif have_systemd_user():
+        unit = ("[Unit]\nDescription=offload redirect relay\n\n[Service]\n"
+                "Environment=PATH=%s\nExecStart=%s\nRestart=always\nRestartSec=3\n\n"
+                "[Install]\nWantedBy=default.target\n") % (path, " ".join(shlex.quote(a) for a in argv))
+        os.makedirs(os.path.dirname(systemd_unit()), exist_ok=True)
+        with open(systemd_unit(), "w") as f:
+            f.write(unit)
+        subprocess.run(["systemctl", "--user", "daemon-reload"])
+        r = subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if r.returncode:
+            die("systemd could not start the relay: %s" % r.stdout.decode().strip())
+    else:
+        with open(os.devnull, "rb") as dn, open(os.path.join(STATE, "service.err"), "ab") as err:
+            subprocess.Popen(argv, stdin=dn, stdout=err, stderr=err, start_new_session=True)
+
+
+def read_stats():
+    try:
+        with open(STATS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_redirect(args):
+    conf = config()
+    sub = args[0] if args else "status"
+    if sub == "status":
+        return redirect_status()
+    if sub == "off":
+        claude_env(None)
+        service_stop()
+        print("Redirect is off. Claude Code sessions started from now on call the API directly.")
+        print("Sessions that are already running keep their old setting until restarted.")
+        return
+    box = sub
+    port = conf["port"]
+    for i, a in enumerate(args):
+        if a == "--port" and i + 1 < len(args):
+            port = int(args[i + 1])
+    state_dir()
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", box,
+                        "%s version" % conf["remote_cmd"]],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode:
+        die("cannot run offload on %s over ssh (is it reachable, and is offload installed there?)" % box)
+    service_stop()
+    service_start(box, port)
+    for _ in range(40):
+        time.sleep(0.5)
+        s = read_stats()
+        if s and s.get("tunnel_up"):
+            break
+    else:
+        service_stop()
+        die("the relay did not come up; see %s" % LOG)
+    if "--no-settings" not in args:
+        claude_env("http://127.0.0.1:%d" % port)
+        print("Redirect is on through %s." % box)
+        print("Claude Code sessions started from now on use it (set in %s)." % CLAUDE_SETTINGS)
+        print("Sessions that are already running must be restarted to pick it up.")
+    else:
+        print("Relay is up through %s. To use it:  export ANTHROPIC_BASE_URL=http://127.0.0.1:%d" % (box, port))
+    say("Check savings with:  offload redirect status")
+
+
+def redirect_status():
+    s = read_stats()
+    alive = False
+    if s:
+        try:
+            os.kill(int(s.get("pid", 0)), 0)
+            alive = True
+        except (OSError, ValueError):
+            pass
+    env_on = False
+    try:
+        with open(CLAUDE_SETTINGS) as f:
+            env_on = "ANTHROPIC_BASE_URL" in (json.load(f).get("env") or {})
+    except (OSError, ValueError):
+        pass
+    if not alive:
+        print("Redirect: off")
+        if env_on:
+            print("WARNING: Claude Code is still pointed at the relay, but the relay is not running.")
+            say("         Run `offload redirect off`, or `offload redirect <box>` to start it again.")
+        return
+    print("Redirect: on, through %s (%s)" % (s["box"], "connected" if s.get("tunnel_up") else
+                                             "NOT connected, calls go direct"))
+    print("Claude Code setting: %s" % ("points at the relay" if env_on else "not set (relay unused)"))
+    print("Since: %s" % time.strftime("%b %d %H:%M", time.localtime(s["since"])))
+    raw = s["req_raw"] + s["resp_raw"]
+    wire = s["req_wire"] + s["resp_wire"]
+    print("Requests: %d" % s["requests"])
+    print("Would have crossed the link: %s" % mb(raw))
+    print("Actually crossed the link:   %s%s" % (
+        mb(wire), "  (%.0fx less)" % (raw / wire) if wire else ""))
+    print("  requests %s -> %s, replies %s -> %s" % (
+        mb(s["req_raw"]), mb(s["req_wire"]), mb(s["resp_raw"]), mb(s["resp_wire"])))
+    if s["direct_requests"]:
+        print("Went direct while the box was unreachable: %d requests, %s" % (
+            s["direct_requests"], mb(s["direct_bytes"])))
+    if s["resyncs"]:
+        print("Resyncs: %d" % s["resyncs"])
+
+
+# ---------------------------------------------------------------- put / get / run / claude / fetch
+
+def rel_home(path):
+    """Local path -> path relative to the home directory on the box."""
+    p = os.path.abspath(os.path.expanduser(path))
+    if p == HOME:
+        die("refusing to copy the whole home directory")
+    if p.startswith(HOME + os.sep):
+        return p, p[len(HOME) + 1:]
+    return p, os.path.join("offload", p.lstrip(os.sep))
+
+
+def pick_box(opts):
+    box = opts.get("box") or config()["box"]
+    if not box:
+        die("no box given. Use -b <box>, or set a default with: offload box <name>")
+    return box
+
+
+RS_SENT = re.compile(r"Total (?:bytes )?sent: ([\d,.]+)")          # openrsync (macOS): "Total sent: N B"
+RS_RECV = re.compile(r"Total (?:bytes )?received: ([\d,.]+)")
+RS_SIZE = re.compile(r"Total transferred file size: ([\d,.]+)")
+RS_FILES = re.compile(r"Number of (?:regular )?files transferred: ([\d,.]+)")
+RS_PROG = re.compile(r"^\s*([\d,]+)B?\s+\d+%\s+(\S+/s)")   # "22,446,080 74% 20.6MB/s"; rsync 3.5 writes "22,446,080B"
+RS_NOISE = ("sending incremental", "receiving incremental", "building file list", "created directory",
+            "receiving file list", "sending file list", "Transfer starting")
+_RSYNC_VER = []
+
+
+def num(s):
+    return int(re.sub(r"[^\d]", "", s) or 0)
+
+
+def rsync_version():
+    """(major, minor) of the local rsync. (0, 0) when it is not rsync 3 (openrsync, 2.6.9)."""
+    if not _RSYNC_VER:
+        v = (0, 0)
+        try:
+            out = subprocess.run(["rsync", "--version"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT).stdout.decode(errors="replace")
+            m = re.match(r"rsync\s+version\s+(\d+)\.(\d+)", out)
+            if m:
+                v = (int(m.group(1)), int(m.group(2)))
+        except OSError:
+            die("rsync is not installed on this machine")
+        _RSYNC_VER.append(v)
+    return _RSYNC_VER[0]
+
+
+def rsync(src, dst, opts, extra=(), ignore_dir=None, dry=False, est=None):
+    """Run rsync and return its totals. With est (the totals of a dry run) the copy
+    reports its progress through PROG: bytes with rsync 3.1 or newer, files otherwise."""
+    cmd = ["rsync", "-az", "--partial", "--stats"] + list(extra)
+    mode = ""
+    if dry:
+        cmd.append("-n")
+    elif est is not None:
+        if rsync_version() >= (3, 1):
+            cmd += ["--info=progress2", "--no-inc-recursive"]
+            mode = "bytes"
+        else:
+            cmd.append("-v")
+            mode = "files"
+    if ignore_dir and os.path.isfile(os.path.join(ignore_dir, ".offloadignore")):
+        cmd.append("--exclude-from=" + os.path.join(ignore_dir, ".offloadignore"))
+    cmd += ["--exclude=.DS_Store", src, dst]
+    with tempfile.TemporaryFile() as errf:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, env=dict(os.environ, LC_ALL="C"))
+        fd = p.stdout.fileno()
+        buf, keep, count, in_stats = b"", [], 0, False
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            parts = re.split(rb"[\r\n]", buf)
+            buf = parts.pop()
+            for raw in parts:
+                t = raw.decode(errors="replace")
+                if mode == "bytes":
+                    m = RS_PROG.match(t)
+                    if m:
+                        done = num(m.group(1))
+                        if est["size"]:
+                            PROG.update("%d%%  %s of %s  %s" % (
+                                min(100, done * 100 // est["size"]), mb(done), mb(est["size"]), m.group(2)))
+                        else:
+                            PROG.update("%s  %s" % (mb(done), m.group(2)))
+                        continue
+                elif mode == "files":
+                    if t.startswith("Number of files"):
+                        in_stats = True
+                    elif t.strip() and not in_stats and not t.endswith("/") and not t.startswith(RS_NOISE):
+                        count += 1
+                        PROG.update("%d of %d files" % (min(count, est["files"]) if est["files"] else count,
+                                                        max(est["files"], count)))
+                keep.append(t)
+        keep.append(buf.decode(errors="replace"))
+        rc = p.wait()
+        out = "\n".join(keep)
+        if rc:
+            PROG.stop()
+            errf.seek(0)
+            sys.stderr.write(errf.read().decode(errors="replace"))
+            die("rsync failed (exit %d)" % rc)
+
+    def g(rx):
+        m = rx.search(out)
+        return num(m.group(1)) if m else 0
+    return {"sent": g(RS_SENT), "recv": g(RS_RECV), "size": g(RS_SIZE), "files": g(RS_FILES)}
+
+
+def guard(size, opts, what):
+    limit = config()["confirm_mb"] * 1e6
+    if size <= limit or opts.get("yes"):
+        return
+    PROG.stop()
+    msg = "%s is %s to copy over this link." % (what, mb(size))
+    if not sys.stdin.isatty():
+        die(msg + " Re-run with -y to go ahead.")
+    if input(msg + " Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+        die("stopped", 0)
+
+
+def do_put(path, opts, quiet=False):
+    box = pick_box(opts)
+    local, rel = rel_home(path)
+    if not os.path.exists(local):
+        die("no such file or folder: %s" % path)
+    isdir = os.path.isdir(local)
+    src = local + "/" if isdir else local
+    dst = "%s:%s" % (box, rel + "/" if isdir else rel)
+    parent = rel if isdir else os.path.dirname(rel)
+    PROG.stage("Connecting to %s" % box)
+    r = subprocess.run(["ssh", "-o", "ConnectTimeout=10", box, "mkdir -p -- %s" % shlex.quote(parent or ".")])
+    if r.returncode:
+        die("cannot reach %s over ssh" % box)
+    igd = local if isdir else None
+    PROG.stage("Checking what has to be copied to %s" % box)
+    est = rsync(src, dst, opts, ignore_dir=igd, dry=True)
+    guard(est["size"], opts, path)
+    PROG.stage("Copying to %s" % box)
+    st = rsync(src, dst, opts, ignore_dir=igd, est=est)
+    PROG.stop()
+    if not quiet:
+        print("Sent to %s:~/%s  (%s of files, %s crossed the link)" % (
+            box, rel, mb(st["size"]), mb(st["sent"] + st["recv"])))
+    return box, rel, st
+
+
+def do_get(path, opts, quiet=False, update=False):
+    box = pick_box(opts)
+    local, rel = rel_home(path)
+    PROG.stage("Connecting to %s" % box)
+    r = subprocess.run(["ssh", "-o", "ConnectTimeout=10", box,
+                        "test -d %s && echo D || { test -e %s && echo F; }" % (
+                            shlex.quote(rel), shlex.quote(rel))],
+                       stdout=subprocess.PIPE)
+    kind = r.stdout.decode().strip()
+    if kind not in ("D", "F"):
+        die("%s:~/%s does not exist" % (box, rel))
+    isdir = kind == "D"
+    if isdir:
+        os.makedirs(local, exist_ok=True)
+    else:
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+    src = "%s:%s" % (box, rel + "/" if isdir else rel)
+    dst = local + "/" if isdir else local
+    extra = ["--update"] if update else []
+    igd = local if isdir else None
+    PROG.stage("Checking what has to come back from %s" % box)
+    est = rsync(src, dst, opts, extra, ignore_dir=igd, dry=True)
+    guard(est["size"], opts, path)
+    PROG.stage("Copying from %s" % box)
+    st = rsync(src, dst, opts, extra, ignore_dir=igd, est=est)
+    PROG.stop()
+    if not quiet:
+        print("Got %s:~/%s  (%s of files, %s crossed the link)" % (
+            box, rel, mb(st["size"]), mb(st["sent"] + st["recv"])))
+    return box, rel, st
+
+
+def cmd_run(args, opts):
+    if not args:
+        die("usage: offload run <command...>")
+    box, rel, up = do_put(".", opts, quiet=True)
+    command = " ".join(args) if len(args) > 1 else args[0]
+    tty = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+    r = subprocess.run(["ssh", "-C"] + tty + [box, "cd -- %s && %s" % (shlex.quote(rel), command)])
+    _, _, down = do_get(".", dict(opts, yes=True), quiet=True, update=True)
+    sys.stderr.write("offload: ran on %s; %s went up, %s came back\n" % (
+        box, mb(up["sent"] + up["recv"]), mb(down["sent"] + down["recv"])))
+    sys.exit(r.returncode)
+
+
+# ---- claude: move the work to the box as an amux session, with a handoff note
+
+HANDOFF = "OFFLOAD-HANDOFF.md"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+BOX_PATH = 'PATH="$HOME/.local/bin:$HOME/scripts:$HOME/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; export PATH; '
+STATES = ("agent", "shell", "stopped")
+ASK = ("offload: this folder is about to be copied to another machine ({box}), where a new session "
+       "continues the work without this conversation. Write a handoff note now to {path} : the task and "
+       "its goal, what is done, what is in progress, what comes next, the user's standing instructions "
+       "and decisions, and what exists only on this machine (credentials, files outside this folder, "
+       "running jobs). Keep it short and concrete. Do nothing else for this message; the copy starts "
+       "when the file is saved.")
+READ = ("This folder was moved here from another machine ({origin}) with offload. Read {files} first: "
+        "the handoff from the session that worked on it there. Then say in a few lines where things "
+        "stand and wait for instructions.")
+
+
+def local_amux():
+    """Path of the amux command on this machine, or ''."""
+    p = shutil.which("amux")
+    if p:
+        return p
+    for c in (os.path.join(HOME, ".local", "bin", "amux"), "/usr/local/bin/amux", "/opt/homebrew/bin/amux"):
+        if os.access(c, os.X_OK):
+            return c
+    return ""
+
+
+def porcelain(text):
+    """Lines of `amux info --porcelain` -> list of session dicts."""
+    rows = []
+    for ln in text.splitlines():
+        f = ln.split("\t")
+        if len(f) >= 6 and f[1] in STATES:
+            rows.append({"name": f[0], "state": f[1], "provider": f[2] or "claude",
+                         "account": f[3], "dir": f[4], "flags": f[5]})
+    return rows
+
+
+def amux_rows(amux, args):
+    """Sessions amux reports for `info <args> --porcelain`. Empty when it finds none, or
+    when this amux is older than the --porcelain option."""
+    if not amux:
+        return []
+    try:
+        r = subprocess.run([amux, "info"] + args + ["--porcelain"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return porcelain(r.stdout.decode(errors="replace"))
+
+
+def inside_session():
+    """Name of the tmux session this command runs in, or ''."""
+    if not os.environ.get("TMUX"):
+        return ""
+    try:
+        r = subprocess.run(["tmux", "display-message", "-p", "#S"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=5)
+        return r.stdout.decode(errors="replace").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def fresh(path, since):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return st.st_size > 0 and st.st_mtime >= since
+
+
+def write_handoff(amux, sessions, local, box, wait, opts):
+    """Have the agent session(s) working in this folder write a handoff note before the
+    copy. Returns the note files (names inside the folder) the new session should read."""
+    live = [x for x in sessions if x["state"] == "agent"]
+    if not live:
+        if os.path.isfile(os.path.join(local, HANDOFF)):
+            print("No agent session is running for this folder here; using the handoff note "
+                  "already in it (%s)." % HANDOFF)
+            return [HANDOFF]
+        print("No agent session is running for this folder here, so no handoff note was written.")
+        print("The new session starts without the earlier conversation.")
+        return []
+    me = inside_session()
+    notes, asked, t0 = [], [], time.time()
+    for x in live:
+        fname = HANDOFF if len(live) == 1 else "OFFLOAD-HANDOFF-%s.md" % x["name"]
+        path = os.path.join(local, fname)
+        if me == "amux-" + x["name"]:
+            # the session cannot answer while it waits for this very command
+            if not fresh(path, t0 - 1800):
+                die("this command runs inside the session that has to write the handoff note (%s).\n"
+                    "  Write %s first: the task, what is done, what is in progress, what comes next,\n"
+                    "  the user's standing instructions, and what exists only on this machine.\n"
+                    "  Then run this again. (--no-handoff copies without a note.)" % (x["name"], path))
+            notes.append(fname)
+            continue
+        r = subprocess.run([amux, "send", x["name"], ASK.format(box=box, path=path)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        if r.returncode:
+            sys.stderr.write("offload: could not reach session %s to ask for a handoff note\n" % x["name"])
+            continue
+        asked.append((x["name"], fname, path))
+    if asked:
+        names = ", ".join(a[0] for a in asked)
+        PROG.stage("Waiting for %s to write the handoff note" % names)
+        deadline, sizes, stable = t0 + wait, None, 0
+        while True:
+            done = all(fresh(a[2], t0 - 1) for a in asked)
+            now_sizes = [os.path.getsize(a[2]) if os.path.exists(a[2]) else -1 for a in asked]
+            stable = stable + 1 if done and now_sizes == sizes else 0
+            sizes = now_sizes
+            if done and stable >= 2:
+                break
+            if time.time() >= deadline:
+                PROG.stop()
+                msg = ("no handoff note from %s after %d s (it may be busy, or waiting for an approval)."
+                       % (names, wait))
+                if opts.get("yes"):
+                    sys.stderr.write("offload: %s Copying without it.\n" % msg)
+                elif sys.stdin.isatty():
+                    if input("offload: %s Copy without it? [y/N] " % msg).strip().lower() not in ("y", "yes"):
+                        die("stopped", 0)
+                else:
+                    die(msg + " Re-run with --handoff-wait <seconds> to wait longer, "
+                        "or --no-handoff to copy without it.")
+                break
+            time.sleep(1)
+        PROG.stop()
+        for name, fname, path in asked:
+            if fresh(path, t0 - 1):
+                notes.append(fname)
+                print("Handoff note written by %s: %s" % (name, fname))
+    return notes
+
+
+def box_probe(box, name):
+    """What the box has: its home folder, whether amux is there, and the session of
+    that name if one is registered. One ssh call, before anything is copied."""
+    q = shlex.quote(name)
+    script = (BOX_PATH + 'echo "HOME=$HOME"; command -v amux >/dev/null 2>&1 || exit 0; echo AMUX=1; '
+              "amux info --porcelain %s 2>/dev/null || { echo PLAIN; amux info %s 2>/dev/null; }; exit 0"
+              % (q, q))
+    PROG.stage("Connecting to %s" % box)
+    r = subprocess.run(["ssh", "-o", "ConnectTimeout=10", box, script], stdout=subprocess.PIPE,
+                       stdin=subprocess.DEVNULL)
+    PROG.stop()
+    if r.returncode:
+        die("cannot reach %s over ssh" % box)
+    out = ANSI.sub("", r.stdout.decode(errors="replace"))
+    info = {"home": "", "amux": "AMUX=1" in out.splitlines(), "session": None}
+    m = re.search(r"^HOME=(.*)$", out, re.M)
+    if m:
+        info["home"] = m.group(1).strip()
+    rows = [x for x in porcelain(out) if x["name"] == name]
+    if rows:
+        info["session"] = rows[0]
+    elif "PLAIN" in out.splitlines():
+        # an amux older than --porcelain: read the plain text
+        plain = out.split("PLAIN", 1)[1].strip().splitlines()
+        if plain and plain[0].strip() == name:
+            d = re.search(r"^\s*dir:\s*(.*)$", "\n".join(plain), re.M)
+            st = re.search(r"^\s*status:\s*(\S+)", "\n".join(plain), re.M)
+            info["session"] = {"name": name, "dir": d.group(1).strip() if d else "",
+                               "state": "agent" if st and st.group(1) == "running" else "stopped",
+                               "provider": "claude", "account": "", "flags": ""}
+    return info
+
+
+def cmd_session(args, opts, guessed=False):
+    """Move an amux session (or the work in a folder) to the box: see the help."""
+    conf = config()
+    handoff, attach, name, wait, rest = True, True, "", conf["handoff_wait"], []
+    args = list(args)
+    while args:
+        a = args.pop(0)
+        if a == "--no-handoff":
+            handoff = False
+        elif a == "--no-attach":
+            attach = False
+        elif a in ("--name", "--handoff-wait"):
+            if not args:
+                die("%s needs a value" % a)
+            v = args.pop(0)
+            if a == "--name":
+                name = v
+            else:
+                wait = v
+        elif a.startswith("--name="):
+            name = a[7:]
+        elif a.startswith("--handoff-wait="):
+            wait = a[15:]
+        elif a.startswith("-"):
+            die("unknown option %s for session (see offload -h)" % a)
+        else:
+            rest.append(a)
+    try:
+        wait = max(0, int(wait))
+    except (TypeError, ValueError):
+        die("--handoff-wait needs a number of seconds")
+    if len(rest) > 1:
+        die("usage: offload session [<session>|<dir>] [--name <n>] [--no-handoff] [--handoff-wait <s>] [--no-attach]")
+    if name and not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+        die("--name: use letters, digits, dot, dash and underscore")
+    d = rest[0] if rest else "."
+    amux = local_amux()
+    picked = None
+    if not os.path.isdir(os.path.expanduser(d)):
+        # not a folder: a session name
+        rows = amux_rows(amux, [d]) if re.match(r"^[A-Za-z0-9._-]+$", d) else []
+        if not rows:
+            if guessed:
+                die("%s is not a command, a folder or an amux session here (see offload -h)" % d)
+            die("not a folder%s: %s" % (" or an amux session" if amux else "", d))
+        picked = rows[0]
+        d = picked["dir"]
+        if not os.path.isdir(d):
+            die("session %s is registered for %s, which is not a folder here" % (picked["name"], d))
+    box = pick_box(opts)
+    local, rel = rel_home(d)
+    sessions = amux_rows(amux, ["--dir", local])
+    if picked is None and len(sessions) == 1:
+        picked = sessions[0]
+    if picked is None:
+        live = [x for x in sessions if x["state"] == "agent"]
+        picked = live[0] if len(live) == 1 else None
+    if not name:
+        name = picked["name"] if picked else os.path.basename(rel.rstrip("/"))
+        name = re.sub(r"[^A-Za-z0-9_.-]", "-", name).lstrip(".-") or "offload"
+
+    there = box_probe(box, name)
+    # offload works for amux: the session moves to an amux session on the box. Only the
+    # config value "launcher": "tmux" (or the old "auto" on a box without amux) uses plain tmux.
+    use_amux = there["amux"] and conf["launcher"] in ("auto", "amux")
+    if conf["launcher"] not in ("auto", "tmux") and not there["amux"]:
+        die("amux is not installed on %s, so the session cannot move there.\n"
+            "  Install amux on %s (https://amux.nuilab.org), then run this again." % (box, box))
+    ses = there["session"] if use_amux else None
+    if ses:
+        want = os.path.normpath(os.path.join(there["home"], rel))
+        if os.path.normpath(ses["dir"] or "/") != want:
+            die("%s already has a session named %s, for another folder (%s).\n"
+                "  Give the new one another name:  offload session --name <name> %s" % (box, name, ses["dir"], d))
+
+    notes = []
+    if handoff:
+        notes = write_handoff(amux, sessions, local, box, wait, opts)
+    elif os.path.isfile(os.path.join(local, HANDOFF)):
+        notes = [HANDOFF]
+
+    box, rel, st = do_put(d, opts, quiet=True)
+    print("Copied to %s:~/%s (%s crossed the link)." % (box, rel, mb(st["sent"] + st["recv"])))
+    prompt = READ.format(origin=socket.gethostname().split(".")[0], files=" and ".join(notes)) if notes else ""
+    q = shlex.quote
+    target = '"$HOME"/' + q(rel)
+    tty = sys.stdin.isatty() and sys.stdout.isatty()
+
+    if not use_amux:
+        if not there["amux"]:
+            print("amux is not installed on %s, so Claude Code starts there in plain tmux." % box)
+        say("When done, bring results back with:  offload get %s" % d)
+        sys.stdout.flush()
+        launch = conf["claude_launch"].format(name=q(name), dir=target, prompt=q(prompt) if prompt else "")
+        os.execvp("ssh", ["ssh", "-t", box, launch])
+
+    src = picked or {"provider": "claude", "account": "", "flags": ""}
+    says = prompt if src["provider"] in ("claude", "codex") else ""
+    if ses and ses["state"] == "agent":
+        cmd = "amux send %s %s >/dev/null" % (q(name), q(prompt)) if prompt else "true"
+        how = "Session %s is already running on %s%s." % (name, box, "; it was told to read the note" if prompt else "")
+    elif ses:
+        cmd = "amux start %s --no-attach%s" % (q(name), " " + q(says) if says else "")
+        how = "Started session %s on %s." % (name, box)
+    else:
+        parts = ["amux", "exec", q(name), "--provider", q(src["provider"]), "--dir", target]
+        if src["account"]:
+            parts += ["--account", q(src["account"])]
+        try:
+            parts += [q(f) for f in shlex.split(src["flags"])]
+        except ValueError:
+            pass
+        parts.append("--no-attach")
+        if says:
+            parts.append(q(says))
+        cmd = " ".join(parts)
+        how = "Started a new amux session on %s: %s." % (box, name)
+    PROG.stage("Starting the session on %s" % box)
+    r = subprocess.run(["ssh", "-o", "ConnectTimeout=10", box, BOX_PATH + cmd], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    PROG.stop()
+    if r.returncode:
+        sys.stderr.write(ANSI.sub("", r.stdout.decode(errors="replace")))
+        die("the files are on %s, but amux could not start the session there. Start it by hand:\n"
+            "  ssh -t %s 'amux exec %s --provider %s --dir ~/%s'" % (box, box, name, src["provider"], rel))
+    print(how)
+    if notes and not says and not (ses and ses["state"] == "agent"):
+        print("Tell it to read %s first." % " and ".join(notes))
+    say("When done, bring results back with:  offload get %s" % d)
+    stay = [x["name"] for x in sessions if x["state"] == "agent"]
+    if stay:
+        print("Still running here: %s (stop with: amux stop %s)." % (", ".join(stay), stay[0]))
+    go = "ssh -t %s amux attach %s" % (box, name)
+    if attach and tty:
+        sys.stdout.flush()
+        os.execvp("ssh", ["ssh", "-t", box, BOX_PATH + "amux attach " + q(name)])
+    print("Attach with:  %s" % go)
+
+
+def cmd_fetch(args, opts):
+    if not args:
+        die("usage: offload fetch <url>")
+    box = pick_box(opts)
+    remote = ('mkdir -p "$HOME/offload/fetch" && cd "$HOME/offload/fetch" && '
+              "curl -fL -sS --remote-name --remote-header-name "
+              "-w '%%{filename_effective} %%{size_download}\\n' -- %s" % shlex.quote(args[0]))
+    r = subprocess.run(["ssh", "-o", "ConnectTimeout=10", box, remote], stdout=subprocess.PIPE)
+    if r.returncode:
+        die("the download failed on %s" % box)
+    parts = r.stdout.decode().strip().rsplit(" ", 1)
+    fname = parts[0]
+    size = int(float(parts[1])) if len(parts) > 1 else 0
+    print("Downloaded on %s: ~/offload/fetch/%s (%s). Nothing was copied here." % (box, fname, mb(size)))
+    say("Bring it here with:  offload get ~/offload/fetch/%s" % fname)
+
+
+def cmd_box(args):
+    c = config()
+    if args:
+        c["box"] = args[0]
+        save_config(c)
+    print(c["box"] or "(no default box set)")
+
+
+def run_on_hosts(hosts, rest):
+    conf = config()
+    rc = 0
+    tty = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+    for host in hosts.split(","):
+        if "," in hosts:
+            print("== %s ==" % host)
+            sys.stdout.flush()
+        cmd = "%s %s" % (conf["remote_cmd"], " ".join(shlex.quote(a) for a in rest))
+        r = subprocess.run(["ssh"] + tty + ["-o", "ConnectTimeout=10", host, cmd])
+        rc = rc or r.returncode
+    sys.exit(rc)
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    opts = {}
+    while argv and argv[0].startswith("-"):
+        a = argv.pop(0)
+        if a == "-H" and argv:
+            return run_on_hosts(argv.pop(0), argv)
+        elif a == "-b" and argv:
+            opts["box"] = argv.pop(0)
+        elif a == "-y":
+            opts["yes"] = True
+        else:
+            die("unknown option %s (see offload -h)" % a)
+    if not argv:
+        die("no command (see offload -h)")
+    cmd, args = argv[0], argv[1:]
+    # -b and -y are also accepted after the command, except inside `run`'s command line
+    if cmd != "run":
+        rest = []
+        while args:
+            a = args.pop(0)
+            if a == "-b" and args:
+                opts["box"] = args.pop(0)
+            elif a == "-y":
+                opts["yes"] = True
+            else:
+                rest.append(a)
+        args = rest
+    if cmd == "version":
+        print("offload " + VERSION)
+    elif cmd == "redirect":
+        cmd_redirect(args)
+    elif cmd == "_serve":
+        cmd_serve(args)
+    elif cmd == "_redirectd":
+        cmd_redirectd(args)
+    elif cmd == "put":
+        if not args:
+            die("usage: offload put <path>")
+        do_put(args[0], opts)
+    elif cmd == "get":
+        if not args:
+            die("usage: offload get <path>")
+        do_get(args[0], opts)
+    elif cmd == "run":
+        cmd_run(args, opts)
+    elif cmd in ("session", "claude"):   # `claude` is the old name (0.1.0, 0.1.1)
+        cmd_session(args, opts)
+    elif cmd == "fetch":
+        cmd_fetch(args, opts)
+    elif cmd == "box":
+        cmd_box(args)
+    elif cmd.startswith("--") or os.path.isdir(os.path.expanduser(cmd)) or re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", cmd):
+        # `offload <session>` / `amux offload <session>`: a session name, a folder, or a
+        # session option, without the word `session`
+        cmd_session([cmd] + args, opts, guessed=not cmd.startswith("-"))
+    else:
+        die("unknown command %s (see offload -h)" % cmd)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

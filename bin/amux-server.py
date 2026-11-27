@@ -1807,7 +1807,7 @@ def _start_iterm2_session_tab(name: str, cfg: dict, fresh: bool = False,
             shell_setup += _AUTOPROMPT_ENV
         try:
             cj = Path.home() / ".claude.json"
-            if cj.exists() and '"oauthAccount"' in cj.read_text():
+            if not _is_api_account(account) and cj.exists() and '"oauthAccount"' in cj.read_text():
                 shell_setup += "unset ANTHROPIC_API_KEY; "
         except Exception:
             pass
@@ -7772,8 +7772,39 @@ _ACCOUNT_PROVIDERS = ("claude", "iterm2")
 
 
 def normalize_account(a: str) -> str:
-    a = (a or "").strip().lower()
-    return _ACCOUNT_ALIASES.get(a, a)
+    """P/T/X spellings -> personal/team/team2; an API key name keeps its case."""
+    a = (a or "").strip()
+    low = a.lower()
+    if low in _ACCOUNT_ALIASES:
+        return _ACCOUNT_ALIASES[low]
+    return low if low in _SESSION_ACCOUNTS else a
+
+
+# API-KEY ACCOUNTS (2026-11-26): any other name is an Anthropic API key, kept as a
+# mode-600 file <name>.key in one of these folders (the twin of bin/amux's
+# AMUX_API_KEY_DIRS). The session bills that key, not a subscription.
+_API_KEY_DIRS = (Path.home() / ".config" / "claude-code" / "api",)
+_ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _is_api_account(a: str) -> bool:
+    return bool(a) and a not in _SESSION_ACCOUNTS and bool(_ACCOUNT_NAME_RE.match(a))
+
+
+def _api_key_file(a: str) -> Path:
+    for d in _API_KEY_DIRS:
+        f = d / f"{a}.key"
+        if f.is_file():
+            return f
+    return _API_KEY_DIRS[0] / f"{a}.key"
+
+
+def _account_known(a: str) -> bool:
+    """A subscription (personal/team/team2) or an API key name whose key file exists here."""
+    return a in _SESSION_ACCOUNTS or (_is_api_account(a) and _api_key_file(a).is_file())
+
+
+_ACCOUNTS_HELP = "personal, team, team2 (or P / T / X), or the name of an API key"
 
 
 def _session_account(cfg: dict) -> str:
@@ -7792,7 +7823,11 @@ def _session_account(cfg: dict) -> str:
 
 
 def _account_badge(account: str) -> str:
-    return _ACCOUNT_BADGES.get(account, "?" if account else "")
+    if account in _ACCOUNT_BADGES:
+        return _ACCOUNT_BADGES[account]
+    if _is_api_account(account):
+        return "A"
+    return "?" if account else ""
 
 
 # ── Running-account memory (2026-09-26) ──────────────────────────────────────
@@ -7821,7 +7856,7 @@ def _recorded_restart_account(meta: dict, saved_raw: str) -> str:
     Ignored when the stored CC_ACCOUNT has been changed since that launch
     (`amux account <n> X` is an explicit choice and must win over the memory)."""
     a = normalize_account(str(meta.get("last_account", "") or ""))
-    if a not in _SESSION_ACCOUNTS:
+    if not _account_known(a):
         return ""
     if "last_account_saved" in meta and \
             normalize_account(str(meta.get("last_account_saved") or "")) != normalize_account(saved_raw or ""):
@@ -7829,7 +7864,7 @@ def _recorded_restart_account(meta: dict, saved_raw: str) -> str:
     return a
 
 
-_CLAUDE_ACCOUNT_ENV_RE = re.compile(r"(?:^|\s)CLAUDE_ACCOUNT=([A-Za-z0-9_]+)")
+_CLAUDE_ACCOUNT_ENV_RE = re.compile(r"(?:^|\s)CLAUDE_ACCOUNT=([A-Za-z0-9._-]+)")
 
 
 def _live_account(name: str) -> str:
@@ -7856,7 +7891,7 @@ def _live_account(name: str) -> str:
     except Exception:
         return ""
     a = normalize_account(val)
-    return a if a in _SESSION_ACCOUNTS else ""
+    return a if _account_known(a) else ""
 
 
 def _restart_account(name: str) -> str:
@@ -7933,9 +7968,23 @@ def _account_shell_setup(account: str) -> tuple[str, str]:
     """(shell snippet, error). Sources the slot and exports CLAUDE_ACCOUNT so the
     status line badge and the shell agree; a missing slot is an ERROR, not a
     silent fallback to personal (org work must never bill the other account)."""
+    if _is_api_account(account):
+        f = _api_key_file(account)
+        if not f.is_file():
+            return "", (f"unknown account {account!r}: no API key file {f} -- refusing to fall back "
+                        "to the default account")
+        try:
+            mode = f.stat().st_mode & 0o777
+        except OSError:
+            mode = 0
+        if mode not in (0o600, 0o400):
+            return "", f"the API key file {f} is mode {mode:o}; make it private first: chmod 600 {f}"
+        # $(<file) is a shell builtin: the key never reaches a process's argv.
+        return (f"unset CLAUDE_CODE_OAUTH_TOKEN; export ANTHROPIC_API_KEY=\"$(<{shlex.quote(str(f))})\"; "
+                f"export CLAUDE_ACCOUNT={account}; "), ""
     if account not in _SESSION_ACCOUNTS:
-        return "", (f"unknown account {account!r} (valid: " + " ".join(_SESSION_ACCOUNTS)
-                    + ", or P / T / X) -- refusing to fall back to the default account")
+        return "", (f"unknown account {account!r} (valid: {_ACCOUNTS_HELP}) "
+                    "-- refusing to fall back to the default account")
     slot = _account_slot_path(account)
     if not slot.exists():
         return "", (f"the {account} account is not set up on this box (missing {slot}); "
@@ -8010,12 +8059,44 @@ def _opencode_model_is_local(model: str) -> bool:
     return pid in _opencode_local_providers()
 
 
+_OPENCODE_NAMED_CLOUD = {"deepinfra"}
+
+
+def _opencode_model_named_cloud(model: str) -> bool:
+    """DeepInfra (2026-11-26): the one cloud provider the opencode lane accepts, and only
+    when the session names the model; the default stays local."""
+    if not model or "/" not in model:
+        return False
+    pid, _, rest = model.partition("/")
+    return pid.strip().lower() in _OPENCODE_NAMED_CLOUD and bool(rest.strip())
+
+
+def _opencode_cloud_listed(model: str, partners: bool):
+    """Is `model` in `opencode models <provider>`, read with this launch's
+    OPENCODE_PARTNERS (a plugin may hide some models)? None = could not read the list."""
+    pid = model.partition("/")[0]
+    env = dict(os.environ)
+    if partners:
+        env["OPENCODE_PARTNERS"] = "1"
+    else:
+        env.pop("OPENCODE_PARTNERS", None)
+    try:
+        r = subprocess.run(["opencode", "models", pid], capture_output=True, text=True,
+                           timeout=30, env=env)
+    except Exception:
+        return None
+    names = {l.strip() for l in (r.stdout or "").splitlines() if l.strip()}
+    if r.returncode != 0 or not names:
+        return None
+    return model in names
+
+
 def _opencode_default_local_model() -> str:
     """The model the opencode provider launches with when the session doesn't name
     one: AMUX_OPENCODE_MODEL (must itself be local) or the first local provider's
     first model from the opencode config. '' = nothing local available."""
     env_model = os.environ.get("AMUX_OPENCODE_MODEL", "").strip()
-    if env_model and _opencode_model_is_local(env_model):
+    if env_model and (_opencode_model_is_local(env_model) or _opencode_model_named_cloud(env_model)):
         return env_model
     for pid, models in _opencode_local_providers().items():
         if models:
@@ -9110,11 +9191,17 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
                                "(e.g. local-ollama/qwen3-coder:30b) or add a local Ollama provider to "
                                "~/.config/opencode/opencode.json[c]. The OpenCode lane never uses "
                                "the Claude subscription (compliance).")
-            if not _opencode_model_is_local(_oc_model):
-                return False, (f"opencode: model '{_oc_model}' is not a verified LOCAL provider/model — "
-                               "the OpenCode lane must use local models only (compliance). Pick a "
-                               "provider defined with a loopback/tailnet baseURL in "
-                               "~/.config/opencode/opencode.json[c].")
+            if _opencode_model_named_cloud(_oc_model):
+                _pid = _oc_model.partition("/")[0]
+                if _opencode_cloud_listed(_oc_model, _partners) is False:
+                    return False, (f"opencode: model '{_oc_model}' is not in OpenCode's {_pid} list "
+                                   f"(opencode models {_pid})."
+                                   + ("" if _partners else " If it is a partner model, add --partners."))
+            elif not _opencode_model_is_local(_oc_model):
+                return False, (f"opencode: model '{_oc_model}' is neither a verified LOCAL provider/model "
+                               "(a loopback/tailnet baseURL in ~/.config/opencode/opencode.json[c]) nor "
+                               "a DeepInfra model (deepinfra/<model>). The OpenCode lane never runs "
+                               "on the Claude subscription (compliance).")
             _oc_opts = f" -m {shlex.quote(_oc_model)}"
             if _oc_yolo:
                 _oc_opts += " --auto"
@@ -9251,6 +9338,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
             tmux_sess = tmux_name(name)
             # Build shell setup string — skip Claude env cleanup for non-claude providers
             _has_oauth = False
+            _api_acct = False   # an API-key account: its key must survive every unset below
             _acct_rc = ""
             _acct = ""
             if provider in ("codex", "gemini", "opencode", "agy"):
@@ -9271,6 +9359,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
                     return False, _acct_err
                 print(f"[start] {name}: account {_acct} ({_account_badge(_acct)})")
                 _announce_start_account(name, _acct, cfg)
+                _api_acct = _is_api_account(_acct)
                 try:
                     import json as _j2
                     _cj = Path.home() / ".claude.json"
@@ -9278,7 +9367,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
                         _has_oauth = bool(_j2.loads(_cj.read_text()).get("oauthAccount"))
                 except Exception:
                     pass
-                if _has_oauth:
+                if _has_oauth and not _api_acct:
                     shell_rc += "unset ANTHROPIC_API_KEY; "
             for rc in [Path.home() / ".zprofile", Path.home() / ".bash_profile", Path.home() / ".profile"]:
                 if rc.exists():
@@ -9294,7 +9383,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
             if _autoprompt and provider not in ("codex", "gemini", "opencode", "agy"):
                 shell_rc += _AUTOPROMPT_ENV
                 print(f"[start] {name}: prompt suggestions on (--autoprompt)")
-            if provider not in ("codex", "gemini", "opencode") and _has_oauth:
+            if provider not in ("codex", "gemini", "opencode") and _has_oauth and not _api_acct:
                 shell_rc += "unset ANTHROPIC_API_KEY; "
             # opencode partner models: set only by the marker; otherwise unset, so a value
             # in the server's own environment or in the login profile never reaches the agent.
@@ -9309,8 +9398,8 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
                 return False, f"internal: shell setup does not end on account {_acct} -- refusing to start"
             # Forward select env vars into the tmux session.
             _env_args = []
-            if _has_oauth:
-                _env_args += ["-e", "ANTHROPIC_API_KEY="]
+            if _has_oauth or _api_acct:
+                _env_args += ["-e", "ANTHROPIC_API_KEY="]   # an API account exports its own in the pane
             else:
                 _api_key_val = os.environ.get("ANTHROPIC_API_KEY", "")
                 if _api_key_val:
@@ -9471,7 +9560,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
                 _poll_shell_prompt(name, timeout=3.0)  # let profile source complete
     
             # Ensure ANTHROPIC_API_KEY is unset when OAuth is available
-            if _has_oauth and provider not in ("codex", "gemini", "opencode"):
+            if _has_oauth and not _api_acct and provider not in ("codex", "gemini", "opencode"):
                 subprocess.run(["tmux", "send-keys", "-t", tmux_target(name), "-l",
                                 "unset ANTHROPIC_API_KEY"],
                                capture_output=True, timeout=5)
@@ -39623,9 +39712,9 @@ class CCHandler(BaseHTTPRequestHandler):
             # --account personal|team|team2` (P/T/X accepted). Stored for claude/iterm2
             # sessions only; accepted-and-ignored for the other providers.
             account = normalize_account(body.get("account", ""))
-            if account and account not in _SESSION_ACCOUNTS:
-                return self._json({"error": f"unknown account '{account}' (valid: "
-                                   + " ".join(_SESSION_ACCOUNTS) + ", or P / T / X)"}, 400)
+            if account and not _account_known(account):
+                return self._json({"error": f"unknown account '{account}' (valid: {_ACCOUNTS_HELP} "
+                                   "with its key file on that machine)"}, 400)
             if provider in _ACCOUNT_PROVIDERS:
                 cfg["CC_ACCOUNT"] = account or "personal"
             # full_access (2026-08-18): the REST mirror of `amux exec <name>
@@ -42098,10 +42187,10 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                 _cur_dir = parse_env_file(CC_SESSIONS / f"{name}.env").get("CC_DIR", "?")
                                 return self._json({"ok": False, "error":
                                     f"--dir is an exec/register option; session '{name}' already runs "
-                                    f"in {_cur_dir} (change it with: amux-remote <box> exec {name} --dir <path>)"}, 400)
+                                    f"in {_cur_dir}; start runs it in that folder"}, 400)
                             return self._json({"ok": False, "error":
                                 f"{_base} is an exec/register option, not a start flag "
-                                f"(use: amux-remote <box> exec {name} {_base} …)"}, 400)
+                                f"(it is set when the session is created)"}, 400)
                         _kept.append(_t)
                         _i += 1
                     if provider_override:
@@ -42110,8 +42199,8 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         return self._json({"ok": False, "error": f"unknown provider '{provider_override}' (valid: " + " ".join(_SESSION_PROVIDERS) + ")"}, 400)
                     if account_override:
                         account_override = normalize_account(account_override)
-                        if account_override not in _SESSION_ACCOUNTS:
-                            return self._json({"ok": False, "error": f"unknown account '{account_override}' (valid: " + " ".join(_SESSION_ACCOUNTS) + ", or P / T / X)"}, 400)
+                        if not _account_known(account_override):
+                            return self._json({"ok": False, "error": f"unknown account '{account_override}' (valid: {_ACCOUNTS_HELP} with its key file on that machine)"}, 400)
                     # Re-join the kept tokens shell-safely (tokens cannot contain
                     # quotes/backslashes — the charset checks above rejected them).
                     extra_flags = " ".join(shlex.quote(t) for t in _kept)
@@ -42436,8 +42525,8 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     if not isinstance(body["account"], str):
                         return self._json({"error": "account must be a string"}, 400)
                     account_val = normalize_account(body["account"])
-                    if account_val not in _SESSION_ACCOUNTS:
-                        return self._json({"error": "account must be one of: " + ", ".join(_SESSION_ACCOUNTS) + " (or P / T / X)"}, 400)
+                    if not _account_known(account_val):
+                        return self._json({"error": f"account must be one of: {_ACCOUNTS_HELP} (with its key file on that machine)"}, 400)
                     cur_provider = (cfg.get("CC_PROVIDER", "claude") or "claude").strip().lower()
                     if cur_provider not in _ACCOUNT_PROVIDERS:
                         return self._json({"error": f"session runs {cur_provider}; only claude/iterm2 sessions have a Claude account"}, 400)
@@ -42446,7 +42535,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         return self._json({"ok": True, "message": f"account already set to {account_val}"})
                     if is_running(name):
                         return self._json({"error": f"session '{name}' is running; stop it first, then change the account"}, 409)
-                    if account_val != "personal" and not _account_slot_path(account_val).is_file():
+                    if account_val in ("team", "team2") and not _account_slot_path(account_val).is_file():
                         return self._json({"error": f"the {account_val} account is not set up on this box"}, 400)
                     cfg["CC_ACCOUNT"] = account_val
                     _write_env(env_file, cfg)

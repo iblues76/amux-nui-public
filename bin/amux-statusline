@@ -400,6 +400,8 @@ def acct_badge():
     if _a == "personal": return "P"
     if _a == "team":     return "T"
     if _a == "team2":    return "X"
+    # A = an API-key account (amux --account <key name>, 2026-11-26): billed per token.
+    if _a or os.environ.get("ANTHROPIC_API_KEY"): return "A"
     _t = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or ""
     if not _t: return ""
     # Paths are built by concatenation (the slot names carry their own slash).
@@ -447,7 +449,7 @@ except Exception:
 # --- end quota log ----------------------------------------------------------------
 _avis = f"  {_ab} " if _ab else ""
 # Badge look: P = dark-blue text on white; T = white text on dark blue; X = white text on magenta.
-_ACOL = {"P": "1;38;5;18;48;5;231", "T": "1;38;5;231;48;5;18", "X": "1;38;5;231;48;5;90"}
+_ACOL = {"P": "1;38;5;18;48;5;231", "T": "1;38;5;231;48;5;18", "X": "1;38;5;231;48;5;90", "A": "1;38;5;16;48;5;214"}
 _acol = (" " + col(_ACOL.get(_ab, "1;38;5;231;48;5;18"), f" {_ab} ")) if _ab else ""
 segs[0][1] += _avis
 segs[0][2] += _acol

@@ -415,7 +415,7 @@ o=$(out_of amux-remote remotebox start safe.name --append-system-prompt 'say hi'
 curl_args=$(out_of sed -n '1,200p' "$CURL_LOG")
 if has "/api/sessions/safe.name/start" "$curl_args" \
    && has "--append-system-prompt 'say hi'" "$curl_args" \
-   && has "attach: amux-up remotebox safe.name" "$o"; then
+   && has "attach: amux-remote remotebox attach safe.name" "$o"; then
   ok "remote start forwards one-shot flags (spaces survive) and hints the attach"
 else
   bad "remote start flag forwarding failed" "$curl_args"
@@ -1148,13 +1148,13 @@ has "[501, 502, 502, None, 501]" "$o" \
 sect "7h. amux offload, and which sessions work in a folder"
 o=$(PATH="$E/mock:$BINDIR:/usr/bin:/bin" "$BINDIR/amux" offload version 2>&1 | plain); rc=0
 PATH="$E/mock:$BINDIR:/usr/bin:/bin" "$BINDIR/amux" offload version >/dev/null 2>&1 || rc=$?
-[ "$rc" != 0 ] && has "offload is not installed on this machine" "$o" && has "f.ortega/offload" "$o" \
-  && ok "amux offload without the offload tool: says so, and where to get it" || bad "amux offload, tool missing" "rc=$rc $o"
+[ "$rc" = 0 ] && has "offload $(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$REPO/bin/offload")" "$o" \
+  && ok "amux offload runs the offload that ships in bin/ (installed with the companions)" || bad "amux offload, bundled tool" "rc=$rc $o"
 printf '#!/bin/sh\nprintf "offload got:"; for a in "$@"; do printf " [%%s]" "$a"; done; echo\n' > "$E/mock/offload"; chmod +x "$E/mock/offload"
-o=$(A offload -b otherbox claude "my folder" --no-attach)
-[ "$o" = "offload got: [-b] [otherbox] [claude] [my folder] [--no-attach]" ] \
+o=$(A offload -b otherbox session "my folder" --no-attach)
+[ "$o" = "offload got: [-b] [otherbox] [session] [my folder] [--no-attach]" ] \
   && ok "amux offload <args> hands every argument to the offload tool unchanged" || bad "amux offload passthrough" "$o"
-o=$(A help); has "amux offload claude" "$o" && has "transfer" "$o" \
+o=$(A help); has "amux offload <session|folder>" "$o" && has "transfer" "$o" \
   && ok "amux help lists it under the words move and transfer" || bad "amux help: offload"
 mkdir -p "$E/d7h"
 # a stand-in tmux again: one live agent, one open shell
@@ -1256,6 +1256,90 @@ m=$(grep -c 'if pt == "1": body\["partners"\] = True' bin/amux-remote)
 rm -f "$E/mock/tmux" "$E/mock/opencode" "$E/mock/codex" "$AMUX_T7I_LOG"; unset AMUX_T7I_LOG
 [ "$_ocfg_made" = 1 ] && rm -f "$_ocfg"
 for n in oc1 oc2 cx1; do A rm $n >/dev/null; done
+
+# ── 7j. opencode: a DeepInfra model the session names; the default stays local ──
+sect "7j. opencode on DeepInfra: only when named, checked against OpenCode's list"
+mkdir -p "$E/d7j" "$HOME/.config/opencode"
+_ocfg="$HOME/.config/opencode/opencode.json"; _ocfg_made=0
+if [ ! -e "$_ocfg" ] && [ ! -e "$HOME/.config/opencode/opencode.jsonc" ]; then
+  printf '%s\n' '{"model": "deepinfra/zr/m-zero", "provider": {"lab": {"options": {"baseURL": "http://127.0.0.1:11434/v1"}, "models": {"m1": {}}}}}' > "$_ocfg"; _ocfg_made=1
+fi
+# a stand-in opencode: "models deepinfra" lists one model always and a second one only
+# with OPENCODE_PARTNERS=1 (what a plugin that hides some models does)
+cat > "$E/mock/opencode" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  session) echo "[]" ;;
+  models) [ "${2:-}" = deepinfra ] && { echo deepinfra/zr/m-zero; [ "${OPENCODE_PARTNERS:-}" = 1 ] && echo deepinfra/pp/m-partner; } ;;
+esac
+exit 0
+SH
+cat > "$E/mock/tmux" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  new-session) for a in "$@"; do last="$a"; done; printf '%s\n' "$last" > "$AMUX_T7J_LOG" ;;
+  has-session|list-sessions|list-panes|respawn-pane) exit 1 ;;
+  display-message) echo 0 ;;
+esac
+exit 0
+SH
+chmod +x "$E/mock/opencode" "$E/mock/tmux"
+export AMUX_T7J_LOG="$E/t7j.cmd"
+launched() { cat "$AMUX_T7J_LOG" 2>/dev/null; : > "$AMUX_T7J_LOG"; }
+o=$(OPENCODE_PARTNERS=1 A exec dj1 --provider opencode --model deepinfra/zr/m-zero --dir "$E/d7j" --no-attach); c=$(launched)
+has "opencode -m deepinfra/zr/m-zero" "$c" && has "cloud: deepinfra" "$o" \
+  && ok "exec --model deepinfra/<model>: opencode starts on it, and the start says it is a cloud model" || bad "named DeepInfra model" "$o / $c"
+o=$(A exec dj2 --provider opencode --dir "$E/d7j" --no-attach); c=$(launched)
+has "opencode -m lab/m1" "$c" && ok "no --model: the default stays local, although opencode's own default is DeepInfra" || bad "default not local" "$o / $c"
+o=$(OPENCODE_PARTNERS=1 A exec dj3 --provider opencode --model deepinfra/pp/m-partner --dir "$E/d7j" --no-attach); c=$(launched)
+[ -z "$c" ] && has "add --partners" "$o" \
+  && ok "a model OpenCode hides without --partners is refused, although the shell has OPENCODE_PARTNERS=1" || bad "hidden model not refused" "$o / $c"
+o=$(A exec dj4 --provider opencode --model deepinfra/pp/m-partner --partners --dir "$E/d7j" --no-attach); c=$(launched)
+has "opencode -m deepinfra/pp/m-partner" "$c" && has "export OPENCODE_PARTNERS=1; " "$c" \
+  && ok "with --partners it starts, with OPENCODE_PARTNERS=1" || bad "hidden model with --partners" "$o / $c"
+o=$(A exec dj5 --provider opencode --model deepinfra/no/such --dir "$E/d7j" --no-attach); c=$(launched)
+[ -z "$c" ] && has "not in OpenCode's deepinfra list" "$o" && ok "a name OpenCode does not list is refused" || bad "unknown DeepInfra model" "$o / $c"
+o=$(A exec dj6 --provider opencode --model openai/gpt-x --dir "$E/d7j" --no-attach); c=$(launched)
+[ -z "$c" ] && has "neither a verified LOCAL" "$o" && ok "any other cloud provider stays refused" || bad "openai not refused" "$o / $c"
+# the server keeps the same rule in its own launch path
+o=$(PATH="$E/mock:$PATH" OPENCODE_PARTNERS=1 python3 - bin/amux-server.py <<'PYT' 2>&1
+import os, subprocess, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+ns = {"os": os, "subprocess": subprocess}
+exec(src[src.index("_OPENCODE_NAMED_CLOUD = "):src.index("def _opencode_default_local_model(")], ns)
+nc, li = ns["_opencode_model_named_cloud"], ns["_opencode_cloud_listed"]
+print([nc("deepinfra/zr/m-zero"), nc("deepinfra"), nc("openai/x"),
+       li("deepinfra/zr/m-zero", False), li("deepinfra/pp/m-partner", False), li("deepinfra/pp/m-partner", True)])
+PYT
+)
+has "[True, False, False, True, False, True]" "$o" && ok "the server accepts and checks a DeepInfra model the same way" || bad "server DeepInfra rule" "$o"
+rm -f "$E/mock/tmux" "$E/mock/opencode" "$AMUX_T7J_LOG"; unset AMUX_T7J_LOG
+[ "$_ocfg_made" = 1 ] && rm -f "$_ocfg"
+for n in dj1 dj2 dj3 dj4 dj5 dj6; do A rm $n >/dev/null; done
+
+# ── 7k. messages say what the user typed (amux -H, amux up, amux -A) ─────────
+sect "7k. Messages say what you typed: amux -H, amux up, amux -A"
+o=$(A -H nosuchbox ls); has "add it: amux -H add nosuchbox" "$o" && ! has "amux-remote" "$o" \
+  && ok "amux -H <unknown box>: 'add it: amux -H add …', no amux-remote in the text" || bad "amux -H unknown box" "$o"
+o=$(A -H); has "amux -H <box> <cmd>" "$o" && ok "amux -H alone: its own help, in the amux -H spelling" || bad "amux -H alone" "$o"
+o=$(A -H ls); has "try 'amux -H <box> ls" "$o" && ok "a command where the box goes: try 'amux -H <box> ls …'" || bad "amux -H ls" "$o"
+o=$(A -H somebox up); has "usage: amux -H somebox up <name>" "$o" && ok "amux -H <box> up without a name: a usage line" || bad "amux -H up" "$o"
+o=$(A up); has "usage: amux up" "$o" && ok "amux up without a name: usage: amux up …" || bad "amux up" "$o"
+o=$(A -A --bogus); has "amux -A: unknown option '--bogus' (see amux -A -h)" "$o" && ok "amux -A: says amux -A" || bad "amux -A" "$o"
+o=$(PATH="$E/mock:$BINDIR:$PATH" "$BINDIR/amux-remote" nosuchbox ls 2>&1 | plain); has "add it: amux-remote add nosuchbox" "$o" \
+  && ok "amux-remote called directly keeps its own name" || bad "amux-remote direct" "$o"
+
+# ── 7l. the bundled helpers ──────────────────────────────────────────────────
+sect "7l. Bundled helpers: offload, claude-account, amux-idle-report, set-amux-cpu, claude-statusline-refresh"
+for h in offload claude-account amux-idle-report set-amux-cpu claude-statusline-refresh; do
+  if [ -x "$REPO/bin/$h" ] && "$REPO/bin/$h" -h >/dev/null 2>&1; then ok "$h ships in bin/ and answers -h"; else bad "$h missing or -h fails"; fi
+done
+[ -f "$REPO/systemd/amux-cap.service" ] && grep -q 'Slice=amux.slice' "$REPO/systemd/amux-cap.service" \
+  && ok "systemd/amux-cap.service ships with set-amux-cpu" || bad "amux-cap.service missing"
+o=$(env -i PATH=/usr/bin:/bin HOME="$SANDBOX" CLAUDE_ACCOUNT=labkey ANTHROPIC_API_KEY=placeholder "$REPO/bin/claude-account" --badge 2>&1)
+[ "$o" = A ] && ok "claude-account --badge: A for an API key account" || bad "claude-account badge" "$o"
+o=$(PATH="$REPO/bin:$PATH" A offload -h 2>&1 | head -3); has "offload" "$o" && ! has "not installed" "$o" \
+  && ok "amux offload -h reaches the bundled offload" || bad "amux offload -h" "$o"
 
 # ── 8. the audit actually catches things ─────────────────────────────────────
 sect "8. Audit catches planted secrets"

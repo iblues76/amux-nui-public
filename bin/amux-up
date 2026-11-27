@@ -30,6 +30,9 @@
 #   e.g. amux-up api
 #        amux-up box1 api --continue
 #        amux-up box1:api
+# The name the user typed (amux sets AMUX_PROG when it hands off, e.g. "amux up");
+# read once and unset so a tool started from here does not inherit it.
+ME="${AMUX_PROG:-amux-up}"; unset AMUX_PROG
 case "${1:-}" in -h|--help)
   awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
 esac
@@ -38,7 +41,7 @@ set -uo pipefail
 remdir="$HOME/.amux/remotes"
 sessdir="${CC_HOME:-$HOME/.amux}/sessions"
 raw="${1:-}"
-[ -z "$raw" ] && { echo "usage: amux-up [<box>] <name> [flags]   (-h for details)"; exit 2; }
+[ -z "$raw" ] && { echo "usage: $ME [<box>] <name> [flags]   ($ME -h for details)" >&2; exit 2; }
 shift || true
 # box selector — colon form (<box>:<name>) or two-arg form (<box> <name>).
 box=""; name="$raw"; box_explicit=0
@@ -86,8 +89,8 @@ fi
 # <box> <name> (or <box>:<name>). No $AMUX_HUB, no "the only configured box":
 # guessing which machine to drive is how you start/attach on the wrong one.
 if [ -z "$box" ]; then
-  echo "amux-up: '$name' is not a local session, and no box was named." >&2
-  echo "  name the machine explicitly:  amux-up <box> $name" >&2
+  echo "$ME: '$name' is not a local session, and no box was named." >&2
+  echo "  name the machine explicitly:  $ME <box> $name" >&2
   boxes="$(ls "$remdir" 2>/dev/null | sed -n 's/\.env$//p' | tr '\n' ' ')"
   [ -n "$boxes" ] && echo "  boxes: $boxes" >&2
   exit 2
@@ -111,16 +114,16 @@ if command -v amux-remote >/dev/null 2>&1 && [ -f "$remdir/$box.env" ]; then
   # A failed start must NOT be swallowed — attaching after one just drops you
   # into a missing/dead tmux target. AMUX_NO_HINT=1: we attach right after, so
   # amux-remote's "attach: amux-up …" next-step hint would be noise here.
-  if ! AMUX_NO_HINT=1 amux-remote "$box" start "$name" ${start_flags[@]+"${start_flags[@]}"}; then
-    echo "amux-up: starting '$name' on '$box' FAILED — not attaching." >&2
+  if ! AMUX_NO_HINT=1 AMUX_PROG="amux -H" amux-remote "$box" start "$name" ${start_flags[@]+"${start_flags[@]}"}; then
+    echo "$ME: starting '$name' on '$box' FAILED — not attaching." >&2
     exit 1
   fi
-  exec amux-remote "$box" attach "$name" ${attach_flags[@]+"${attach_flags[@]}"}
+  AMUX_PROG="amux -H" exec amux-remote "$box" attach "$name" ${attach_flags[@]+"${attach_flags[@]}"}
 fi
 
-echo "amux-up: '$name' not found locally and no box resolved." >&2
+echo "$ME: '$name' not found locally and no box resolved." >&2
 boxes="$(ls "$remdir"/*.env 2>/dev/null | sed -E 's#.*/##; s/\.env$//' | tr '\n' ' ')"
-[ -n "$boxes" ] && echo "  boxes: ${boxes} — try 'amux-up <box> $name'" >&2
+[ -n "$boxes" ] && echo "  boxes: ${boxes} — try '$ME <box> $name'" >&2
 echo "  local sessions:" >&2
 amux ls -c 2>/dev/null | sed 's/^/    /' >&2
 exit 1
