@@ -82,7 +82,16 @@ fi
 if [ "$known_local" = 1 ]; then
   # local: `amux start` starts if stopped (auto-resumes newest) and attaches; if
   # already running it short-circuits to attach. Either way you end up inside it.
-  exec amux start "$name" "$@"
+  # --cc/--plain/--mosh choose the road to ANOTHER box; a local attach has none, so
+  # they are dropped here (until 2026-11-27 they reached the agent's command line).
+  local_args=()
+  for a in "$@"; do
+    case "$a" in
+      --cc|--plain|--mosh) echo "$ME: $a is for a session on another box; '$name' is on this one — attaching here" >&2 ;;
+      *) local_args+=("$a") ;;
+    esac
+  done
+  exec amux start "$name" ${local_args[@]+"${local_args[@]}"}
 fi
 
 # Remote lane: session isn't local. A MACHINE IS NEVER INFERRED — you name it as
@@ -94,6 +103,13 @@ if [ -z "$box" ]; then
   boxes="$(ls "$remdir" 2>/dev/null | sed -n 's/\.env$//p' | tr '\n' ' ')"
   [ -n "$boxes" ] && echo "  boxes: $boxes" >&2
   exit 2
+fi
+
+# <box>:<name> with another spelling of a configured box (myhost-01 for myhost), as the
+# two-arg form above already accepts.
+if [ ! -f "$remdir/$box.env" ] && command -v amux-remote >/dev/null 2>&1; then
+  _b="$(amux-remote "$box" box 2>/dev/null || true)"
+  [ -n "$_b" ] && [ -f "$remdir/$_b.env" ] && box="$_b"
 fi
 
 if command -v amux-remote >/dev/null 2>&1 && [ -f "$remdir/$box.env" ]; then
@@ -121,9 +137,9 @@ if command -v amux-remote >/dev/null 2>&1 && [ -f "$remdir/$box.env" ]; then
   AMUX_PROG="amux -H" exec amux-remote "$box" attach "$name" ${attach_flags[@]+"${attach_flags[@]}"}
 fi
 
-echo "$ME: '$name' not found locally and no box resolved." >&2
+# Here a box was named (<box>:<name>) that is not configured, or amux-remote is missing.
+command -v amux-remote >/dev/null 2>&1 || { echo "$ME: '$box:$name' needs amux-remote, which is not on PATH (install.sh links the companions into ~/.local/bin)" >&2; exit 1; }
 boxes="$(ls "$remdir"/*.env 2>/dev/null | sed -E 's#.*/##; s/\.env$//' | tr '\n' ' ')"
-[ -n "$boxes" ] && echo "  boxes: ${boxes} — try '$ME <box> $name'" >&2
-echo "  local sessions:" >&2
-amux ls -c 2>/dev/null | sed 's/^/    /' >&2
+[ -n "$boxes" ] || boxes=none
+echo "$ME: unknown box '$box' (configured: $boxes) — add it: amux -H add $box" >&2
 exit 1

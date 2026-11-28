@@ -6956,6 +6956,110 @@ def get_session_info(name: str) -> dict | None:
     }
 
 
+# The agent flags a client asks a session to KEEP (amux -H <box> exec|register <name>
+# --model X --effort high …, 2026-11-27): the same checks as one-shot start flags, and
+# amux's own options are refused here because each has its own field in the request.
+_STORED_FLAGS_REFUSED = ("--dir", "--pwd", "--provider", "--account", "--worktree", "--desc",
+                         "--fresh", "--no-attach", "--detach", "--color", "--full-access", "--yolo",
+                         "--net-sandbox", "--full-sandbox", "--autoprompt", "--partners", "--no-partners")
+
+
+def _stored_flags_from_body(raw) -> tuple[str, str]:
+    """(flags shell-quoted per token, "") or ("", error)."""
+    if raw in (None, ""):
+        return "", ""
+    if not isinstance(raw, str):
+        return "", "flags must be a string"
+    if len(raw) > 2000:
+        return "", "flags too long (max 2000 chars)"
+    if any(c in raw for c in ('"', "\\", "$", "`")):
+        return "", 'flags may not contain " \\ $ or backticks'
+    if any(ord(c) < 32 for c in raw):
+        return "", "flags may not contain control characters"
+    try:
+        toks = shlex.split(raw)
+    except ValueError as ex:
+        return "", f"unparseable flags: {ex}"
+    for t in toks:
+        b = t.split("=", 1)[0]
+        if b in _STORED_FLAGS_REFUSED:
+            return "", f"{b} is an amux option, not an agent flag to store"
+    return " ".join(shlex.quote(t) for t in toks), ""
+
+
+def _flag_markers(body: dict, provider: str) -> tuple[list, str]:
+    """The amux markers a create/re-register request asks for, as CC_FLAGS words:
+    full access (the provider's own spelling), a sandbox, --autoprompt, --partners."""
+    out = []
+    sbx = str(body.get("sandbox") or "").strip().lower()
+    if sbx and sbx not in ("net", "full"):
+        return [], "sandbox must be net or full"
+    if sbx and body.get("full_access"):
+        return [], "full_access cannot be combined with a sandbox"
+    if sbx and provider == "iterm2":
+        # refused at creation, as the CLI does: an iTerm2 tab has no sandbox lane
+        return [], "--net-sandbox / --full-sandbox are not available for iterm2 sessions (use a tmux provider)"
+    if body.get("full_access"):
+        out.append(_provider_yolo_flag(provider))
+    if sbx:
+        out.append(f"--{sbx}-sandbox")
+    if body.get("autoprompt") and provider in ("claude", "iterm2"):
+        out.append("--autoprompt")
+    if body.get("partners"):
+        if provider != "opencode":
+            return [], "--partners applies to the opencode provider only"
+        out.append("--partners")
+    return out, ""
+
+
+def _session_reregister(name: str, env_file: Path, body: dict, given_dir: str) -> tuple[dict, int]:
+    """POST /api/sessions with "update": true on a registered session (2026-11-27): the
+    box's twin of the local `amux register|exec <name> …` on an existing session, used by
+    `amux -H <box> register|exec`. What the request does not restate is kept — the
+    folder, the agent, the account and every other line (description, tags, pin) — and
+    the stored agent flags are REPLACED by the ones given, as the local re-register does."""
+    cfg = parse_env_file(env_file)
+    if body.get("worktree"):
+        return {"error": "--worktree applies only when a session is created"}, 400
+    old_provider = (cfg.get("CC_PROVIDER") or "claude").strip().lower() or "claude"
+    provider = normalize_provider(str(body.get("provider") or "").strip().lower()) or old_provider
+    if provider not in _SESSION_PROVIDERS:
+        return {"error": f"unknown provider '{provider}' (valid: " + " ".join(_SESSION_PROVIDERS) + ")"}, 400
+    account = normalize_account(str(body.get("account") or ""))
+    if account and not _account_known(account):
+        return {"error": f"unknown account '{account}' (valid: {_ACCOUNTS_HELP} with its key file on that machine)"}, 400
+    flags, err = _stored_flags_from_body(body.get("flags"))
+    if err:
+        return {"error": err}, 400
+    markers, err = _flag_markers(body, provider)
+    if err:
+        return {"error": err}, 400
+    if given_dir:
+        if not (given_dir.startswith("/") or given_dir == "~" or given_dir.startswith("~/")):
+            return {"error": f"the folder must be an absolute path or ~/…, got '{given_dir}'"}, 400
+        try:
+            Path(given_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            return {"error": f"cannot create the folder {given_dir}: {ex.strerror or ex}"}, 400
+        cfg["CC_DIR"] = given_dir
+    desc = str(body.get("desc") or "").strip()
+    if desc:
+        cfg["CC_DESC"] = desc
+    cfg["CC_PROVIDER"] = provider
+    cfg["CC_FLAGS"] = " ".join([f for f in [flags] if f] + markers)
+    if provider in _ACCOUNT_PROVIDERS:
+        cfg["CC_ACCOUNT"] = account or (cfg.get("CC_ACCOUNT") or "").strip() or "personal"
+    else:
+        cfg.pop("CC_ACCOUNT", None)
+    if provider != "iterm2":
+        cfg.pop("CC_ITERM2_SESSION_ID", None)
+    _write_env(env_file, cfg)
+    slog(f"[register] {name}: re-registered (provider {provider}, flags: {cfg['CC_FLAGS'] or '(none)'})")
+    return {"ok": True, "message": f"updated {name}", "name": name, "updated": True,
+            "dir": cfg.get("CC_DIR", ""), "provider": provider,
+            "account": cfg.get("CC_ACCOUNT", ""), "flags": cfg["CC_FLAGS"]}, 200
+
+
 def _find_latest_session_id(work_dir: str) -> str:
     """Find the most recent Claude Code conversation session ID for a working directory.
     Skips snapshot-only files that have no user/assistant messages (claude --resume exits on those)."""
@@ -8807,7 +8911,9 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False,
             if account_override:
                 argv += ["--account", account_override]
             if provider_override:
-                return False, "a one-shot provider cannot be combined with a sandboxed start"
+                # the CLI's start takes a one-shot provider with a sandbox (2026-11-27:
+                # this used to be refused here only)
+                argv += ["--provider", provider_override]
             try:
                 argv += shlex.split(extra_flags or "")
             except ValueError:
@@ -10384,6 +10490,8 @@ def send_text(name: str, text: str) -> tuple[bool, str]:
 # CLI rejects (leading '-', dots), so a REST-created session could not be operated on
 # from the command line.
 _VALID_SESSION_NAME_RE = re.compile(r'^[a-zA-Z0-9_][a-zA-Z0-9_\-]*$')
+# The same words amux, amux-remote and amux-rename print for a name outside the rule.
+_SESSION_NAME_RULE = "allowed: letters, digits, '_' and '-'; it cannot start with '-'"
 
 def _channel_id(a: str, b: str) -> str:
     """Stable channel id = sorted pair joined by '__'. Order-independent."""
@@ -10500,7 +10608,8 @@ def send_keys(name: str, keys: str) -> tuple[bool, str]:
     if not is_running(name):
         return False, "not running"
     if keys not in _ALLOWED_TMUX_KEYS:
-        return False, f"key '{keys}' not in allowed set"
+        return False, (f"key '{keys}' not in allowed set (named keys only: "
+                       + " ".join(sorted(_ALLOWED_TMUX_KEYS, key=lambda k: (len(k) > 1, k))) + ")")
     lock = _get_send_lock(name)
     with lock:
         try:
@@ -37445,6 +37554,23 @@ class CCHandler(BaseHTTPRequestHandler):
                             break
             return self._json(sc["data"] if sc["data"] is not None else [])
 
+        # GET /api/sessions-by-dir?dir=<folder> (2026-11-27) — the sessions registered for a
+        # folder on this box, resolved here (~ and symlinks): `amux -H <box> info --dir`,
+        # the twin of the local `amux info --dir`. An older server answers 404.
+        if method == "GET" and path == "/api/sessions-by-dir":
+            want_raw = (qs.get("dir", [""])[0] or "").strip()
+            if not want_raw:
+                return self._json({"error": "dir is required"}, 400)
+            want = str(Path(want_raw).expanduser().resolve())
+            found = []
+            for f in sorted(CC_SESSIONS.glob("*.env"), key=lambda f: (f.stem.upper(), f.stem)):
+                raw_dir = parse_env_file(f).get("CC_DIR", "")
+                if raw_dir and str(Path(raw_dir).expanduser().resolve()) == want:
+                    info = get_session_info(f.stem) or {}
+                    info.pop("raw", None)
+                    found.append(info)
+            return self._json({"dir": want, "sessions": found})
+
         # GET /api/sessions-git — bulk git info for all sessions (avoids 80+ individual requests)
         if method == "GET" and path == "/api/sessions-git":
             sgc = _sessions_git_cache
@@ -39629,6 +39755,7 @@ class CCHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             name = body.get("name", "").strip()
             dir_path = body.get("dir", "").strip()
+            given_dir = dir_path
             # Fall back to saved files_cwd pref if no dir provided
             if not dir_path:
                 try:
@@ -39643,14 +39770,26 @@ class CCHandler(BaseHTTPRequestHandler):
                                ("a creator name", body.get("creator", ""))):
                 if _env_unsafe(_val):
                     return self._json({"error": _lbl + " " + _ENV_UNSAFE_MSG}, 400)
-            name = re.sub(r'[^a-zA-Z0-9_-]', '-', name)
+            # ONE name rule for every client (the amux CLI's validate_name): refuse a
+            # name outside it. Until 2026-11-27 it was rewritten here ("my.app" became
+            # "my-app"), and the client then failed to start the name it had sent.
+            if not _VALID_SESSION_NAME_RE.match(name):
+                return self._json({"error": f"invalid session name '{name}' ({_SESSION_NAME_RULE})"}, 400)
             if _is_session_blocked(name):
                 return self._json({
                     "error": f"session '{name}' is blocked; remove it from blocked-sessions.txt first"
                 }, 403)
             env_file = CC_SESSIONS / f"{name}.env"
             if env_file.exists():
+                # "update": true = register again, as the local CLI does (amux -H register/exec)
+                if body.get("update"):
+                    _resp, _code = _session_reregister(name, env_file, body, given_dir)
+                    return self._json(_resp, _code)
                 return self._json({"error": f"session '{name}' already exists"}, 409)
+            # agent flags to keep (amux -H exec|register --model X --effort high …)
+            stored_flags, _ferr = _stored_flags_from_body(body.get("flags"))
+            if _ferr:
+                return self._json({"error": _ferr}, 400)
             CC_SESSIONS.mkdir(parents=True, exist_ok=True)
             cfg = {}
             use_worktree = bool(body.get("worktree", False))
@@ -39715,34 +39854,33 @@ class CCHandler(BaseHTTPRequestHandler):
             if account and not _account_known(account):
                 return self._json({"error": f"unknown account '{account}' (valid: {_ACCOUNTS_HELP} "
                                    "with its key file on that machine)"}, 400)
+            # account_default (2026-11-27): the account the CALLER's terminal runs, sent by
+            # amux -H exec/register when no --account is given, so a new session follows
+            # the account in use, as the local `amux exec` does. Unlike "account" it is
+            # soft: when this machine lacks that subscription slot or key file, the
+            # session gets personal, and the answer says so.
+            _acct_note = ""
+            if not account and provider in _ACCOUNT_PROVIDERS:
+                _dflt = normalize_account(str(body.get("account_default", "") or ""))
+                if _dflt:
+                    if _account_known(_dflt) and (_dflt not in ("team", "team2") or _account_slot_path(_dflt).is_file()):
+                        account = _dflt
+                    else:
+                        _acct_note = f"the {_dflt} account is not on this machine, so the session runs on personal"
             if provider in _ACCOUNT_PROVIDERS:
                 cfg["CC_ACCOUNT"] = account or "personal"
             # full_access (2026-08-18): the REST mirror of `amux exec <name>
             # --full-access` — persist the provider's own no-sandbox spelling
             # into CC_FLAGS at creation. One request, no toggle: a toggle would
             # depend on the session's prior state and also flip auto-continue.
-            _sbx = str(body.get("sandbox") or "").strip().lower()
-            if _sbx and _sbx not in ("net", "full"):
-                return self._json({"error": "sandbox must be net or full"}, 400)
-            if _sbx and body.get("full_access"):
-                return self._json({"error": "full_access cannot be combined with a sandbox"}, 400)
-            if body.get("full_access"):
-                cfg["CC_FLAGS"] = _provider_yolo_flag(provider)
-            if _sbx:
-                cfg["CC_FLAGS"] = f'--{_sbx}-sandbox'
-
-            # autoprompt (2026-10-14): REST mirror of `amux exec <name> --autoprompt` —
-            # prompt suggestions on for this session; stored as a CC_FLAGS marker that
-            # start_session strips and turns into CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=true.
-            if body.get("autoprompt") and provider in ("claude", "iterm2"):
-                cfg["CC_FLAGS"] = f'{cfg["CC_FLAGS"]} --autoprompt'.strip()
-            # partners (2026-11-24): REST mirror of `amux exec <name> --provider opencode
-            # --partners`; stored as a CC_FLAGS marker that start_session strips and turns
-            # into OPENCODE_PARTNERS=1. Refused for every other provider.
-            if body.get("partners"):
-                if provider != "opencode":
-                    return self._json({"error": "--partners applies to the opencode provider only"}, 400)
-                cfg["CC_FLAGS"] = f'{cfg["CC_FLAGS"]} --partners'.strip()
+            # Markers (_flag_markers): full access in the provider's own spelling, a
+            # sandbox, autoprompt (2026-10-14: prompt suggestions on; start_session turns
+            # it into CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=true), partners (2026-11-24:
+            # opencode only, OPENCODE_PARTNERS=1). They follow the agent flags to keep.
+            _markers, _merr = _flag_markers(body, provider)
+            if _merr:
+                return self._json({"error": _merr}, 400)
+            cfg["CC_FLAGS"] = " ".join([f for f in [stored_flags] if f] + _markers)
             if provider == "iterm2":
                 # Optional since 2026-08-12: with no pane id, the session
                 # spawns its own iTerm2 tab at first start (see
@@ -39763,7 +39901,12 @@ class CCHandler(BaseHTTPRequestHandler):
             effective_dir = worktree_path or dir_path
             if effective_dir:
                 _ensure_memory(name, effective_dir)
-            resp = {"ok": True, "message": f"created {name}"}
+            # name + flags echoed: a client can tell this box kept the flags it sent
+            # (an older server ignores "flags" and does not echo them)
+            resp = {"ok": True, "message": f"created {name}" + (f" ({_acct_note})" if _acct_note else ""),
+                    "name": name, "flags": cfg["CC_FLAGS"]}
+            if cfg.get("CC_ACCOUNT"):
+                resp["account"] = cfg["CC_ACCOUNT"]
             if worktree_path:
                 resp["worktree"] = worktree_path
                 resp["branch"] = cfg.get("CC_BRANCH", "")
@@ -41749,6 +41892,9 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     last_save = _last_log_save.get(name, 0)
                     if now - last_save >= _LOG_SAVE_INTERVAL:
                         threading.Thread(target=save_session_log, args=(name, output), daemon=True).start()
+                # "running" tells a client whether this is a live screen or a stopped
+                # session's saved log (amux -H <box> peek says which, 2026-11-27).
+                running = bool(output) or is_running(name)
                 saved = load_session_log(name, tail_bytes=65_536)
                 if saved:
                     live = output.strip() if output else ""
@@ -41756,8 +41902,8 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         combined = saved.rstrip() + "\n\n" + live + "\n"
                     else:
                         combined = saved
-                    return self._json({"name": name, "output": combined, "saved": True})
-                return self._json({"name": name, "output": output or "(no output)"})
+                    return self._json({"name": name, "output": combined, "saved": True, "running": running})
+                return self._json({"name": name, "output": output or "(no output)", "running": running})
             if action == "info":
                 info = get_session_info(name)
                 return self._json(info)
@@ -42033,7 +42179,10 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 ok, msg = send_keys(name, keys)
                 if ok:
                     _update_meta(name, last_send=int(time.time()))
-                code = 200 if ok else (409 if msg == "not running" else 500)
+                # 409 = not running; 400 = a key the box does not send (the caller's
+                # mistake, not a server error: it used to answer 500)
+                code = 200 if ok else (409 if msg == "not running" else
+                                       400 if "not in allowed set" in msg else 500)
                 return self._json({"ok": ok, "message": msg}, code)
             if action == "memory":
                 body = self._read_body()
@@ -42177,16 +42326,21 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                             fresh_start = True
                             _i += 1
                             continue
+                        # Attaching is the client's business: an older client sent
+                        # --detach on to here, and it reached the agent's argv.
+                        if _t in ("--no-attach", "--detach"):
+                            _i += 1
+                            continue
                         # exec/register-only options must never reach the agent
                         # binary (2026-07-30: `start … --dir …` was forwarded to
                         # claude → `error: unknown option '--dir'`, and the
                         # fallback ladder retried the same bad flags).
                         _base = _t.split("=", 1)[0]
-                        if _base in ("--dir", "--worktree", "--desc"):
-                            if _base == "--dir":
+                        if _base in ("--dir", "--pwd", "--worktree", "--desc"):
+                            if _base in ("--dir", "--pwd"):
                                 _cur_dir = parse_env_file(CC_SESSIONS / f"{name}.env").get("CC_DIR", "?")
                                 return self._json({"ok": False, "error":
-                                    f"--dir is an exec/register option; session '{name}' already runs "
+                                    f"{_base} is an exec/register option; session '{name}' already runs "
                                     f"in {_cur_dir}; start runs it in that folder"}, 400)
                             return self._json({"ok": False, "error":
                                 f"{_base} is an exec/register option, not a start flag "
@@ -42404,19 +42558,42 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
 
                 # Rename
                 if "rename" in body:
-                    new_name = re.sub(r'[^a-zA-Z0-9_-]', '-', body["rename"].strip())
-                    if not new_name:
-                        return self._json({"error": "invalid name"}, 400)
+                    # the one name rule (see POST /api/sessions): refused, not rewritten
+                    new_name = str(body["rename"] or "").strip()
+                    if not _VALID_SESSION_NAME_RE.match(new_name):
+                        return self._json({"error": f"invalid session name '{new_name}' ({_SESSION_NAME_RULE})"}, 400)
                     new_file = CC_SESSIONS / f"{new_name}.env"
                     if new_file.exists() and new_name != name:
                         return self._json({"error": f"'{new_name}' already exists"}, 409)
-                    # Rename tmux session if running
+                    # Rename tmux session if running, and its window (the name the
+                    # status line and the tab show), as amux-rename does
                     if is_running(name):
                         subprocess.run(
                             ["tmux", "rename-session", "-t", tmux_target(name), tmux_name(new_name)],
                             capture_output=True, timeout=5,
                         )
+                        subprocess.run(["tmux", "rename-window", "-t", f"={tmux_name(new_name)}", new_name],
+                                       capture_output=True, timeout=5)
                     env_file.rename(new_file)
+                    # the name written inside the file follows (amux-rename rewrites it too)
+                    if cfg.get("CC_NAME") not in (None, new_name):
+                        cfg["CC_NAME"] = new_name
+                        _write_env(new_file, cfg)
+                    # the origin record and the color pin are kept under the name too
+                    try:
+                        _old_o, _new_o = _amux_home / "origins" / name, _amux_home / "origins" / new_name
+                        if _old_o.exists() and not _new_o.exists():
+                            _old_o.rename(_new_o)
+                    except OSError:
+                        pass
+                    _ac = str(Path(__file__).resolve().parent / "amux-color")
+                    if not (os.path.isfile(_ac) and os.access(_ac, os.X_OK)):
+                        _ac = shutil.which("amux-color") or ""
+                    if _ac:
+                        try:
+                            subprocess.run([_ac, "rename", name, new_name], capture_output=True, timeout=10)
+                        except Exception:
+                            pass
                     # Migrate memory file
                     old_mem = CC_MEMORY / f"{name}.md"
                     new_mem = CC_MEMORY / f"{new_name}.md"
@@ -42533,16 +42710,36 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     old_account = _session_account(cfg)
                     if account_val == old_account:
                         return self._json({"ok": True, "message": f"account already set to {account_val}"})
-                    if is_running(name):
-                        return self._json({"error": f"session '{name}' is running; stop it first, then change the account"}, 409)
                     if account_val in ("team", "team2") and not _account_slot_path(account_val).is_file():
                         return self._json({"error": f"the {account_val} account is not set up on this box"}, 400)
+                    was_running = is_running(name)
                     cfg["CC_ACCOUNT"] = account_val
                     _write_env(env_file, cfg)
                     # (the request wrapper already invalidates the sessions snapshot
                     # for any successful non-GET on /api/sessions)
                     slog(f"[account] {name}: {old_account} -> {account_val} ({_account_badge(account_val)})")
-                    return self._json({"ok": True, "message": f"account set to {account_val} ({_account_badge(account_val)}); takes effect on next start"})
+                    # A running session is restarted on the new account, the same rule as
+                    # provider/model/dir here and as `amux account` on the CLI (2026-11-27):
+                    # the agent is asked to exit, and the conversation resumes.
+                    restarted = False
+                    if was_running:
+                        try:
+                            work_dir_pre = str(Path(cfg.get("CC_DIR", str(Path.home()))).expanduser().resolve())
+                            conv_id = _live_conv_id(name, work_dir_pre)
+                            if conv_id:
+                                meta_pre = _load_meta(name)
+                                if meta_pre.get("cc_conversation_id") != conv_id:
+                                    meta_pre["cc_conversation_id"] = conv_id
+                                    _save_meta(name, meta_pre)
+                            _stop_session_for_restart(name, cur_provider)
+                            ok_r, _ = start_session(name, account_override=account_val)
+                            restarted = bool(ok_r)
+                        except Exception:
+                            pass
+                    tail = ("; session restarted on it" if restarted else
+                            "; the session could not be restarted, start it again to use it" if was_running else
+                            "; takes effect on next start")
+                    return self._json({"ok": True, "message": f"account set to {account_val} ({_account_badge(account_val)}){tail}"})
 
                 # Change model
                 if "model" in body:
@@ -42691,9 +42888,18 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
 
                 # Change directory
                 if "dir" in body:
-                    new_dir = body["dir"].strip()
+                    new_dir = str(body["dir"] or "").strip()
                     if _env_unsafe(new_dir):
                         return self._json({"error": "a folder path " + _ENV_UNSAFE_MSG}, 400)
+                    # `amux -H <box> dir <name> <path>` and the dashboard: a folder on
+                    # this box, absolute or ~/…, created when missing (as create does).
+                    # A relative path would be resolved against wherever the agent starts.
+                    if not new_dir or not (new_dir.startswith("/") or new_dir == "~" or new_dir.startswith("~/")):
+                        return self._json({"error": f"the folder must be an absolute path or ~/…, got '{new_dir}'"}, 400)
+                    try:
+                        Path(new_dir).expanduser().mkdir(parents=True, exist_ok=True)
+                    except OSError as ex:
+                        return self._json({"error": f"cannot create the folder {new_dir}: {ex.strerror or ex}"}, 400)
                     old_dir = cfg.get("CC_DIR", "")
                     cfg["CC_DIR"] = new_dir
                     _write_env(env_file, cfg)
@@ -42719,6 +42925,14 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     cfg["CC_DESC"] = body["desc"].strip()
                     _write_env(env_file, cfg)
                     return self._json({"ok": True, "message": "description updated"})
+
+                # Set the pin (2026-11-27): {"pinned": true|false} — deterministic, for
+                # `amux -H <box> pin <name> on|off` and `rm --force` (toggle_pin flips).
+                if "pinned" in body:
+                    want_pin = bool(body.get("pinned"))
+                    cfg["CC_PINNED"] = "1" if want_pin else ""
+                    _write_env(env_file, cfg)
+                    return self._json({"ok": True, "message": "pinned" if want_pin else "unpinned"})
 
                 # Toggle pin
                 if body.get("toggle_pin"):
@@ -43490,18 +43704,42 @@ def main():
         return
     port = 8822
     bind_hosts = ["0.0.0.0"]
+    # Every argument is either understood or refused (exit 2). Until 2026-11-27 anything
+    # else was skipped without a word, so `--bind=127.0.0.1` (or a typo) left the
+    # dashboard on 0.0.0.0, every interface, while the user believed it was loopback.
+    _usage = "usage: amux serve [port] [--bind host[,host,...]] [--no-tls]"
+
+    def _arg_error(msg):
+        sys.stderr.write(f"amux serve: {msg}\n{_usage}\n")
+        sys.exit(2)
+
     _args = sys.argv[1:]
     _i = 0
     while _i < len(_args):
         _a = _args[_i]
-        if _a == "--bind" and _i + 1 < len(_args):
-            bind_hosts = [h.strip() for h in _args[_i + 1].split(",") if h.strip()]
-            _i += 2
+        if _a == "--bind" or _a.startswith("--bind="):
+            if _a == "--bind":
+                if _i + 1 >= len(_args) or _args[_i + 1].startswith("-"):
+                    _arg_error("--bind needs a host (e.g. --bind 127.0.0.1)")
+                _val = _args[_i + 1]
+                _i += 2
+            else:
+                _val = _a[len("--bind="):]
+                _i += 1
+            bind_hosts = [h.strip() for h in _val.split(",") if h.strip()]
+            if not bind_hosts:
+                _arg_error("--bind needs a host (e.g. --bind 127.0.0.1)")
+        elif _a == "--no-tls":
+            _i += 1
         elif _a.isdigit():
             port = int(_a)
+            if not 0 < port < 65536:
+                _arg_error(f"port {_a} is out of range (1-65535)")
             _i += 1
+        elif _a.startswith("-"):
+            _arg_error(f"unknown option '{_a}'")
         else:
-            _i += 1
+            _arg_error(f"unexpected argument '{_a}' (the port is a number)")
     lan_ip = get_lan_ip()
     no_tls = "--no-tls" in sys.argv
 

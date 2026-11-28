@@ -4,7 +4,7 @@ amux-nui-public is a build of [**amux**](https://github.com/mixpeek/amux) that i
 
 It is the setup that I use every day, with the personal parts taken out. It contains no machine names, accounts, addresses or credentials, so you add your own.
 
-**Version 0.7.7**, which bundles a modified **amux 0.9.23** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
+**Version 0.7.8**, which bundles a modified **amux 0.9.24** (`bin/amux`, `bin/amux-server.py`, `bin/amux-remote`). `amux version` prints both numbers.
 
 It runs on **macOS** and **Linux**, and on **Windows inside WSL2**. [What you need](#what-you-need) lists what each system needs.
 

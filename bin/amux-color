@@ -108,6 +108,23 @@ def die(msg):
     sys.exit(1)
 
 
+def usage_die(line):
+    """A wrong command line: the usage line on stderr, exit 2 (the same rule as amux)."""
+    sys.stderr.write("usage: %s\n" % line)
+    sys.exit(2)
+
+
+def bad_opt(where, opt):
+    sys.stderr.write("amux color: %s: unknown option '%s' (see amux color -h)\n" % (where, opt))
+    sys.exit(2)
+
+
+RECOLOR_HELP = """amux recolor [<name> ...]   repaint the open tab(s) of running sessions (default: all)
+
+Each session's tab takes the color amux color shows for it (pinned, or the automatic one).
+A session that is not running has no tab to repaint. See also: amux color -h"""
+
+
 def color_or_die(spec):
     try:
         return parse_color(spec)
@@ -526,7 +543,7 @@ def main(argv):
         with Store() as s:
             if len(argv) > 1:
                 if argv[1] not in MODES:
-                    die("unknown mode '%s' — one of: %s" % (argv[1], ", ".join(MODES)))
+                    usage_die("amux color --mode [%s]   (got '%s')" % ("|".join(MODES), argv[1]))
                 s.data["_mode"] = argv[1]
             print("mode: %s" % s.mode)
         return 0
@@ -554,7 +571,7 @@ def main(argv):
     if cmd in ("ensure", "emit", "osc", "get"):
         one, force = opt("--color"), flag("--force")
         if len(argv) < 2:
-            die("usage: amux-color %s <name>" % cmd)
+            usage_die("amux-color %s <name> [--color C]" % cmd)
         name = argv[1]
         with Store(write=cmd != "get") as s:
             chosen = resolve(s, name, oneshot=one, record=cmd != "get")
@@ -572,7 +589,7 @@ def main(argv):
         return 0
     if cmd == "rename":
         if len(argv) != 3:
-            die("usage: amux-color rename <old> <new>")
+            usage_die("amux-color rename <old> <new>")
         with Store() as s:
             if argv[1] in s.sessions:
                 s.sessions[argv[2]] = s.sessions.pop(argv[1])
@@ -583,24 +600,43 @@ def main(argv):
                 s.sessions.pop(n, None)
         return 0
     if cmd == "recolor":
+        # -h used to be taken as a session name ("-h: not running")
+        if any(a in ("-h", "--help") for a in argv[1:]):
+            print(RECOLOR_HELP)
+            return 0
+        for a in argv[1:]:
+            if a.startswith("-"):
+                bad_opt("recolor", a)
         run = running()
-        names = argv[1:] or sorted(run)
+        named = argv[1:]
+        names = named or sorted(run)
+        rc = 0
         with Store() as s:
             for n in names:
+                # a name given by hand must be a session (all running ones are, by definition)
+                if named and not os.path.isfile(os.path.join(SESSIONS, n + ".env")):
+                    sys.stderr.write("amux color: session '%s' not found on this box (see: amux ls)\n" % n)
+                    rc = 1
+                    continue
                 if n not in run:
-                    print("%s: not running" % n)
+                    print("session '%s' is not running — no tab to repaint" % n)
                     continue
                 chosen = resolve(s, n, run=run)
                 k = paint_clients(n, osc(chosen))
                 print("%s %s -> %s (%d attached terminal%s)"
                       % (swatch(chosen), n, chosen["color"] if chosen else "none", k, "" if k == 1 else "s"))
-        return 0
+        return rc
 
     # amux color <name> [<color>|next|auto|none|--reroll]
     name = cmd
+    if name.startswith("-"):
+        bad_opt("color", name)
     reroll = flag("--reroll")
+    for a in argv[1:]:
+        if a.startswith("-"):
+            bad_opt("color", a)
     if not os.path.isfile(os.path.join(SESSIONS, name + ".env")):
-        die("no session '%s' (see: amux ls)" % name)
+        die("session '%s' not found on this box (see: amux ls)" % name)
     val = argv[1] if len(argv) > 1 else None
     run = running()
     with Store() as s:

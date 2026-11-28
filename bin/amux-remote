@@ -27,28 +27,13 @@
 #   AMUX_MOSH      1 = attach over mosh by default (same as --mosh; --cc overrides). Set it
 #                  in the environment (all boxes) or in the box's .env (that box only).
 #
-# Usage:
-#   amux-remote                         list configured boxes (~/.amux/remotes/*.env)
-#   amux-remote <box> ls [-c] [--bare] [--names]  list sessions (-c = compact grid; --bare = no header; --names = names only)
-#   amux-remote <box> pick [--sessionid N]  pick one of <box>'s sessions and attach (via ccjump);
-#                                       --sessionid N = row N of `ls -c`: attach, or start + attach
-#   amux-remote <box> box               print the configured box name this spelling resolves to
-#   amux-remote <box> attach <name> [--cc|--plain|--mosh] [--color <c>]   SSH in and attach (native iTerm2 tabs in -CC mode;
-#                                       --mosh = plain tmux over mosh: instant local echo on
-#                                       laggy links, survives network changes/sleep)
-#   amux-remote <box> peek <name> [lines]    print a session's recent output (default 30, like `amux peek`)
-#   amux-remote <box> send <name> <text...>  send text/prompt to a session
-#   amux-remote <box> start <name> [flags...]   start a session (flags forwarded
-#                                       one-shot to the launch) and, when run
-#                                       interactively (stdout is a TTY), ATTACH —
-#                                       same SSH attach as amux-up, honors
-#                                       --cc/--plain/--mosh. --no-attach (or piping /
-#                                       scripting) skips the attach and prints
-#                                       the attach hint instead.
-#   amux-remote <box> stop <name>       stop a session (takes no flags)
-#   amux-remote <box> info <name>       session status/meta as JSON
-#   amux-remote <box> url               print the box's server URL
-#   amux-remote <box> curl <path> [args...]  raw authenticated curl against the API
+# Usage: the full list is usage() below (amux-remote help, amux -H help); in short
+#   amux-remote                          list configured boxes (~/.amux/remotes/*.env)
+#   amux-remote add <box>                configure one (reads its address + token over ssh)
+#   amux-remote <box> <verb> [args...]   ls pick attach peek send exec register start stop
+#                                        rm pin rename dir info provider account model
+#                                        full-access url curl box — the local amux's verbs,
+#                                        with the differences `amux help remote` lists
 #
 #   --ssh   LAST RESORT: run the verb through the box's own `amux` over SSH
 #           instead of the REST API, for when the dashboard is down or its port
@@ -62,9 +47,9 @@ set -euo pipefail
 # AMUX_FORCE_COLOR=1 forces it on under capture; NO_COLOR turns it off.
 if [[ -n "${AMUX_FORCE_COLOR:-}" && "${AMUX_FORCE_COLOR:-}" != "0" ]] \
    || { [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && [[ "${TERM:-dumb}" != "dumb" ]]; }; then
-  BOLD=$'\033[1m' DIM=$'\033[2m' GREEN=$'\033[32m' CYAN=$'\033[36m' RED=$'\033[31m' RESET=$'\033[0m'
+  BOLD=$'\033[1m' DIM=$'\033[2m' GREEN=$'\033[32m' CYAN=$'\033[36m' RED=$'\033[31m' YELLOW=$'\033[33m' RESET=$'\033[0m'
 else
-  BOLD='' DIM='' GREEN='' CYAN='' RED='' RESET=''
+  BOLD='' DIM='' GREEN='' CYAN='' RED='' YELLOW='' RESET=''
 fi
 
 # amux-remote REQUIRES a box. The first argument names a configured box whose
@@ -73,6 +58,7 @@ fi
 # selected + sourced in the dispatch block at the bottom (once die()/usage() exist).
 AMUX_REMOTES_DIR="${CC_HOME:-$HOME/.amux}/remotes"
 BOX="" BOX_ENV=""   # set by the dispatch block once a box is chosen
+CMD=""              # the verb being run (for usage lines), set by the dispatch block
 # The name the user typed for this tool: amux sets AMUX_PROG="amux -H" when `amux -H <box> ...`
 # hands off here, so every usage line, hint and error says what to type again. Read once and
 # unset, so a tool started from here does not inherit the wrong name.
@@ -177,6 +163,16 @@ _resolve_box_by_hostline() {
 }
 
 die() { echo "${RED}error:${RESET} $*" >&2; exit 1; }
+# ONE wording and exit code for the common errors (2026-11-27), the same as amux's own:
+#   usage: <command line>                                   exit 2  (typed wrong)
+#   <cmd>: unknown option '<opt>' (see <cmd> -h)            exit 2
+#   <cmd>: unexpected argument '<arg>' (…)                  exit 2
+#   session '<name>' not found on <box> (see: … ls)         exit 1  (it did not work)
+#   session '<name>' is not running on <box> (start it: …)  exit 1  (0 for stop: nothing to do)
+# Errors go to stderr; the ✓ lines of a success stay on stdout.
+usage_die() { echo "usage: $*" >&2; exit 2; }
+bad_opt()   { echo "${RED}error:${RESET} $ME $BOX_ARG $CMD: unknown option '$1' (see $ME $BOX_ARG $CMD -h)" >&2; exit 2; }
+bad_arg()   { echo "${RED}error:${RESET} $ME $BOX_ARG $CMD: unexpected argument '$1'${2:+ — $2}" >&2; exit 2; }
 
 # --ssh: run the verb through the box's own `amux` CLI over SSH instead of the
 # REST API. A LAST RESORT, never automatic — amux-remote assumes the dashboard
@@ -242,21 +238,61 @@ _run_over_ssh() {
 
 require_config() {
   [[ -n "${AMUX_URL:-}" ]]   || die "AMUX_URL is not set (missing from $BOX_ENV)"
-  [[ -n "${AMUX_TOKEN:-}" ]] || die "AMUX_TOKEN is not set (get it from box '$BOX's ~/.amux/auth_token)"
+  [[ -n "${AMUX_TOKEN:-}" ]] || die "AMUX_TOKEN is not set in $BOX_ENV (configure the box again: $ME add $BOX --force)"
   AMUX_URL="${AMUX_URL%/}"  # strip trailing slash
 }
 
 # Session names are spliced into URL paths and (for attach) a remote shell
 # command line — whitelist them hard. Blocks command injection like
 #   amux-remote example-host attach "x'; invalid input #"
-# and keeps URLs encoding-free. Mirrors the server's _VALID_SESSION_NAME_RE
-# (legacy dots tolerated for pre-existing sessions; leading '-' and '.' not).
+# and keeps URLs encoding-free.
+# TWO rules, the same everywhere (amux, amux-remote, the server, amux-rename):
+#   a NEW name (exec, register, rename): letters, digits, '_' and '-', not starting
+#     with '-' — the local `amux register` rule and the server's _VALID_SESSION_NAME_RE;
+#   an EXISTING name being looked up may also hold a '.', for a session an older
+#     server created (never a leading '-' or '.').
+NAME_RULE="allowed: letters, digits, '_' and '-'; it cannot start with '-'"
 validate_remote_name() {
-  local n="$1"
+  local n="$1" c="$CMD"
+  [[ -n "$c" ]] || c="<command>"
   case "$n" in
-    ""|-*|.*) die "invalid session name: '$n'" ;;
-    *[!A-Za-z0-9_.-]*) die "invalid session name '$n' (allowed: letters, digits, '_', '-', '.')" ;;
+    "")  usage_die "$ME $BOX_ARG $c <name> …" ;;
+    -*)  bad_opt "$n" ;;
+    .*|*[!A-Za-z0-9_.-]*) echo "${RED}error:${RESET} invalid session name '$n' ($NAME_RULE)" >&2; exit 2 ;;
   esac
+}
+validate_new_name() {
+  local n="$1"
+  validate_remote_name "$n"
+  case "$n" in
+    *.*) echo "${RED}error:${RESET} invalid session name '$n' ($NAME_RULE)" >&2; exit 2 ;;
+  esac
+}
+
+# The server's answer to a session request, in the words the local amux uses.
+# $1 = session name, $2 = the server's message. Prints one line.
+_remote_msg() {
+  local name="$1" msg="$2"
+  [[ -n "$msg" ]] || msg=failed
+  case "$msg" in
+    "not running"|*"is not running"*)
+      printf "session '%s' is not running on %s (start it: %s %s start %s)" "$name" "$BOX" "$ME" "$BOX_ARG" "$name" ;;
+    *"not found"*)
+      printf "session '%s' not found on %s (see: %s %s ls)" "$name" "$BOX" "$ME" "$BOX_ARG" ;;
+    *) printf '%s' "$msg" ;;
+  esac
+}
+
+# A JSON answer that is an error ({"error": …} or {"ok": false, …}): print it in the
+# local wording on stderr and exit 1. Anything else returns quietly.
+_die_on_error() { # $1 = session name, $2 = body
+  local m
+  m=$(printf '%s' "$2" | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+if isinstance(d, dict) and (d.get("error") or d.get("ok") is False):
+    print(str(d.get("error") or d.get("message") or "failed"))' 2>/dev/null) || true
+  [[ -z "$m" ]] || die "$(_remote_msg "$1" "$m")"
 }
 
 # api <METHOD> <path> [curl args...]
@@ -312,8 +348,8 @@ cmd_ls() {
       -c|--compact)        compact=1 ;;
       --bare|--no-header)  bare=1 ;;
       --names)             names=1 ;;
-      -*)                  die "unknown ls option: $1 (try: -c/--compact, --bare, --names)" ;;
-      *)                   die "unexpected argument: $1 (usage: $ME $BOX_ARG ls [-c] [--bare])" ;;
+      -*)                  bad_opt "$1" ;;
+      *)                   bad_arg "$1" "it takes no name; usage: $ME $BOX_ARG ls [-c] [--bare] [--names]" ;;
     esac
     shift
   done
@@ -378,7 +414,7 @@ shells  = sum(1 for s in data if state(s) == "shell")
 def short_model(s):
     m = ""
     mm = re.search(r"--model\s+(\S+)", s.get("flags","") or "")
-    if mm: m = mm.group(1)
+    if mm: m = mm.group(1).strip("\x27\x22")   # stored flags are shell-quoted
     if not m:
         am = s.get("active_model","") or ""
         for tag in ("opus","sonnet","haiku","fable"):
@@ -484,16 +520,16 @@ cmd_peek() {
   for a in "$@"; do
     case "$a" in
       --raw) raw=1 ;;
-      -*)    die "unknown peek option: $a (usage: $ME $BOX_ARG peek [--raw] <name> [lines])" ;;
+      -*)    bad_opt "$a" ;;
       *)     if [[ -z "$name" ]]; then name="$a"
              elif [[ -z "$lines" ]]; then lines="$a"
-             else die "unexpected argument: $a (usage: $ME $BOX_ARG peek [--raw] <name> [lines])"; fi ;;
+             else bad_arg "$a" "usage: $ME $BOX_ARG peek [--raw] <name> [lines]"; fi ;;
     esac
   done
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG peek [--raw] <name> [lines]"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG peek [--raw] <name> [lines]"
   lines="${lines:-30}"   # same default as the local `amux peek`
   validate_remote_name "$name"
-  [[ "$lines" =~ ^[0-9]+$ ]] || die "lines must be a number, got: $lines"
+  [[ "$lines" =~ ^[0-9]+$ ]] || usage_die "$ME $BOX_ARG peek [--raw] <name> [lines]   (lines is a number, default 30; got '$lines')"
   local body; body=$(api GET "/api/sessions/${name}/peek?lines=${lines}")
   # The server falls back to the RAW pane log when the live capture is short, and
   # that log replays every escape the agent ever wrote — terminal QUERIES (claude's
@@ -502,11 +538,17 @@ cmd_peek() {
   # OSC 52 clipboard writes. So by default keep only SGR colors and drop everything
   # else: OSC/DCS/APC strings, non-SGR CSI, other escapes, stray C0 controls.
   # --raw prints the server's bytes untouched.
-  printf '%s' "$body" | AMUX_PEEK_RAW=$raw python3 -c '
+  _die_on_error "$name" "$body"
+  # A stopped session: the box answers with its saved log; say whose and why (the
+  # local peek has no saved log to show and says the session is not running).
+  local note="session '$name' is not running on $BOX — its last saved output:"
+  printf '%s' "$body" | AMUX_PEEK_RAW=$raw AMUX_PEEK_NOTE="$note" python3 -c '
 import json, os, re, sys
 d = json.load(sys.stdin)
 if isinstance(d, dict) and d.get("error"):
     sys.exit("server: " + str(d["error"]))
+if isinstance(d, dict) and d.get("running") is False:
+    sys.stderr.write(os.environ.get("AMUX_PEEK_NOTE", "") + "\n")
 out = d.get("output", "")
 if os.environ.get("AMUX_PEEK_RAW") != "1":
     out = re.sub(r"\x1b[\]P_^X].*?(?:\x07|\x1b\\|$)", "", out, flags=re.S)   # OSC/DCS/APC/PM/SOS strings
@@ -518,17 +560,41 @@ if os.environ.get("AMUX_PEEK_RAW") != "1":
 print(out)'
 }
 
+# send <name> <text...> | send <name> --keys <key>...  — like the local `amux send`.
+# --keys goes to the box's /keys endpoint, one named key per request (the box sends
+# only named keys: Enter, Escape, C-c, arrows, F1-F12, ...); until 2026-11-27 the words
+# "--keys C-c" were typed into the agent as text. A failure exits 1 (it said
+# "✓ sent"-style lines on stdout and exited 0 for a missing session).
 cmd_send() {
   require_config
   local name="${1:-}"; shift || true
-  local text="$*"
-  [[ -n "$name" && -n "$text" ]] || die "usage: $ME $BOX_ARG send <name> <text...>"
+  local usage="$ME $BOX_ARG send <name> <text...>   or   $ME $BOX_ARG send <name> --keys <key>..."
+  [[ -n "$name" ]] || usage_die "$usage"
   validate_remote_name "$name"
-  local payload
+  local payload body ok
+  if [[ "${1:-}" == "--keys" ]]; then
+    shift
+    [[ $# -gt 0 ]] || usage_die "$usage"
+    local k
+    for k in "$@"; do
+      payload=$(python3 -c 'import json,sys; print(json.dumps({"keys": sys.argv[1]}))' "$k")
+      body=$(api POST "/api/sessions/${name}/keys" -H 'Content-Type: application/json' -d "$payload")
+      ok=$(_resp_ok_msg "$body")
+      [[ "${ok%%$'\n'*}" == 1 ]] || die "$(_remote_msg "$name" "${ok#*$'\n'}")"
+    done
+    echo "${GREEN}✓${RESET} sent keys to $name: $*"
+    return 0
+  fi
+  local text="$*"
+  [[ -n "$text" ]] || usage_die "$usage"
   payload=$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$text")
-  local body; body=$(api POST "/api/sessions/${name}/send" -H 'Content-Type: application/json' -d "$payload")
-  printf '%s' "$body" \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(("\033[32m✓\033[0m sent" if d.get("ok") else "\033[31m✗\033[0m "+str(d.get("message","failed"))))'
+  body=$(api POST "/api/sessions/${name}/send" -H 'Content-Type: application/json' -d "$payload")
+  ok=$(_resp_ok_msg "$body")
+  [[ "${ok%%$'\n'*}" == 1 ]] || die "$(_remote_msg "$name" "${ok#*$'\n'}")"
+  case "${ok#*$'\n'}" in
+    *auto-woke*) echo "${GREEN}✓${RESET} sent to $name: $text ${DIM}(it was stopped: $BOX started it first)${RESET}" ;;
+    *)           echo "${GREEN}✓${RESET} sent to $name: $text" ;;
+  esac
 }
 
 # Is <name> running on this box, per the server's authoritative flag?
@@ -544,11 +610,27 @@ for s in (data or []):
 sys.exit(1)' "$1"
 }
 
+# What a session on the box is doing, from its info: agent | shell | stopped |
+# missing, or nothing when the box cannot tell (then the caller goes on as before).
+_remote_state() {
+  local body
+  body=$(api GET "/api/sessions/$1/info" 2>/dev/null) || return 0
+  printf '%s' "$body" | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+if not isinstance(d, dict): sys.exit(0)
+if d.get("error"):
+    print("missing" if "not found" in str(d["error"]) else ""); sys.exit(0)
+print(d.get("state") or ("agent" if d.get("running") else "stopped"))' 2>/dev/null || true
+}
+
 # Parse a server JSON response into "<0|1>\n<message>" (1 = ok).
 _resp_ok_msg() {
+  # An answer that does not parse is a failure (it used to count as success).
   printf '%s' "$1" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
-except Exception: d={}
+except Exception:
+    print("0"); print("the box gave an answer that is not JSON"); sys.exit(0)
 bad = (isinstance(d,dict) and d.get("error")) or (isinstance(d,dict) and not d.get("ok",True))
 print("0" if bad else "1")
 print(str((d.get("error") or d.get("message","failed")) if isinstance(d,dict) else "failed"))' 2>/dev/null
@@ -559,12 +641,12 @@ print(str((d.get("error") or d.get("message","failed")) if isinstance(d,dict) el
 # survive spaces/quotes: shlex.join here -> server validates -> _shell_quote_flags
 # re-quotes per token at spawn. NOTE: for claude sessions resume is AUTOMATIC
 # (the server auto-resumes the newest conversation on start), so --continue is
-# rarely needed — but it is forwarded and honored. `start` does NOT attach;
-# attach with: amux-up <box> <name>.
+# rarely needed — but it is forwarded and honored. When run from a terminal it then
+# attaches (as the local `amux start` does); --no-attach/--detach or piped output skip it.
 cmd_start() {
   require_config
   local name="${1:-}"; shift || true
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG start <name> [flags...]"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG start <name> [--fresh] [--no-attach] [--provider <p>] [--account <a>] [--full-access] [--cc|--plain|--mosh] [--color <c>] [agent flags...]"
   validate_remote_name "$name"
   # Split amux-level options from one-shot launch flags. --no-attach and the
   # attach-lane flags (--cc/--plain/--mosh) are OURS, never forwarded to the server.
@@ -572,7 +654,8 @@ cmd_start() {
   for _a in "$@"; do
     if (( _color_next )); then attach_flags+=("$_a"); _color_next=0; continue; fi
     case "$_a" in
-      --no-attach)  no_attach=1; continue ;;
+      # --detach is the local start's other spelling: it used to reach the agent's argv
+      --no-attach|--detach)  no_attach=1; continue ;;
       --cc|--plain|--mosh) attach_flags+=("$_a"); continue ;;
       --color)      attach_flags+=("$_a"); _color_next=1; continue ;;   # painted at attach
       --color=*)    attach_flags+=("$_a"); continue ;;
@@ -581,9 +664,9 @@ cmd_start() {
     # --dir …` reached claude's argv → `error: unknown option '--dir'`).
     case "${_a%%=*}" in
       --pwd)
-        die "--pwd is local-only: your current directory exists on THIS machine, not on $BOX (use: $ME $BOX_ARG exec $name --dir <path>)" ;;
+        die "--pwd is local-only: your current directory exists on THIS machine, not on $BOX (move the session: $ME $BOX_ARG dir $name <path on $BOX>)" ;;
       --dir)
-        die "--dir is an exec/register option; 'start' runs the session in its registered folder ($ME $BOX_ARG info $name shows it)" ;;
+        die "--dir is an exec/register option; 'start' runs the session in its registered folder (show or change it: $ME $BOX_ARG dir $name [<path>])" ;;
       --worktree|--desc)
         die "${_a%%=*} is an exec/register option, not a start flag (it is set when the session is created: $ME $BOX_ARG exec <new name> ${_a%%=*} …)" ;;
     esac
@@ -601,53 +684,17 @@ cmd_start() {
   fi
   local ok; ok=$(_resp_ok_msg "$resp")
   local good="${ok%%$'\n'*}" msg="${ok#*$'\n'}"
-  if [[ "$good" != "1" ]]; then
-    echo "${RED}✗${RESET} ${msg:-failed}"; return 1
-  fi
+  [[ "$good" == "1" ]] || die "$(_remote_msg "$name" "$msg")"
   echo "${GREEN}✓${RESET} ${msg:-started}"
   # ATTACH WHEN INTERACTIVE (2026-07-30: one command, not two) — consistent with local `amux start`, which already attaches.
   # Suppressed when: --no-attach, stdout is not a TTY (scripts/cron/pipes), or
   # AMUX_NO_HINT is set (a wrapper like amux-up is about to attach itself).
   if (( ! no_attach )) && [[ -t 1 ]] && [[ -z "${AMUX_NO_HINT:-}" ]]; then
-    cmd_attach "$name" ${attach_flags[@]+"${attach_flags[@]}"}   # execs ssh — does not return
+    _ATTACH_AFTER_START=1 cmd_attach "$name" ${attach_flags[@]+"${attach_flags[@]}"}   # execs ssh — does not return
   fi
   # No attach happened — say what the next step is, unless a wrapper
   # (amux-up) set AMUX_NO_HINT=1 because it attaches right after.
   [[ -n "${AMUX_NO_HINT:-}" ]] || echo "${DIM}  attach: $ME $BOX_ARG attach $name${RESET}"
-}
-
-# amux-remote <box> rm <name> — remove a session on the remote box (server
-# stops it first if running, and deletes its .env/meta/memory/log). Added
-# 2026-08-12; previously amux-remote had no delete verb at all.
-#
-# AUTHORIZATION: the server's delete endpoint is deliberately gated — it exists
-# to stop a SESSION/AGENT from deleting sessions via the bare API. It opens for
-# either AMUX_ALLOW_AGENT_SESSION_DELETE=1 on the remote box, or a request
-# carrying X-Amux-UI-Token — the guard token the dashboard embeds because its
-# HTML is only served to an authenticated human. amux-remote is the same class
-# of actor as the dashboard (a human typing at their own terminal, holding the
-# box's AMUX_TOKEN), so it derives the SAME guard value the server computes:
-# sha256("amux-ui-guard:" + AUTH_TOKEN)[:40] — see _UI_TOKEN in amux-server.py.
-# The derived value is a one-way hash (not the token), python3 reads AMUX_TOKEN
-# from the environment (exported at config load, never argv), and the header
-# reaches curl via a process-substitution file descriptor, never stdout or ps.
-cmd_rm() {
-  require_config
-  local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG rm <name>"
-  validate_remote_name "$name"
-  shift
-  [[ $# -eq 0 ]] || die "unexpected extra arguments after '$name': $* — '$ME $BOX_ARG rm' takes no flags"
-  local resp ok
-  resp=$(api POST "/api/sessions/${name}/delete" \
-    -H @<(python3 -c 'import hashlib, os; print("X-Amux-UI-Token: " + hashlib.sha256(("amux-ui-guard:" + os.environ["AMUX_TOKEN"]).encode()).hexdigest()[:40])'))
-  ok=$(_resp_ok_msg "$resp")
-  local good="${ok%%$'\n'*}" msg="${ok#*$'\n'}"
-  if [[ "$good" != "1" ]]; then
-    msg="${msg:-failed}"
-    echo "${RED}✗${RESET} ${msg}"; return 1
-  fi
-  echo "${GREEN}✓${RESET} removed ${BOLD}${name}${RESET}"
 }
 
 cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; error loudly on extras
@@ -656,15 +703,22 @@ cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; err
   local name="" now=0 a
   for a in "$@"; do
     case "$a" in
-      --now|--force|-f) [[ "$action" == stop ]] || die "unexpected argument '$a' — '$ME $BOX_ARG $action' takes no flags"
+      --now|--force|-f) [[ "$action" == stop ]] || bad_opt "$a"
                         now=1 ;;
-      -*) die "unexpected argument '$a' — usage: $ME $BOX_ARG ${action}$([[ $action == stop ]] && echo ' [--now]') <name>" ;;
-      *)  [[ -z "$name" ]] || die "unexpected extra arguments after '$name': $a — '$ME $BOX_ARG $action' takes one session"
+      -*) bad_opt "$a" ;;
+      *)  [[ -z "$name" ]] || bad_arg "$a" "it takes one session"
           name="$a" ;;
     esac
   done
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG ${action}$([[ $action == stop ]] && echo ' [--now]') <name>"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG ${action}$([[ $action == stop ]] && echo ' [--now]') <name>"
   validate_remote_name "$name"
+  if [[ "$action" == stop ]]; then
+    # the local stop's answer for a session with nothing to stop (it used to say "✓ stopped")
+    case "$(_remote_state "$name")" in
+      missing) die "$(_remote_msg "$name" "not found")" ;;
+      stopped) echo "${DIM}session '$name' is not running on $BOX${RESET}"; return 0 ;;
+    esac
+  fi
   local resp ok
   if (( now )); then
     # --now: the box ends the tmux session at once, without asking the agent to exit
@@ -674,9 +728,7 @@ cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; err
   fi
   ok=$(_resp_ok_msg "$resp")
   local good="${ok%%$'\n'*}" msg="${ok#*$'\n'}"
-  if [[ "$good" != "1" ]]; then
-    echo "${RED}✗${RESET} ${msg:-failed}"; return 1
-  fi
+  [[ "$good" == "1" ]] || die "$(_remote_msg "$name" "$msg")"
 
   # `stop` is a GRACEFUL stop server-side: it types /exit and the agent takes a few
   # seconds to wind down. Acking the request as "stopped" was misleading, so confirm
@@ -702,170 +754,488 @@ cmd_simple_post() {  # stop/clear — stop takes --now, clear takes nothing; err
   echo "${GREEN}✓${RESET} ${action}"
 }
 
-# ── exec: create + set model + start, in one call ────────────────────────────
-# The local `amux` CLI has `exec` (= register + start). The REST API has NO single
-# equivalent, which is why `amux-remote <box> exec` used to fail with "unknown
-# command". This composes the three calls the server does expose:
-#   POST  /api/sessions                create (name, dir, desc, worktree)
-#   PATCH /api/sessions/<name>/config  set the model — REQUIRED as a second step,
-#                                      because create hardcodes CC_FLAGS="" and so
-#                                      cannot carry a model at all
-#   POST  /api/sessions/<name>/start   start it
-# Each step is checked. If create succeeds but the model PATCH fails we say so
-# loudly and still start — better than silently running the wrong model.
-cmd_exec() {
+# A folder on the box, as typed here. `~` is expanded by the LOCAL shell long before
+# we see it, so an unquoted `--dir ~/x` sends the CALLER's home path. That is right
+# Mac->Mac and WRONG Mac->Linux (/Users/<me> vs /home/<user>), where the server would
+# silently mkdir the wrong tree. So rewrite the caller's OWN home prefix back to `~/`
+# and say so out loud. The remote expands it with Path(...).expanduser(), so `~/x`
+# always means "the remote user's home" — which is what typing `~` meant. Mac->Mac
+# same user this is a no-op; any path outside the caller's home is passed through
+# untouched. Quoting ('~/x') skips this entirely. $1 = path, $2 = what to call it.
+_remote_path() {
+  local p="$1"
+  if [[ "$p" == "$HOME" || "$p" == "$HOME"/* ]]; then
+    if [[ "$p" == "$HOME" ]]; then p="~"; else p="~/${p#"$HOME"/}"; fi
+    printf '%snote: %s%s was expanded by your local shell; sending %s for %s to expand%s\n' "$DIM" "$2" "$1" "$p" "$BOX" "$RESET" >&2
+  fi
+  printf '%s' "$p"
+}
+
+# amux-remote <box> dir <name> [<path>] — show or change the folder a session runs in
+# (the local `amux dir`). The box creates the folder if needed and, when the session
+# is running, restarts it there (the conversation resumes).
+cmd_dir() {
   require_config
-  local name="${1:-}"; shift || true
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG exec <name> --provider claude|codex|gemini|opencode|agy [--dir <path>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--partners] [--desc <text>] [--worktree] [--no-attach] [--cc|--plain|--mosh] (--provider required for a new session)"
+  local name="${1:-}" new="${2:-}"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG dir <name> [<path on $BOX>]"
   validate_remote_name "$name"
-  local dir="" model="" desc="" provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0 sandbox="" partners=0
-  local attach_flags=()
+  [[ $# -le 2 ]] || bad_arg "$3" "usage: $ME $BOX_ARG dir <name> [<path>]"
+  local body
+  if [[ -z "$new" ]]; then
+    body=$(api GET "/api/sessions/${name}/info")
+    _die_on_error "$name" "$body"
+    printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("dir") or "(not set)")'
+    return 0
+  fi
+  new=$(_remote_path "$new" "")
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"dir": sys.argv[1]}))' "$new")
+  body=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload")
+  _die_on_error "$name" "$body"
+  local msg; msg=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("message") or "directory updated")' 2>/dev/null) || msg="directory updated"
+  echo "${GREEN}✓${RESET} $name: folder ${BOLD}$new${RESET} ${DIM}($msg)${RESET}"
+}
+
+# ── exec / register: the box's twin of the local `amux exec` / `amux register` ──
+# (rewritten 2026-11-27, audit step 4). The same options as the local commands:
+#   stored on the box     --provider --account --dir --desc --worktree --full-access
+#                         --net-sandbox/--full-sandbox --autoprompt --partners, and the
+#                         agent flags the local amux stores (--model, --effort,
+#                         --permission-mode, --append-system-prompt, … from
+#                         `amux __agent-flags`), --opt=value forms included
+#   this launch only      any other option or word (exec; register refuses them, as
+#                         the local register does)
+#   attach                --no-attach/--detach, --cc/--plain/--mosh, --color <c> (this
+#                         attach's tab color: the local exec pins it in amux color, the
+#                         box's color store cannot be reached from here)
+# On a session that is already registered both register it again, as the local ones
+# do: what is not restated is kept (folder, agent, account, description, tags, pin) and
+# the stored agent flags are replaced by the ones given. One request:
+#   POST  /api/sessions  {name, …, flags: "<agent flags to store>", update: true}
+# An older box answers 409 for an existing session and ignores "flags"; both are said.
+
+# The agent flags to store, from this machine's amux (ONE list: parse_claude_flags).
+AGENT_VALUE_FLAGS="" AGENT_BOOL_FLAGS="" _AGENT_FLAGS_LOADED=0
+_load_agent_flags() {
+  (( _AGENT_FLAGS_LOADED )) && return 0
+  _AGENT_FLAGS_LOADED=1
+  local out=""
+  if command -v amux >/dev/null 2>&1; then out=$(amux __agent-flags 2>/dev/null) || out=""; fi
+  AGENT_VALUE_FLAGS=$(printf '%s\n' "$out" | sed -n 1p)
+  AGENT_BOOL_FLAGS=$(printf '%s\n' "$out" | sed -n 2p)
+}
+
+# cmd_reg <exec|register> <name> [options...]
+cmd_reg() {
+  require_config
+  local mode="$1"; shift
+  local name="${1:-}"; shift || true
+  local usage="$ME $BOX_ARG $mode <name> --provider claude|codex|gemini|opencode|iterm2|agy [--dir <path>] [--model <m>] [--account P|T|X] [--full-access | --net-sandbox | --full-sandbox] [--autoprompt] [--partners] [--desc <text>] [--worktree] [agent flags...]"
+  [[ "$mode" == exec ]] && usage="$usage [--no-attach] [--cc|--plain|--mosh] [--color <c>] (--provider required for a new session)"
+  [[ -n "$name" && "$name" != -* ]] || usage_die "$usage"
+  # a NEW name: the rule `amux register` and the box's server apply (no dots). Until
+  # 2026-11-27 `exec my.app` made the server create "my-app", then failed to start "my.app".
+  validate_new_name "$name"
+  _load_agent_flags
+  local dir="" model="" desc="" desc_set=0 provider="" worktree=0 no_attach=0 full_access=0 account="" autoprompt=0 sandbox="" partners=0
+  local attach_flags=() stored=() once=() a
   while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --dir)      dir="${2:-}";   [[ -n "$dir"   ]] || die "--dir needs a value";   shift 2 ;;
+    a="$1"
+    # --opt=value is --opt value for every option that takes one
+    if [[ "$a" == --*=* ]]; then
+      case "${a%%=*}" in
+        --dir|--model|--provider|--account|--desc|--color) set -- "${a%%=*}" "${a#*=}" "${@:2}"; a="$1" ;;
+        *) if [[ " $AGENT_VALUE_FLAGS " == *" ${a%%=*} "* ]]; then set -- "${a%%=*}" "${a#*=}" "${@:2}"; a="$1"; fi ;;
+      esac
+    fi
+    case "$a" in
+      --dir)      dir="${2:-}"; [[ -n "$dir" ]] || usage_die "$ME $BOX_ARG $mode <name> --dir <path on $BOX> …"; shift 2; continue ;;
       # --pwd is the LOCAL amux's "use the dir I'm in" — meaningless on another box.
       --pwd)      die "--pwd is local-only: your current directory ($PWD) is on this machine, not on $BOX — pass --dir <path> (a path on $BOX)" ;;
       # Prompt suggestions ON for this session; stored in its flags.
-      --autoprompt) autoprompt=1; shift ;;
+      --autoprompt) autoprompt=1 ;;
       # opencode only: the session starts with OPENCODE_PARTNERS=1; stored in its flags.
-      --partners) partners=1; shift ;;
-      # Claude account (2026-09-05): personal|team|team2 (P/T/X). Claude/iterm2 only;
-      # the server accepts-and-ignores it for other providers.
-      --account)  account="${2:-}"
-                  account=$(_norm_account "$account") || exit 1
-                  shift 2 ;;
-      --account=*) account="${1#--account=}"
-                  account=$(_norm_account "$account") || exit 1
-                  shift ;;
-      --no-attach) no_attach=1; shift ;;
-      # Attach lane for the auto-attach after start — ours, handed to cmd_start.
-      --cc|--plain|--mosh) attach_flags+=("$1"); shift ;;
-      --model)    model="${2:-}"; [[ -n "$model" ]] || die "--model needs a value"; shift 2 ;;
+      --partners) partners=1 ;;
+      # Claude account: personal|team|team2 (P/T/X) or an API key name on that box.
+      --account)  account=$(_norm_account "${2:-}") || exit 2; shift 2; continue ;;
+      --model)    model="${2:-}"; [[ -n "$model" ]] || usage_die "$ME $BOX_ARG $mode <name> --model <model> …"; stored+=(--model "$model"); shift 2; continue ;;
       --provider) provider="${2:-}"
                   # "antigravity" is the product name; the lane (and binary) is `agy`
                   [[ "$provider" == antigravity || "$provider" == antigravity-cli ]] && provider=agy
                   case "$provider" in
                     claude|codex|gemini|opencode|iterm2|agy) ;;
-                    *) die "unknown provider '${provider:-}' (valid: claude codex gemini opencode iterm2 agy)" ;;
+                    *) echo "${RED}error:${RESET} unknown provider '${provider}' (valid: claude codex gemini opencode iterm2 agy)" >&2; exit 2 ;;
                   esac
-                  shift 2 ;;
-      --desc)     desc="${2:-}";  shift 2 ;;
-      --worktree) worktree=1; shift ;;
-      # Provider-neutral full access, persisted into the session's flags at
-      # creation (the server re-spells it per provider). --yolo = same thing.
-      --full-access|--yolo) full_access=1; shift ;;
-      # Sandboxes: confine the agent's commands to the session folder.
-      --net-sandbox)  sandbox=net;  shift ;;
-      --full-sandbox) sandbox=full; shift ;;
-      -*)         die "unknown exec option: $1 (try --dir, --model, --provider, --account, --full-access, --net-sandbox, --full-sandbox, --autoprompt, --partners, --desc, --worktree, --no-attach, --cc, --plain, --mosh)" ;;
-      *)          die "unexpected argument: $1 (name comes first)" ;;
+                  shift 2; continue ;;
+      --desc)     [[ $# -ge 2 ]] || usage_die "$ME $BOX_ARG $mode <name> --desc <text> …"; desc="$2"; desc_set=1; shift 2; continue ;;
+      --worktree) worktree=1 ;;
+      # Provider-neutral full access, stored in the session's flags (the box re-spells
+      # it per provider). --yolo = same thing.
+      --full-access|--yolo) full_access=1 ;;
+      # Sandboxes (2026-11-21): confine the agent's commands to the session folder.
+      --net-sandbox)  sandbox=net ;;
+      --full-sandbox) sandbox=full ;;
+      --no-attach|--detach|--cc|--plain|--mosh|--color)
+        [[ "$mode" == exec ]] || { echo "${RED}error:${RESET} register does not know '$a' — it stores a session's options; attaching is for: $ME $BOX_ARG exec|start $name …" >&2; exit 2; }
+        case "$a" in
+          --no-attach|--detach) no_attach=1 ;;
+          --color) [[ -n "${2:-}" ]] || die "--color needs a value (a palette name, #rrggbb, next, auto or none)"
+                   attach_flags+=(--color "$2"); shift ;;
+          *)       attach_flags+=("$a") ;;
+        esac ;;
+      *)
+        if [[ " $AGENT_VALUE_FLAGS " == *" $a "* ]]; then
+          [[ $# -ge 2 ]] || usage_die "$ME $BOX_ARG $mode <name> $a <value> …"
+          stored+=("$a" "$2"); shift 2; continue
+        elif [[ " $AGENT_BOOL_FLAGS " == *" $a "* ]]; then
+          stored+=("$a")
+        elif [[ "$mode" == exec ]]; then
+          once+=("$a")          # this launch only, as the local exec does
+        else
+          echo "${RED}error:${RESET} register does not know '$a' — it stores a session's options and the agent flags amux knows; a prompt or a one-launch flag belongs to: $ME $BOX_ARG exec $name … / $ME $BOX_ARG start $name …" >&2; exit 2
+        fi ;;
     esac
+    shift
   done
-
-  # REQUIRED since v0.5.0 (2026-08-12): a new session must name its agent — no
-  # silent claude default. (The server enforces this too; failing here is just
-  # a better error. exec on an EXISTING session errors "already exists" anyway,
-  # so unlike local amux there is no stored-provider-preserving path to allow.)
-  [[ -n "$provider" ]] || die "--provider is required (no default): $ME $BOX_ARG exec $name --provider claude|codex|gemini|opencode|iterm2|agy [--dir <path>] ..."
-  if (( partners )) && [[ "$provider" != "opencode" ]]; then
+  if (( partners )) && [[ -n "$provider" && "$provider" != "opencode" ]]; then
     die "--partners applies to the opencode provider only (this session would run $provider)"
   fi
+  [[ -z "$dir" ]] || dir=$(_remote_path "$dir" "--dir ")
 
-  # `~` is expanded by the LOCAL shell long before we see it, so an unquoted
-  # `--dir ~/x` sends the CALLER's home path. That is right Mac->Mac and WRONG
-  # Mac->Linux (/Users/<me> vs /home/<me>), where the server would silently
-  # mkdir the wrong tree. So rewrite the caller's OWN home prefix back to `~/`
-  # and say so out loud. The remote expands it with Path(...).expanduser(), so
-  # `~/x` always means "the remote user's home" — which is what typing `~` meant.
-  # Mac->Mac same user this is a no-op; any path outside the caller's home is
-  # passed through untouched. Quoting ('~/x') skips this entirely.
-  if [[ -n "$dir" && ( "$dir" == "$HOME" || "$dir" == "$HOME"/* ) ]]; then
-    local _lcl="$dir"
-    if [[ "$dir" == "$HOME" ]]; then dir="~"; else dir="~/${dir#"$HOME"/}"; fi
-    printf '%snote: --dir %s was expanded by your local shell; sending %s for %s to expand%s\n' "$DIM" "$_lcl" "$dir" "$BOX" "$RESET" >&2
+  # No --account on a new claude session: follow the account this terminal runs
+  # (CLAUDE_ACCOUNT, as `amux exec` does here). Sent as account_default, which the box
+  # applies only to a NEW session and replaces with personal when it lacks that account.
+  local acct_default=""
+  if [[ -z "$account" && ( "$provider" == claude || "$provider" == iterm2 ) && -n "${CLAUDE_ACCOUNT:-}" ]]; then
+    acct_default=$(_norm_account "$CLAUDE_ACCOUNT" 2>/dev/null) || acct_default=""
   fi
-
-  local payload resp created ok msg
+  local flags_str="" payload resp
+  if (( ${#stored[@]} )); then
+    flags_str=$(python3 -c 'import shlex,sys; print(shlex.join(sys.argv[1:]))' "${stored[@]}")
+  fi
   payload=$(python3 -c '
 import json,sys
-name, d, desc, wt, prov, fa, acct, ap, sbx, pt = sys.argv[1:11]
-body = {"name": name}
-if d:         body["dir"]      = d
-if desc:      body["desc"]     = desc
-if wt == "1": body["worktree"] = True
-if prov:      body["provider"] = prov
-if fa == "1": body["full_access"] = True
-if acct:      body["account"]  = acct
-if ap == "1": body["autoprompt"] = True
-if sbx:       body["sandbox"]  = sbx
-if pt == "1": body["partners"] = True
-print(json.dumps(body))' "$name" "$dir" "$desc" "$worktree" "$provider" "$full_access" "$account" "$autoprompt" "$sandbox" "$partners")
+name, d, desc, dset, wt, prov, fa, acct, ap, sbx, pt, fl, acd = sys.argv[1:14]
+body = {"name": name, "update": True}
+if d:          body["dir"]      = d
+if dset == "1": body["desc"]    = desc
+if wt == "1":  body["worktree"] = True
+if prov:       body["provider"] = prov
+if fa == "1":  body["full_access"] = True
+if acct:       body["account"]  = acct
+elif acd:      body["account_default"] = acd
+if ap == "1":  body["autoprompt"] = True
+if sbx:        body["sandbox"]  = sbx
+if pt == "1":  body["partners"] = True
+if fl:         body["flags"]    = fl
+print(json.dumps(body))' "$name" "$dir" "$desc" "$desc_set" "$worktree" "$provider" "$full_access" "$account" "$autoprompt" "$sandbox" "$partners" "$flags_str" "$acct_default")
 
   resp=$(api POST /api/sessions -H 'Content-Type: application/json' -d "$payload")
-  created=$(printf '%s' "$resp" | python3 -c '
+  # "<ok 0|1>|<updated 0|1>|<flags echoed 0|1>|<dir>|<provider>|<account>" then the message
+  local res; res=$(printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception:
-    print("0"); print("could not parse server response"); raise SystemExit
+    print("0|0|0|||"); print("the box gave an answer that is not JSON"); raise SystemExit
 if not isinstance(d, dict):
-    print("0"); print("unexpected server response"); raise SystemExit
-print("1" if d.get("ok") else "0")
+    print("0|0|0|||"); print("unexpected answer from the box"); raise SystemExit
+print("%d|%d|%d|%s|%s|%s" % (1 if d.get("ok") else 0, 1 if d.get("updated") else 0, 1 if "flags" in d else 0,
+                             d.get("dir") or "", d.get("provider") or "", d.get("account") or ""))
 print(str(d.get("error") or d.get("message") or "create failed"))' 2>/dev/null)
-  ok="${created%%$'\n'*}"; msg="${created#*$'\n'}"
-  if [[ "$ok" != "1" ]]; then
-    echo "${RED}✗${RESET} ${msg:-create failed}" >&2
+  local head="${res%%$'\n'*}" msg="${res#*$'\n'}"
+  local ok updated echoed rdir rprov racct
+  IFS='|' read -r ok updated echoed rdir rprov racct <<<"$head"
+  if [[ "$ok" != 1 ]]; then
     case "$msg" in
-      *"already exists"*) echo "${DIM}  already registered — just start it: $ME $BOX_ARG start $name${RESET}" >&2 ;;
+      *"already exists"*)
+        die "session '$name' already exists on $BOX, and the amux there is older (it cannot register a session again) — start it: $ME $BOX_ARG start $name" ;;
+      *"provider is required"*)
+        usage_die "$ME $BOX_ARG $mode $name --provider claude|codex|gemini|opencode|iterm2|agy …   (--provider is required for a new session: no default)" ;;
+      *) die "$(_remote_msg "$name" "$msg")" ;;
     esac
-    return 1
   fi
-  echo "${GREEN}✓${RESET} created ${BOLD}${name}${RESET}${dir:+ ${DIM}in ${dir}${RESET}}${provider:+ ${DIM}(provider: ${provider}${account:+, account: ${account}})${RESET}}"
-  if (( full_access )); then
-    echo "${GREEN}✓${RESET} full access ${DIM}(no sandbox, no approvals)${RESET}"
-  fi
-  if (( autoprompt )); then
-    echo "${GREEN}✓${RESET} prompt suggestions on ${DIM}(--autoprompt)${RESET}"
-  fi
-  if (( partners )); then
-    echo "${GREEN}✓${RESET} partner models shown ${DIM}(--partners; OPENCODE_PARTNERS=1 for the agent)${RESET}"
-  fi
+  [[ -n "$rdir" ]] || rdir="$dir"
+  [[ -n "$rprov" ]] || rprov="$provider"
+  [[ -n "$racct" ]] || racct="$account"
+  local verb="created" shown_flags="$flags_str"
+  (( updated )) && verb="registered again"
+  [[ -n "$shown_flags" ]] || shown_flags="(none)"
+  echo "${GREEN}✓${RESET} $verb ${BOLD}${name}${RESET} on $BOX${rdir:+ ${DIM}in ${rdir}${RESET}}${rprov:+ ${DIM}(provider: ${rprov}${racct:+, account: ${racct}})${RESET}}"
+  if (( updated )); then echo "  ${DIM}what was not given is kept; its stored agent flags are now: $shown_flags${RESET}"; fi
+  case "$msg" in *"is not on this machine"*) echo "  ${YELLOW}note:${RESET} ${msg#*(}" | sed 's/)$//' ;; esac
+  if (( full_access )); then echo "${GREEN}✓${RESET} full access ${DIM}(no sandbox, no approvals)${RESET}"; fi
+  if [[ -n "$sandbox" ]]; then echo "${GREEN}✓${RESET} --${sandbox}-sandbox ${DIM}(commands kept inside the session folder)${RESET}"; fi
+  if (( autoprompt )); then echo "${GREEN}✓${RESET} prompt suggestions on ${DIM}(--autoprompt)${RESET}"; fi
+  if (( partners )); then echo "${GREEN}✓${RESET} partner models shown ${DIM}(--partners; OPENCODE_PARTNERS=1 for the agent)${RESET}"; fi
 
-  if [[ -n "$model" ]]; then
-    local mp mresp
-    mp=$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1]}))' "$model")
-    mresp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$mp")
-    if printf '%s' "$mresp" | python3 -c '
+  # An older box ignores "flags" (it does not echo them): keep the model the old way
+  # (PATCH), and say what was not stored.
+  if (( ${#stored[@]} )) && (( ! echoed )) && (( ! updated )); then
+    local rest=() i=0
+    while (( i < ${#stored[@]} )); do
+      if [[ "${stored[i]}" == --model ]]; then i=$((i + 2)); continue; fi
+      rest+=("${stored[i]}"); i=$((i + 1))
+    done
+    if [[ -n "$model" ]]; then
+      local mp mresp
+      mp=$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1]}))' "$model")
+      mresp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$mp")
+      if printf '%s' "$mresp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
 except Exception: raise SystemExit(1)
 raise SystemExit(0 if isinstance(d, dict) and not d.get("error") else 1)' 2>/dev/null; then
-      echo "${GREEN}✓${RESET} model ${CYAN}${model}${RESET}"
-    else
-      echo "${RED}✗${RESET} could not set model '${model}' — starting on the box default instead" >&2
+        echo "${GREEN}✓${RESET} model ${CYAN}${model}${RESET}"
+      else
+        echo "${RED}error:${RESET} could not set model '${model}' — starting on the box default instead" >&2
+      fi
     fi
+    if (( ${#rest[@]} )); then
+      if [[ "$mode" == exec ]]; then
+        echo "${YELLOW}note:${RESET} the amux on $BOX is older and does not store agent flags; for this launch only: ${rest[*]}" >&2
+        once=("${rest[@]}" ${once[@]+"${once[@]}"})
+      else
+        echo "${YELLOW}note:${RESET} the amux on $BOX is older and does not store agent flags; not stored: ${rest[*]}" >&2
+      fi
+    fi
+  elif [[ -n "$model" ]]; then
+    echo "${GREEN}✓${RESET} model ${CYAN}${model}${RESET}"
   fi
 
+  [[ "$mode" == exec ]] || return 0
   if (( no_attach )); then
-    cmd_start "$name" --no-attach
+    cmd_start "$name" --no-attach ${once[@]+"${once[@]}"}
   else
-    cmd_start "$name" ${attach_flags[@]+"${attach_flags[@]}"}
+    cmd_start "$name" ${attach_flags[@]+"${attach_flags[@]}"} ${once[@]+"${once[@]}"}
   fi
 }
 
+# Is <name> pinned on the box? Prints 1 or 0; a missing session is an error.
+_remote_pinned() {
+  local body
+  body=$(api GET "/api/sessions/$1/info")
+  _die_on_error "$1" "$body"
+  printf '%s' "$body" | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("pinned") else 0)'
+}
+# Pin or unpin <name> ($2 = on|off). An older box has no {"pinned": …}: it is told to
+# flip the pin instead, which is the same thing once we know the pin is the other way.
+_remote_set_pin() {
+  local want=false body m
+  [[ "$2" == on ]] && want=true
+  body=$(api PATCH "/api/sessions/$1/config" -H 'Content-Type: application/json' -d "{\"pinned\": $want}")
+  m=$(printf '%s' "$body" | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print(d.get("error") or "") if isinstance(d, dict) else print("")' 2>/dev/null) || m=""
+  if [[ "$m" == "nothing to update" ]]; then
+    body=$(api PATCH "/api/sessions/$1/config" -H 'Content-Type: application/json' -d '{"toggle_pin": true}')
+  fi
+  _die_on_error "$1" "$body"
+}
+
+# amux-remote <box> rm [--force] <name> — remove a session on the box (it stops it first
+# and deletes its config, state, memory file and log). Added 2026-08-12; --force
+# (2026-11-27): a pinned session is unpinned first, as the local `amux rm --force` does.
+#
+# AUTHORIZATION: the server's delete endpoint is deliberately gated — it exists
+# to stop a SESSION/AGENT from deleting sessions via the bare API. It opens for
+# either AMUX_ALLOW_AGENT_SESSION_DELETE=1 on the remote box, or a request
+# carrying X-Amux-UI-Token — the guard token the dashboard embeds because its
+# HTML is only served to an authenticated human. amux-remote is the same class
+# of actor as the dashboard (a human typing at their own terminal, holding the
+# box's AMUX_TOKEN), so it derives the SAME guard value the server computes:
+# sha256("amux-ui-guard:" + AUTH_TOKEN)[:40] — see _UI_TOKEN in amux-server.py.
+# The derived value is a one-way hash (not the token), python3 reads AMUX_TOKEN
+# from the environment (exported at config load, never argv), and the header
+# reaches curl via a process-substitution file descriptor, never stdout or ps.
+cmd_rm() {
+  require_config
+  local name="" force=0 a
+  for a in "$@"; do
+    case "$a" in
+      -f|--force) force=1 ;;
+      -*) bad_opt "$a" ;;
+      *)  [[ -z "$name" ]] || bad_arg "$a" "it takes one session"; name="$a" ;;
+    esac
+  done
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG rm [--force] <name>"
+  validate_remote_name "$name"
+  if (( force )) && [[ "$(_remote_pinned "$name")" == 1 ]]; then
+    _remote_set_pin "$name" off
+  fi
+  local resp ok
+  resp=$(api POST "/api/sessions/${name}/delete" \
+    -H @<(python3 -c 'import hashlib, os; print("X-Amux-UI-Token: " + hashlib.sha256(("amux-ui-guard:" + os.environ["AMUX_TOKEN"]).encode()).hexdigest()[:40])'))
+  ok=$(_resp_ok_msg "$resp")
+  local good="${ok%%$'\n'*}" msg="${ok#*$'\n'}"
+  if [[ "$good" != "1" ]]; then
+    case "$msg" in
+      *pinned*) die "session '$name' is pinned on $BOX — unpin it first ($ME $BOX_ARG pin $name off), or: $ME $BOX_ARG rm --force $name" ;;
+    esac
+    die "$(_remote_msg "$name" "$msg")"
+  fi
+  echo "${GREEN}✓${RESET} removed ${BOLD}${name}${RESET}"
+}
+
+# amux-remote <box> pin <name> [on|off] — show or set the dashboard pin (2026-11-27),
+# the local `amux pin`. A pinned session is refused by rm unless --force.
+cmd_pin() {
+  require_config
+  local name="${1:-}" want="${2:-}"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG pin <name> [on|off]"
+  validate_remote_name "$name"
+  [[ $# -le 2 ]] || bad_arg "$3" "usage: $ME $BOX_ARG pin <name> [on|off]"
+  local cur; cur=$(_remote_pinned "$name")
+  if [[ -z "$want" ]]; then
+    if [[ "$cur" == 1 ]]; then echo on; else echo off; fi
+    return 0
+  fi
+  case "$want" in
+    on|yes|true|1)  want=on ;;
+    off|no|false|0) want=off ;;
+    *) usage_die "$ME $BOX_ARG pin <name> [on|off]   (got '$want')" ;;
+  esac
+  if { [[ "$want" == on ]] && [[ "$cur" == 1 ]]; } || { [[ "$want" == off ]] && [[ "$cur" == 0 ]]; }; then
+    echo "$name: already pinned $want"; return 0
+  fi
+  _remote_set_pin "$name" "$want"
+  echo "${GREEN}✓${RESET} pin ${BOLD}$name${RESET} on $BOX: $want"
+}
+
+# amux-remote <box> rename [-n] <old> <new> — the box renames the session in place
+# (registration, state, memory file, log, board rows, its live tmux session and window,
+# origin record, color pin): the agent keeps running. Like the local `amux rename`.
+cmd_rename() {
+  require_config
+  local dry=0 a names=()
+  for a in "$@"; do
+    case "$a" in
+      -n|--dry-run) dry=1 ;;
+      -*) bad_opt "$a" ;;
+      *)  names+=("$a") ;;
+    esac
+  done
+  [[ ${#names[@]} -eq 2 ]] || usage_die "$ME $BOX_ARG rename [-n] <old> <new>   (-n = show the plan, change nothing)"
+  local old="${names[0]}" new="${names[1]}" body
+  validate_remote_name "$old"
+  validate_new_name "$new"
+  [[ "$old" != "$new" ]] || die "the new name is the same as the old one"
+  body=$(api GET "/api/sessions/${old}/info")
+  _die_on_error "$old" "$body"
+  body=$(api GET "/api/sessions/${new}/info")
+  printf '%s' "$body" | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d.get("name") else 1)' 2>/dev/null \
+    && die "session '$new' already exists on $BOX"
+  if (( dry )); then
+    echo "rename ${BOLD}$old${RESET} -> ${BOLD}$new${RESET} on $BOX ${DIM}(dry run — nothing changed)${RESET}"
+    return 0
+  fi
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"rename": sys.argv[1]}))' "$new")
+  body=$(api PATCH "/api/sessions/${old}/config" -H 'Content-Type: application/json' -d "$payload")
+  _die_on_error "$old" "$body"
+  echo "${GREEN}✓${RESET} renamed ${BOLD}$old${RESET} -> ${BOLD}$new${RESET} on $BOX ${DIM}(a running agent keeps running)${RESET}"
+}
+
+# Print one or more info objects (from the box) the way the local `amux info` does.
+# $1 = text | porcelain | json. Reads one JSON object, or a list of them, on stdin.
+_info_render() {
+  AMUX_R_MODE="$1" AMUX_R_BOX="$BOX" AMUX_R_START="$ME $BOX_ARG start" \
+  AMUX_R_B="$BOLD" AMUX_R_D="$DIM" AMUX_R_G="$GREEN" AMUX_R_Y="$YELLOW" AMUX_R_R="$RESET" \
+  python3 -c '
+import json, os, sys
+e = os.environ.get
+mode = e("AMUX_R_MODE")
+B, D, G, Y, R = e("AMUX_R_B", ""), e("AMUX_R_D", ""), e("AMUX_R_G", ""), e("AMUX_R_Y", ""), e("AMUX_R_R", "")
+data = json.load(sys.stdin)
+items = data if isinstance(data, list) else [data]
+if mode == "json":
+    print(json.dumps(data, indent=4)); sys.exit(0)
+def badge(a):
+    return {"team": "T", "team2": "X", "": "P", "personal": "P"}.get(a, "A")
+for d in items:
+    name = d.get("name", "")
+    prov = d.get("provider") or "claude"
+    acct = d.get("account") or ""
+    state = d.get("state") or ("agent" if d.get("running") else "stopped")
+    if mode == "porcelain":
+        print("\t".join([name, state, prov, acct if prov in ("claude", "iterm2") else "",
+                         d.get("dir") or "", d.get("flags") or ""]))
+        continue
+    print(B + name + R)
+    print("  dir:   " + (d.get("dir") or "(not set)"))
+    print("  flags: " + (d.get("flags") or "(none)"))
+    print("  provider: " + prov)
+    if prov in ("claude", "iterm2"):
+        a = acct or "personal"
+        print("  account:  %s (%s)" % (a, badge(a)))
+    if state == "agent":
+        print("  status: " + G + "running" + R)
+    elif state == "shell":
+        print("  status: " + Y + "no agent" + R + " " + D + "(its tmux session is open at a shell; "
+              + e("AMUX_R_START", "") + " " + name + " starts the agent again)" + R)
+    else:
+        print("  status: " + D + "stopped" + R)
+    if d.get("desc"):
+        print("  desc:   " + d["desc"])
+    if d.get("pinned"):
+        print("  pinned: yes")'
+}
+
+# amux-remote <box> info <name> | info --dir <folder>   [--porcelain | --json]
+# The local `amux info`, line for line (2026-11-27; it printed the box's JSON).
+# --json prints the box's info object as before; --porcelain one tab-separated line:
+#   name  state(agent|shell|stopped)  provider  account  folder  flags
 cmd_info() {
   require_config
-  local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG info <name>"
+  local mode=text dir="" has_dir=0 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)      mode=json ;;
+      --porcelain) mode=porcelain ;;
+      --dir)       has_dir=1; dir="${2:-}"; shift ;;
+      --dir=*)     has_dir=1; dir="${1#--dir=}" ;;
+      -*)          bad_opt "$1" ;;
+      *)           [[ -z "$name" ]] || bad_arg "$1" "it takes one session"; name="$1" ;;
+    esac
+    shift
+  done
+  local body
+  if (( has_dir )); then
+    [[ -n "$dir" && -z "$name" ]] || usage_die "$ME $BOX_ARG info --dir <folder on $BOX> [--porcelain | --json]"
+    dir=$(_remote_path "$dir" "--dir ")
+    local q; q=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$dir")
+    body=$(api GET "/api/sessions-by-dir?dir=$q")
+    local err; err=$(printf '%s' "$body" | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: print("the box gave an answer that is not JSON"); sys.exit(0)
+print(d.get("error") or "") if isinstance(d, dict) else print("")' 2>/dev/null) || err=""
+    [[ "$err" != "not found" ]] || die "the amux on $BOX is older and has no info --dir — on that box: amux info --dir $dir"
+    [[ -z "$err" ]] || die "$err"
+    local n; n=$(printf '%s' "$body" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("sessions") or []))')
+    if [[ "$n" == 0 ]]; then
+      [[ "$mode" == json ]] && echo "[]"
+      [[ "$mode" == text ]] && echo "no session is registered for $(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("dir") or "")') on $BOX"
+      return 1
+    fi
+    printf '%s' "$body" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("sessions") or []))' | _info_render "$mode"
+    return 0
+  fi
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG info <name>   or   $ME $BOX_ARG info --dir <folder>   [--porcelain | --json]"
   validate_remote_name "$name"
-  local body; body=$(api GET "/api/sessions/${name}/info")
-  printf '%s' "$body" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$body"
+  body=$(api GET "/api/sessions/${name}/info")
+  # a missing session is an error on stderr with exit 1, not {"error": …} on stdout
+  _die_on_error "$name" "$body"
+  printf '%s' "$body" | _info_render "$mode"
 }
 
 # amux-remote <box> provider <name> [<p>] — show or change a session's agent
 cmd_provider() {
   require_config
   local name="${1:-}" new="${2:-}"
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG provider <name> [claude|codex|gemini|opencode|agy]"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG provider <name> [claude|codex|gemini|opencode|agy]"
   validate_remote_name "$name"
   # Flag spelling accepted too (2026-08-12): exec teaches `--provider <p>`, so
   # typing it here must work instead of dying at name validation.
@@ -876,6 +1246,7 @@ cmd_provider() {
   esac
   if [[ -z "$new" ]]; then
     local body; body=$(api GET "/api/sessions/${name}/info")
+    _die_on_error "$name" "$body"
     printf '%s' "$body" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
@@ -892,6 +1263,7 @@ print((d.get("provider") or d.get("config",{}).get("CC_PROVIDER") or "claude"))'
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"provider": sys.argv[1]}))' "$new")
   local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload")
+  _die_on_error "$name" "$resp"
   printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
@@ -906,10 +1278,11 @@ print("\033[32m✓\033[0m " + str(d.get("message", "provider updated")))'
 cmd_model() {
   require_config
   local name="${1:-}" new="${2:-}"
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG model <name> [<model>]"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG model <name> [<model>]"
   validate_remote_name "$name"
   if [[ -z "$new" ]]; then
     local body; body=$(api GET "/api/sessions/${name}/info")
+    _die_on_error "$name" "$body"
     printf '%s' "$body" | python3 -c '
 import json,sys,shlex
 try: d = json.load(sys.stdin)
@@ -922,6 +1295,7 @@ print(f[f.index("--model") + 1] if "--model" in f[:-1] else "(box default)")'
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1]}))' "$new")
   local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload")
+  _die_on_error "$name" "$resp"
   printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
@@ -935,10 +1309,11 @@ print("\033[32m✓\033[0m " + str(d.get("message", "model updated")))'
 cmd_full_access() {
   require_config
   local name="${1:-}" new="${2:-}"
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG full-access <name> [on|off]"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG full-access <name> [on|off]"
   validate_remote_name "$name"
   if [[ -z "$new" ]]; then
     local body; body=$(api GET "/api/sessions/${name}/info")
+    _die_on_error "$name" "$body"
     printf '%s' "$body" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
@@ -956,6 +1331,7 @@ print("on" if on else "off")'
     *) die "full-access takes on or off, not '$new'" ;;
   esac
   local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "{\"full_access\": $want}")
+  _die_on_error "$name" "$resp"
   printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
@@ -971,7 +1347,7 @@ print("\033[32m✓\033[0m " + str(d.get("message", "full access updated")))'
 cmd_account() {
   require_config
   local name="${1:-}" new="${2:-}"
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG account <name> [personal|team|team2|P|T|X|<api key name>]"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG account <name> [personal|team|team2|P|T|X|<api key name>]"
   validate_remote_name "$name"
   case "$new" in
     --account)   new="${3:-}"
@@ -980,6 +1356,7 @@ cmd_account() {
   esac
   if [[ -z "$new" ]]; then
     local body; body=$(api GET "/api/sessions/${name}/info")
+    _die_on_error "$name" "$body"
     printf '%s' "$body" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
@@ -998,6 +1375,7 @@ print(a if a else "(no account: not a claude/iterm2 session)")'
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"account": sys.argv[1]}))' "$new")
   local resp; resp=$(api PATCH "/api/sessions/${name}/config" -H 'Content-Type: application/json' -d "$payload")
+  _die_on_error "$name" "$resp"
   printf '%s' "$resp" | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
@@ -1009,7 +1387,7 @@ print("\033[32m✓\033[0m " + str(d.get("message", "account updated")))'
 cmd_curl() {
   require_config
   local path="${1:-}"; shift || true
-  [[ -n "$path" ]] || die "usage: $ME $BOX_ARG curl <path> [curl args...]"
+  [[ -n "$path" ]] || usage_die "$ME $BOX_ARG curl <path> [curl args...]"
   [[ "$path" == /* ]] || path="/$path"
   api GET "$path" "$@"
 }
@@ -1140,12 +1518,12 @@ cmd_attach() {
       --color) [[ -n "${2:-}" ]] || die "--color needs a value (a palette name, #rrggbb, next, auto or none)"
                color="$2"; shift ;;
       --color=*) color="${1#--color=}" ;;
-      --*)     die "unknown attach option: $1 (try --cc, --plain, --mosh or --color)" ;;
-      *)       [[ -n "$name" ]] && die "unexpected argument: $1"; name="$1" ;;
+      -*)      bad_opt "$1" ;;
+      *)       [[ -z "$name" ]] || bad_arg "$1" "it takes one session"; name="$1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || die "usage: $ME $BOX_ARG attach <name> [--cc|--plain|--mosh] [--color <c>]"
+  [[ -n "$name" ]] || usage_die "$ME $BOX_ARG attach <name> [--cc|--plain|--mosh] [--color <c>]"
   # SECURITY: name is spliced into a remotely-parsed shell string below — the
   # whitelist is what prevents `attach "x'; rm -rf ~ #"` from escaping the quotes.
   validate_remote_name "$name"
@@ -1154,11 +1532,22 @@ cmd_attach() {
     [[ "$color" =~ ^#?[A-Za-z0-9]+$ ]] || die "invalid --color '$color' (a palette name, #rrggbb, next, auto or none)"
     color="${color/#\#/\\#}"
   fi
+  # A missing or stopped session gets the local wording, not tmux's "Session amux-x
+  # not found" and a raw `tmux ls` from the box. Skipped right after our own start.
+  if [[ -z "${_ATTACH_AFTER_START:-}" ]]; then
+    case "$(_remote_state "$name")" in
+      missing) die "$(_remote_msg "$name" "not found")" ;;
+      stopped) die "$(_remote_msg "$name" "not running")" ;;
+    esac
+  fi
   local paint=0; _tabcolor_here && paint=1
   local host; host=$(_ssh_host)
   local user="${AMUX_SSH_USER:-$USER}"
   local tname="amux-${name}"
-  local missing="(echo 'Session ${tname} not found. Running sessions:' && tmux ls 2>/dev/null; exit 1)"
+  # (a race after the check above: the session ended in between). Spliced into the
+  # remotely parsed command, so only the validated name and a whitelisted box name.
+  local sbox="${BOX//[^A-Za-z0-9._-]/}"
+  local missing="(echo \"error: session '${name}' is not running on ${sbox}\" >&2; exit 1)"
   if (( use_mosh )); then
     # mosh renders a screen, it cannot carry tmux's -CC control stream, so the
     # mosh lane is always plain tmux. Missing mosh on either end falls back to
@@ -1234,7 +1623,7 @@ ${BOLD}Add a box${RESET} ${DIM}(the only way in: each box's URL + dashboard toke
 ${BOLD}Configured boxes${RESET} ${DIM}(~/.amux/remotes/<box>.env)${RESET}
   ${GREEN}${boxes:-<none — add one: $ME add <box>>}${RESET}
 
-${BOLD}Per-box config${RESET} ${DIM}(~/.amux/remotes/<box>.env, chmod 600)${RESET}
+${BOLD}Per-box config${RESET} ${DIM}(~/.amux/remotes/<box>.env, chmod 600 — written by '$ME add <box>')${RESET}
   AMUX_URL       ${DIM}e.g. https://192.0.2.10:8822${RESET}
   AMUX_TOKEN     ${DIM}from that box's ~/.amux/auth_token${RESET}
   AMUX_SSH_HOST  ${DIM}SSH host for attach (default: host from AMUX_URL). Space-separated${RESET}
@@ -1249,17 +1638,26 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
                           ${DIM}--names = the names only, one per line)${RESET}
   ${CYAN}pick${RESET} [--sessionid N]    pick one of the box's sessions and attach ${DIM}(--sessionid N = row N of 'ls -c':${RESET}
                           ${DIM}attach, or start + attach)${RESET}
-  ${CYAN}attach${RESET} <name> [--cc|--plain|--mosh]  SSH in + attach (native iTerm2 tabs in -CC mode)
+  ${CYAN}attach${RESET} <name> [--cc|--plain|--mosh] [--color <c>]  SSH in + attach (native iTerm2 tabs in -CC mode;
+                          ${DIM}--color = this attach's tab color)${RESET}
                           ${DIM}--mosh = plain tmux over mosh: keystrokes echo instantly on a${RESET}
                           ${DIM}laggy link and the session survives Wi-Fi/hotspot switches and${RESET}
                           ${DIM}sleep. Falls back to SSH if mosh is missing on either end.${RESET}
   ${CYAN}peek${RESET} [--raw] <name> [lines]  print recent output (default 30, like 'amux peek'; colors kept, every other
                           ${DIM}escape stripped so replayed terminal queries/clipboard writes can't fire;${RESET}
                           ${DIM}--raw = the server's bytes untouched)${RESET}
-  ${CYAN}send${RESET} <name> <text...>   send text/prompt to a session
-  ${CYAN}exec${RESET} <name> --provider <p> [--account P|T|X] [--dir <p>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--partners] [--desc <t>] [--worktree] [--no-attach] [--cc|--plain|--mosh]
-                          ${DIM}create + start in one step (like local 'amux exec'); attaches${RESET}
-                          ${DIM}when interactive (--cc/--plain/--mosh pick the lane, as for attach). quote '~/…' so the REMOTE box expands it.${RESET}
+  ${CYAN}send${RESET} <name> <text...>   send text/prompt to a session (+ Enter)
+                          ${DIM}send <name> --keys <key>... sends named keys instead: C-c, Enter, Escape,${RESET}
+                          ${DIM}Tab, Up/Down, F1-F12, y/n/q … (the box sends named keys only)${RESET}
+  ${CYAN}exec${RESET} <name> --provider <p> [--account P|T|X] [--dir <p>] [--model <m>] [--full-access] [--net-sandbox|--full-sandbox] [--autoprompt] [--partners] [--desc <t>] [--worktree] [agent flags...] [--no-attach] [--cc|--plain|--mosh] [--color <c>]
+                          ${DIM}register + start in one step, like the local 'amux exec': the agent flags the${RESET}
+                          ${DIM}local amux stores (--model, --effort, --permission-mode, --append-system-prompt, …,${RESET}
+                          ${DIM}--opt=value too) are stored on the box; any other option or word goes to this${RESET}
+                          ${DIM}launch only. On a session that is already registered it registers it again:${RESET}
+                          ${DIM}what is not given is kept (folder, agent, account, description, pin) and the${RESET}
+                          ${DIM}stored agent flags are replaced by the ones given. Attaches when interactive${RESET}
+                          ${DIM}(--cc/--plain/--mosh pick the lane; --no-attach/--detach skip it; --color = this${RESET}
+                          ${DIM}attach's tab color, not pinned on the box). Quote '~/…' so the REMOTE box expands it.${RESET}
                           ${BOLD}--account personal|team|team2|<api key name>${RESET} ${DIM}(P/T/X) = which Claude${RESET}
                           ${DIM}subscription (or API key on that box) the session bills to; claude/iterm2${RESET}
                           ${DIM}only, default personal. 'ls'${RESET}
@@ -1281,9 +1679,11 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
                           ${BOLD}--partners${RESET} ${DIM}= opencode only: the agent starts with OPENCODE_PARTNERS=1${RESET}
                           ${DIM}(a plugin then lists its partner models too); stored. On start:${RESET}
                           ${DIM}--partners for one launch, --no-partners to leave it out once.${RESET}
-                          ${BOLD}--provider is REQUIRED${RESET} ${DIM}(claude|codex|gemini|opencode|agy — no default:${RESET}
+                          ${BOLD}--provider is REQUIRED for a new session${RESET} ${DIM}(claude|codex|gemini|opencode|iterm2|agy — no default:${RESET}
                           ${DIM}a silent claude fallback once put an opencode workspace on${RESET}
                           ${DIM}the Claude subscription)${RESET}
+  ${CYAN}register${RESET} <name> --provider <p> [options and agent flags as for exec]
+                          ${DIM}register (or register again) without starting, like the local 'amux register'${RESET}
   ${CYAN}start${RESET} <name> [flags...] start an ALREADY-REGISTERED session; flags forwarded one-shot
                           ${DIM}(e.g. --provider opencode, one-shot --model, --fresh,${RESET}
                           ${DIM}--full-access for THIS launch only). When run${RESET}
@@ -1291,12 +1691,17 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
                           ${DIM}--no-attach or piped output skips that. --cc/--plain/--mosh route to${RESET}
                           ${DIM}the attach. every provider AUTO-RESUMES its newest conversation${RESET}
                           ${DIM}for the dir; pass --fresh to cold-start a new one instead${RESET}
-  ${CYAN}stop${RESET} <name>             stop a session ${DIM}(takes no flags)${RESET}
-  ${CYAN}rm${RESET} <name>               remove a session ${DIM}(stops it first; deletes its config/meta/log${RESET}
-                          ${DIM}on the remote box — same as the dashboard's delete)${RESET}
+  ${CYAN}stop${RESET} [--now] <name>     stop a session: the agent is asked to exit, and the tmux session ends
+                          ${DIM}once it has left, or after 15 s; --now (also --force, -f) ends it at once${RESET}
+  ${CYAN}rm${RESET} [--force] <name>     remove a session ${DIM}(stops it first; deletes its config/meta/memory file/log${RESET}
+                          ${DIM}on the remote box — same as the dashboard's delete). A pinned session${RESET}
+                          ${DIM}is refused unless --force (which unpins it first)${RESET}
+  ${CYAN}pin${RESET} <name> [on|off]     show or set the dashboard pin ${DIM}(a pinned session is one to keep)${RESET}
+  ${CYAN}rename${RESET} [-n] <old> <new>  rename in place on the box: registration, state, memory, log, live
+                          ${DIM}tmux session and window move together; the agent keeps running (-n = the plan)${RESET}
   ${CYAN}provider${RESET} <name> [<p>]   show or change the session's agent ${DIM}(claude|codex|gemini|opencode|agy;${RESET}
-                          ${DIM}flag spelling '--provider <p>' accepted too; change is persisted${RESET}
-                          ${DIM}and rewrites CC_FLAGS to the new provider's default model)${RESET}
+                          ${DIM}flag spelling '--provider <p>' accepted too; change is persisted, rewrites${RESET}
+                          ${DIM}its flags to the new provider's default model, and RESTARTS a running session)${RESET}
   ${CYAN}account${RESET} <name> [P|T|X]  show or change which Claude subscription the session bills to
                           ${DIM}(personal|team|team2 or P|T|X; claude/iterm2 only; the session must be${RESET}
                           ${DIM}stopped; persisted — next start uses it. One launch only instead:${RESET}
@@ -1304,7 +1709,13 @@ ${BOLD}Commands${RESET} ${DIM}(after the box name)${RESET}
   ${CYAN}model${RESET} <name> [<m>]      show or change the session's model ${DIM}(persisted; restarts it if running)${RESET}
   ${CYAN}full-access${RESET} <name> [on|off]  show or set full access ${DIM}(no sandbox / no approvals;${RESET}
                           ${DIM}persisted; restarts it if running)${RESET}
-  ${CYAN}info${RESET} <name>             session status/meta as JSON
+  ${CYAN}dir${RESET} <name> [<path>]     show or change the folder the session runs in ${DIM}(the box creates it;${RESET}
+                          ${DIM}a running session is restarted there and resumes its conversation)${RESET}
+  ${CYAN}info${RESET} <name> [--porcelain | --json]  the session's folder, flags, agent, account and state, as
+                          ${DIM}the local 'amux info' prints them; --json = the box's info object; --porcelain =${RESET}
+                          ${DIM}one tab-separated line (name state provider account folder flags)${RESET}
+                          ${DIM}info --dir <folder> = the sessions registered for a folder on the box${RESET}
+  ${CYAN}models${RESET}                  not served by the API (it reads the box's agent configs): $ME <box> --ssh models
   ${CYAN}url${RESET}                     print the box's server URL
   ${CYAN}curl${RESET} <path> [args...]   raw authenticated GET against the API
   ${CYAN}box${RESET}                     print the configured box name this spelling resolves to
@@ -1331,11 +1742,11 @@ cmd_add() {
       --url)   url="${2:-}"; shift 2 || die "--url needs a URL" ;;
       --force) force=1; shift ;;
       -h|--help) subhelp add; return 0 ;;
-      -*)      die "add: unknown option $1" ;;
-      *)       [[ -z "$box" ]] || die "add takes one box name"; box="$1"; shift ;;
+      -*)      echo "${RED}error:${RESET} $ME add: unknown option '$1' (see $ME add -h)" >&2; exit 2 ;;
+      *)       [[ -z "$box" ]] || { echo "${RED}error:${RESET} $ME add: unexpected argument '$1' — it takes one box name" >&2; exit 2; }; box="$1"; shift ;;
     esac
   done
-  [[ -n "$box" ]] || die "usage: $ME add <box> [--ssh <alias>] [--url <url>] [--force]"
+  [[ -n "$box" ]] || usage_die "$ME add <box> [--ssh <alias>] [--url <url>] [--force]"
   [[ "$box" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid box name '$box'"
   [[ -n "$ssh_alias" ]] || ssh_alias="$box"
   [[ "$ssh_alias" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || die "invalid SSH alias '$ssh_alias'"
@@ -1422,7 +1833,7 @@ esac
 BOX_ENV="$AMUX_REMOTES_DIR/$BOX.env"
 if [[ ! -f "$BOX_ENV" ]]; then
   # A leading subcommand (the common slip now that a box is mandatory) lands here.
-  case " ls list pick choose attach a peek send exec start stop rm remove del info meta curl url provider account acct model full-access box resolve " in
+  case " ls list pick choose attach a peek send exec run register reg start stop rm remove del info meta curl url provider account acct model models full-access dir pin rename mv box resolve " in
     *" $BOX "*) die "a box is required first: try '$ME <box> $BOX …' — boxes: $(list_boxes)" ;;
   esac
   # One machine has several SSH names — a LAN alias, a tailnet twin, a couple of
@@ -1452,6 +1863,7 @@ if [[ -n "${AMUX_SSH_HOST_PIN:-}" ]]; then
 fi
 
 cmd="${1:-}"; shift || true
+CMD="$cmd"
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && [[ "$cmd" != pick && "$cmd" != choose ]]; then
   subhelp "$cmd" && exit 0
 fi
@@ -1479,7 +1891,8 @@ case "$cmd" in
   attach|a)      cmd_attach "$@" ;;
   peek)          cmd_peek "$@" ;;
   send)          cmd_send "$@" ;;
-  exec)          cmd_exec "$@" ;;
+  exec|run)      cmd_reg exec "$@" ;;
+  register|reg)  cmd_reg register "$@" ;;
   start)         cmd_start "$@" ;;
   stop)          cmd_simple_post stop "$@" ;;
   rm|remove|del) cmd_rm "$@" ;;
@@ -1488,9 +1901,13 @@ case "$cmd" in
   account|acct)  cmd_account "$@" ;;
   model)         cmd_model "$@" ;;
   full-access)   cmd_full_access "$@" ;;
+  dir)           cmd_dir "$@" ;;
+  pin)           cmd_pin "$@" ;;
+  rename|mv)     cmd_rename "$@" ;;
+  models)        echo "${RED}error:${RESET} models lists what $BOX's agents accept, from its own config files, which the API does not serve — ask it over ssh: $ME $BOX_ARG --ssh models" >&2; exit 2 ;;
   curl)          cmd_curl "$@" ;;
   box|resolve)   echo "$BOX" ;;   # the configured name this spelling resolved to (myhost-01 -> myhost)
   url)           require_config; echo "$AMUX_URL" ;;
   ""|help|-h|--help) usage ;;
-  *)             die "unknown command: $cmd (try: $ME help)" ;;
+  *)             echo "${RED}error:${RESET} unknown command: $cmd (try: $ME help)" >&2; exit 2 ;;
 esac

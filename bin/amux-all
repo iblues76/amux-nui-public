@@ -126,5 +126,5 @@ else
   [ "${#offline[@]}" -gt 0 ] && printf '  offline: %s\n' "$(names "${offline[@]}")"
   [ "$nhid" -gt 0 ] && printf '  (amux -A --showall lists them in full · amux pick -A to choose a session)\n'
 fi
-[ "${#boxes[@]}" -gt 0 ] || echo "  (no boxes configured — add ~/.amux/remotes/<box>.env)"
+[ "${#boxes[@]}" -gt 0 ] || echo "  (no boxes configured — add one: amux -H add <box>)"
 exit 0

@@ -49,6 +49,8 @@ die()  { echo "${RED}error:${RESET} $*" >&2; exit 1; }
 info() { echo "$*"; }
 
 usage() { awk 'NR==1&&/^#!/{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit "${1:-0}"; }
+# A wrong command line: the usage line on stderr, exit 2 (the same rule as amux).
+usage_die() { echo "usage: amux-rename [-n] <old> <new>   (amux-rename -h for help)" >&2; exit 2; }
 
 DRY=0
 args=()
@@ -57,11 +59,11 @@ while [[ $# -gt 0 ]]; do
     -h|--help)    usage 0 ;;
     -n|--dry-run) DRY=1; shift ;;
     --)           shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
-    -*)           die "unknown option: $1 (try -h)" ;;
+    -*)           echo "${RED}error:${RESET} amux-rename: unknown option '$1' (see amux-rename -h)" >&2; exit 2 ;;
     *)            args+=("$1"); shift ;;
   esac
 done
-[[ ${#args[@]} -eq 2 ]] || usage 1
+[[ ${#args[@]} -eq 2 ]] || usage_die
 OLD_QUERY="${args[0]}"
 NEW="${args[1]}"
 
@@ -98,7 +100,7 @@ resolve_session() {
   done
   if [[ ${#matches[@]} -eq 1 ]]; then echo "${matches[0]}"; return
   elif [[ ${#matches[@]} -gt 1 ]]; then die "ambiguous: '$query' matches ${matches[*]}"; fi
-  die "session '$query' not found"
+  die "session '$query' not found on this box (see: amux ls)"
 }
 
 OLD="$(resolve_session "$OLD_QUERY")"
@@ -106,7 +108,7 @@ OLD="$(resolve_session "$OLD_QUERY")"
 # Validate the new name with the rule `amux register` applies (validate_name): it
 # is written into a file that amux later sources, and used as a tmux target.
 [[ "$NEW" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] \
-  || die "invalid new name '$NEW' (allowed: letters, digits, '_', '-'; it cannot start with '-')"
+  || { echo "${RED}error:${RESET} invalid new name '$NEW' (allowed: letters, digits, '_' and '-'; it cannot start with '-')" >&2; exit 2; }
 [[ "$NEW" == "$OLD" ]] && die "new name is the same as the old name"
 [[ -e "$CC_SESSIONS/$NEW.env" ]] && die "session '$NEW' already exists"
 

@@ -47,10 +47,11 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -n|--dry-run) dry=1 ;;
     -y|--yes)     yes=1 ;;
-    -k|--keep)    shift; [ $# -gt 0 ] || { echo "usage: -k <name[,name...]>" >&2; exit 2; }
+    -k|--keep)    shift; [ $# -gt 0 ] || { echo "usage: amux-rm-stopped [-n] [-y] [-k <name[,name...]>]" >&2; exit 2; }
                   if [ -n "$keep_csv" ]; then keep_csv="$keep_csv,$1"; else keep_csv="$1"; fi ;;
     -h|--help)    usage; exit 0 ;;
-    *)            echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    -*)           echo "${R}error:${N} amux-rm-stopped: unknown option '$1' (see amux-rm-stopped -h)" >&2; exit 2 ;;
+    *)            echo "${R}error:${N} amux-rm-stopped: unexpected argument '$1' — it removes every stopped session; one session: amux rm $1" >&2; exit 2 ;;
   esac
   shift
 done

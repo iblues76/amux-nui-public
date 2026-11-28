@@ -8,8 +8,8 @@
 
 set -euo pipefail
 
-CC_VERSION="0.9.23"
-CC_RELEASE="0.7.7"   # this repository's release: the VERSION file (tools/selftest checks they agree)
+CC_VERSION="0.9.24"
+CC_RELEASE="0.7.8"   # this repository's release: the VERSION file (tools/selftest checks they agree)
 _RESUME_TARGET=""
 _RESUME_SKIPPED=""
 
@@ -48,6 +48,16 @@ fi
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 die() { echo "${RED}error:${RESET} $*" >&2; exit 1; }
+# ONE wording and exit code for the common errors (2026-11-27), the same in amux-remote:
+#   usage: <command line>                              exit 2  (typed wrong)
+#   <cmd>: unknown option '<opt>' (see <cmd> -h)       exit 2
+#   <cmd>: unexpected argument '<arg>' (…)             exit 2
+#   session '<name>' not found on this box (…)         exit 1  (it did not work)
+#   session '<name>' is not running (start it: …)      exit 1  (0 for stop: nothing to do)
+usage_die() { echo "usage: $*" >&2; exit 2; }
+bad_opt()   { echo "${RED}error:${RESET} $1: unknown option '$2' (see $1 -h)" >&2; exit 2; }
+bad_arg()   { echo "${RED}error:${RESET} $1: unexpected argument '$2'${3:+ — $3}" >&2; exit 2; }
+not_running() { die "session '$1' is not running (start it: amux start $1)"; }
 
 need_tmux() {
   command -v tmux &>/dev/null || die "tmux is required. Install with: brew install tmux"
@@ -78,6 +88,10 @@ _session_files() {
 # Resolve session name from partial match or alias
 resolve_session() {
   local query="$1"
+  # No name at all: every name starts with "", so this used to say "ambiguous: ''
+  # matches <every session>", or pick the only one. Each command checks first and
+  # prints its own usage line; this is the backstop.
+  [[ -n "$query" ]] || usage_die "amux <command> <name> …   (a session name or its amux ls row number is required)"
   # Exact match first
   if [[ -f "$CC_SESSIONS/$query.env" ]]; then
     echo "$query"
@@ -114,14 +128,14 @@ resolve_session() {
   elif [[ ${#matches[@]} -gt 1 ]]; then
     die "ambiguous: '$query' matches ${matches[*]}"
   fi
-  die "session '$query' not found on this box (to look on your other boxes: add --find)"
+  die "session '$query' not found on this box (see: amux ls; on other boxes: amux search --sessions $query)"
 }
 
 # Load session config into env vars
 load_session() {
   local name="$1"
   local file="$CC_SESSIONS/$name.env"
-  [[ -f "$file" ]] || die "session '$name' not found"
+  [[ -f "$file" ]] || die "session '$name' not found on this box (see: amux ls)"
   # shellcheck disable=SC1090
   source "$file"
 }
@@ -139,12 +153,12 @@ tmux_name() { echo "amux-$1"; }
 # targets — an unvalidated name containing a quote, newline, or shell metacharacter is a
 # command-injection into the operator's shell, and slashes / '..' could redirect the .env
 # path. Whitelist a conservative charset (mirrors the check `amux rename` already does).
+AMUX_NAME_RULE="allowed: letters, digits, '_' and '-'; it cannot start with '-'"
 validate_name() {
   local n="$1"
   case "$n" in
-    "")                die "session name is empty" ;;
-    -*)                die "session name cannot start with '-': '$n'" ;;
-    *[!A-Za-z0-9_-]*)  die "invalid session name '$n' (allowed: letters, digits, '_', '-')" ;;
+    "")                   usage_die "amux register|exec <name> --provider <p> …" ;;
+    -*|*[!A-Za-z0-9_-]*)  echo "${RED}error:${RESET} invalid session name '$n' ($AMUX_NAME_RULE)" >&2; exit 2 ;;
   esac
 }
 
@@ -961,15 +975,45 @@ _split_color_flag() {
   return 0
 }
 
+# The agent flags register/exec STORE in a session's CC_FLAGS (2026-11-27: one list).
+# Any other word on exec goes to that one launch; register refuses it. parse_claude_flags
+# reads these, `amux -H <box> exec|register` gets them from `amux __agent-flags` (so the
+# box stores the same ones), and the completion scripts are built from them.
+AMUX_AGENT_VALUE_FLAGS="--model --permission-mode --system-prompt --append-system-prompt --mcp-config --allowedTools --allowed-tools --disallowedTools --disallowed-tools --add-dir --effort --mode --settings --setting-sources --tools --plugin-dir --agents --agent --betas --debug-file --json-schema --fallback-model --max-budget-usd --session-id --file"
+# (--strict-mcp-config takes no value: it sat in the value list until 2026-11-23 and
+# swallowed whatever flag followed it)
+AMUX_AGENT_BOOL_FLAGS="--dangerously-skip-permissions --allow-dangerously-skip-permissions --verbose --chrome --no-chrome --debug --disable-slash-commands --no-session-persistence --ide --fork-session --strict-mcp-config"
+
 parse_claude_flags() {
   CC_FLAGS=()
   CC_DIR=""
   CC_EXTRA_ARGS=()
   CC_PROVIDER_OPT=""
   CC_ACCOUNT_OPT=""
+  CC_DESC_OPT=""; CC_DESC_SET=0
   local _dir_src=""
 
   while [[ $# -gt 0 ]]; do
+    # --opt=value is the same as --opt value for every option that takes a value
+    # (2026-11-27): `--dir=PATH` used to fall through to the agent's arguments, so
+    # exec registered the session in $PWD and then failed on start, and register
+    # refused `--model=opus` as a word it did not know.
+    if [[ "$1" == --*=* && " $AMUX_AGENT_VALUE_FLAGS --dir --desc " == *" ${1%%=*} "* ]]; then
+      [[ -n "${1#*=}" || "${1%%=*}" == --desc ]] || die "${1%%=*} needs a value"
+      set -- "${1%%=*}" "${1#*=}" "${@:2}"
+    fi
+    # The agent flags to store (the one list above)
+    if [[ " $AMUX_AGENT_VALUE_FLAGS " == *" $1 "* ]]; then
+      [[ $# -ge 2 ]] || die "$1 needs a value"
+      CC_FLAGS+=("$1" "$2")
+      shift 2
+      continue
+    fi
+    if [[ " $AMUX_AGENT_BOOL_FLAGS " == *" $1 "* ]]; then
+      CC_FLAGS+=("$1")
+      shift
+      continue
+    fi
     case "$1" in
       # Prompt suggestions (2026-10-14): if you turn them off with promptSuggestionEnabled=false
       # in ~/.claude/settings.json, --autoprompt turns them back ON for THIS session.
@@ -1029,28 +1073,9 @@ parse_claude_flags() {
         validate_provider "$CC_PROVIDER_OPT"
         shift
         ;;
-      # Flags that take a value
-      --model|--permission-mode|--system-prompt|--append-system-prompt|\
-      --mcp-config|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|\
-      --add-dir|--effort|--mode|--settings|--setting-sources|--tools|\
-      --plugin-dir|--agents|--agent|--betas|--debug-file|--json-schema|\
-      --fallback-model|--max-budget-usd|--session-id|--file)
-        [[ $# -ge 2 ]] || die "$1 needs a value"
-        CC_FLAGS+=("$1" "$2")
-        shift 2
-        ;;
-      # Boolean flags (--strict-mcp-config takes no value: listed above, it swallowed
-      # whatever flag followed it)
-      --dangerously-skip-permissions|--allow-dangerously-skip-permissions|\
-      --full-access|--yolo|--verbose|--chrome|--no-chrome|--debug|\
-      --disable-slash-commands|--no-session-persistence|--ide|--fork-session|\
-      --strict-mcp-config)
-        # Store the compatibility spelling; cmd_start re-spells it per provider.
-        if [[ "$1" == "--yolo" || "$1" == "--full-access" ]]; then
-          CC_FLAGS+=("--dangerously-skip-permissions")
-        else
-          CC_FLAGS+=("$1")
-        fi
+      # Full access: store the compatibility spelling; cmd_start re-spells it per provider.
+      --full-access|--yolo)
+        CC_FLAGS+=("--dangerously-skip-permissions")
         shift
         ;;
       # Working directory — resolve to absolute path, create if needed.
@@ -1067,10 +1092,18 @@ parse_claude_flags() {
         CC_DIR="$(cd "$2" && pwd)" || die "cannot resolve --dir to absolute path: $2"
         shift 2
         ;;
-      # Server-side options: only `amux -H <box> exec` has them. Stopping here beats
-      # register dropping them without a word and exec handing them to the agent.
-      --desc|--desc=*|--worktree)
-        die "${1%%=*} is an option of 'amux -H <box> exec' (the box's server applies it); this box's register/exec has no such option"
+      # A description, as the dashboard and `amux -H <box> exec --desc` store it (2026-11-27).
+      --desc)
+        [[ $# -ge 2 ]] || die "--desc needs a text"
+        check_env_value "--desc" "$2"
+        [[ "$2" != *$'\n'* ]] || die "--desc may not contain a line break"
+        CC_DESC_OPT="$2"; CC_DESC_SET=1
+        shift 2
+        ;;
+      # The box's server makes the git worktree: only `amux -H <box> exec` has it.
+      # Stopping here beats register dropping it without a word and exec handing it to the agent.
+      --worktree)
+        die "--worktree is an option of 'amux -H <box> exec' (the box's server creates the worktree); this box's register/exec has no such option"
         ;;
       # Everything else goes to extra args
       *)
@@ -1079,7 +1112,10 @@ parse_claude_flags() {
         ;;
     esac
   done
-  CC_FLAGS_STR="${CC_FLAGS[*]:-}"
+  # One token per flag word, shell-quoted (2026-11-27), as the box's server stores them:
+  # joined bare, `--append-system-prompt "React + Tailwind"` came back at the next start
+  # as three words (React became the prompt and "+ Tailwind" two stray arguments).
+  CC_FLAGS_STR=$(quote_argv ${CC_FLAGS[@]+"${CC_FLAGS[@]}"}) || die "failed to quote the flags"
   local _sb=0 _fa=0 _t
   for _t in ${CC_FLAGS[@]+"${CC_FLAGS[@]}"}; do
     case "$_t" in
@@ -1157,9 +1193,18 @@ _write_registration() {
   if [[ " $CC_FLAGS_STR " == *" --partners "* && "$provider" != "opencode" ]]; then
     die "--partners applies to the opencode provider only (session '$name' runs $provider)"
   fi
+  # An iTerm2 tab has no sandbox lane (amux-sandbox wraps tmux launches): refuse it
+  # here, as the box's server does, rather than store a sandbox start cannot apply.
+  if [[ "$provider" == iterm2 && ( " $CC_FLAGS_STR " == *" --net-sandbox "* || " $CC_FLAGS_STR " == *" --full-sandbox "* ) ]]; then
+    die "--net-sandbox / --full-sandbox are not available for iterm2 sessions (use a tmux provider)"
+  fi
   local account extra
   account=$(resolve_account_for_write "$provider" "$file")
   extra=$(_session_extra_lines "$file" "$provider")   # read BEFORE the file is rewritten
+  if (( ${CC_DESC_SET:-0} )); then   # --desc given: it replaces the stored description
+    extra=$(printf '%s\n' "$extra" | grep -v '^CC_DESC=' || true)
+    [[ -z "$CC_DESC_OPT" ]] || extra=$(printf 'CC_DESC="%s"\n%s' "$CC_DESC_OPT" "$extra")
+  fi
   {
     printf '# amux session: %s\n# registered: %s\n' "$name" "$(date -Iseconds)"
     printf 'CC_NAME="%s"\nCC_DIR="%s"\nCC_FLAGS="%s"\nCC_PROVIDER="%s"\n' \
@@ -1172,7 +1217,7 @@ _write_registration() {
 
 cmd_register() {
   local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: amux register <name> --provider claude|codex|gemini|opencode|iterm2|agy [--model opus] [--full-access] [--dir /path | --pwd] [--autoprompt] [--partners] [agent flags...] (--provider required for a new session)"
+  [[ -n "$name" && "$name" != -* ]] || usage_die "amux register <name> --provider claude|codex|gemini|opencode|iterm2|agy [--model opus] [--full-access] [--dir /path | --pwd] [--autoprompt] [--partners] [agent flags...] (--provider required for a new session)"
   validate_name "$name"
   shift
 
@@ -1182,7 +1227,8 @@ cmd_register() {
   # register only stores: anything it does not recognise used to vanish without a
   # word (`--strict-mcp-config --model opus` once lost the model this way).
   if (( ${#CC_EXTRA_ARGS[@]} )); then
-    die "register does not know '${CC_EXTRA_ARGS[0]}' — it stores a session's options and the agent flags amux knows; a prompt or a one-launch flag belongs to: amux exec $name … / amux start $name …"
+    echo "${RED}error:${RESET} register does not know '${CC_EXTRA_ARGS[0]}' — it stores a session's options and the agent flags amux knows; a prompt or a one-launch flag belongs to: amux exec $name … / amux start $name …" >&2
+    exit 2
   fi
 
   _write_registration register "$name"
@@ -1216,9 +1262,21 @@ resolve_account_for_write() {
 # Also accepts the flag spelling (`amux provider <session> --provider <p>` /
 # `--provider=<p>`), 2026-08-12: exec/register teach the flag form, so typing it
 # here must work instead of dying with "invalid session name".
+# A change to a RUNNING session's provider, account, folder or model (2026-11-27): the
+# change is stored, then the session is restarted so it takes effect; the agent is asked
+# to exit first (as amux stop does) and its conversation resumes. The same rule as the
+# server, so `amux X` and `amux -H <box> X` behave alike.
+_restart_for_change() { # $1 name, $2 what changed
+  echo "${DIM}restarting $1 so the new $2 takes effect (its conversation resumes)${RESET}"
+  ( cmd_stop "$1" ) >/dev/null 2>&1 || die "could not stop '$1'; the new $2 is stored and takes effect on its next start"
+  ( cmd_start "$1" --no-attach ) >/dev/null 2>&1 || die "'$1' stopped but did not start again; the new $2 is stored: amux start $1"
+  echo "${GREEN}restarted${RESET} $1"
+}
+
 cmd_provider() {
-  local name
-  name=$(resolve_session "${1:-}")
+  local name _was_running=0
+  [[ -n "${1:-}" ]] || usage_die "amux provider <name> [claude|codex|gemini|opencode|iterm2|agy]"
+  name=$(resolve_session "$1")
   local file="$CC_SESSIONS/$name.env"
   local cur
   cur=$(sed -n 's/^CC_PROVIDER="\{0,1\}\([a-z0-9]*\)"\{0,1\}$/\1/p' "$file" | head -1)
@@ -1240,7 +1298,7 @@ cmd_provider() {
     return
   fi
   if is_running "$name" 2>/dev/null; then
-    die "session '$name' is running — stop it first (amux stop $name), then change the provider"
+    _was_running=1
   fi
   # PARITY with the server's PATCH provider-change (2026-08-12): until now this
   # command only rewrote CC_PROVIDER and left CC_FLAGS alone, while the server
@@ -1368,8 +1426,14 @@ os.replace(tmp, envf)
 print(f"flags: {flags or '(none)'} -> {newflags or '(none)'}")
 PYEOF
 ) || die "failed to update $file"
-  echo "${GREEN}provider${RESET} $name: $cur -> ${BOLD}$new${RESET} ${DIM}(takes effect on next start)${RESET}"
+  if (( _was_running )); then
+    echo "${GREEN}provider${RESET} $name: $cur -> ${BOLD}$new${RESET}"
+  else
+    echo "${GREEN}provider${RESET} $name: $cur -> ${BOLD}$new${RESET} ${DIM}(takes effect on next start)${RESET}"
+  fi
   echo "  ${DIM}${summary}${RESET}"
+  (( _was_running )) && _restart_for_change "$name" provider
+  return 0
 }
 
 # amux account <name> [P|T|X] — show or change which Claude subscription a
@@ -1380,8 +1444,9 @@ PYEOF
 # re-pointed it at $PWD). Non-claude providers have no account: show says so,
 # set refuses. Flag spelling (--account T / --account=T) accepted like exec.
 cmd_account() {
-  local name
-  name=$(resolve_session "${1:-}")
+  local name _was_running=0
+  [[ -n "${1:-}" ]] || usage_die "amux account <name> [personal|team|team2|P|T|X|<api key name>]"
+  name=$(resolve_session "$1")
   local file="$CC_SESSIONS/$name.env"
   local prov cur new
   prov=$(sed -n 's/^CC_PROVIDER="\{0,1\}\([a-z0-9]*\)"\{0,1\}$/\1/p' "$file" | head -1)
@@ -1411,7 +1476,7 @@ cmd_account() {
     return
   fi
   if is_running "$name" 2>/dev/null; then
-    die "session '$name' is running — stop it first (amux stop $name), then change the account"
+    _was_running=1
   fi
   # Same rule as launch: a team/team2 slot must be provisioned here; personal may
   # be absent on browser-/login boxes and still works.
@@ -1438,7 +1503,165 @@ with os.fdopen(fd, "w") as f:
     f.write("\n".join(out) + "\n"); f.flush(); os.fsync(f.fileno())
 os.replace(tmp, envf)
 PYEOF
-  echo "${GREEN}account${RESET} $name: $cur -> ${BOLD}$new${RESET} ($(account_col "$new")) ${DIM}(takes effect on next start)${RESET}"
+  if (( _was_running )); then
+    echo "${GREEN}account${RESET} $name: $cur -> ${BOLD}$new${RESET} ($(account_col "$new"))"
+    _restart_for_change "$name" account
+  else
+    echo "${GREEN}account${RESET} $name: $cur -> ${BOLD}$new${RESET} ($(account_col "$new")) ${DIM}(takes effect on next start)${RESET}"
+  fi
+}
+
+# amux dir <name> [<path>] — show or change the folder a session runs in (2026-11-27).
+# Only CC_DIR changes: a re-register with --dir also replaces the stored flags. The
+# folder is created when missing and stored absolute. Like provider and account, a
+# running session must be stopped first here; on another box (amux -H <box> dir) the
+# box's server restarts a running session in the new folder instead.
+cmd_dir() {
+  [[ -n "${1:-}" && "${1:-}" != -* ]] || usage_die "amux dir <name> [<path>]"
+  [[ $# -le 2 ]] || bad_arg "amux dir" "$3" "usage: amux dir <name> [<path>]"
+  local name file cur shown new _was_running=0
+  name=$(resolve_session "$1")
+  file="$CC_SESSIONS/$name.env"
+  cur=$(sed -n 's/^CC_DIR="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$file" | head -1)
+  shown="$cur"; [[ -n "$shown" ]] || shown="(not set)"
+  if [[ $# -lt 2 ]]; then
+    printf '%s\n' "$shown"
+    return 0
+  fi
+  [[ -n "$2" ]] || die "amux dir: the folder is empty"
+  mkdir -p "$2" 2>/dev/null || die "cannot create the folder: $2"
+  new=$(cd "$2" && pwd) || die "cannot resolve the folder: $2"
+  check_env_value "the folder" "$new"
+  if [[ "$new" == "${cur/#\~/$HOME}" ]]; then
+    echo "$name: folder already $new"
+    return 0
+  fi
+  if is_running "$name" 2>/dev/null; then
+    _was_running=1
+  fi
+  python3 - "$file" "$new" <<'PYEOF' || die "failed to update $file"
+import os, re, sys, tempfile
+envf, new = sys.argv[1], sys.argv[2]
+out, seen = [], False
+for line in open(envf):
+    line = line.rstrip("\n")
+    if re.match(r'^CC_DIR=', line):
+        if not seen:
+            out.append(f'CC_DIR="{new}"'); seen = True
+        continue
+    out.append(line)
+if not seen:
+    out.append(f'CC_DIR="{new}"')
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(envf) or ".", prefix=".env.")
+with os.fdopen(fd, "w") as f:
+    f.write("\n".join(out) + "\n"); f.flush(); os.fsync(f.fileno())
+os.replace(tmp, envf)
+PYEOF
+  if (( _was_running )); then
+    echo "${GREEN}folder${RESET} $name: $shown -> ${BOLD}$new${RESET}"
+    _restart_for_change "$name" folder
+  else
+    echo "${GREEN}folder${RESET} $name: $shown -> ${BOLD}$new${RESET} ${DIM}(takes effect on next start)${RESET}"
+  fi
+}
+
+# Rewrite one KEY="value" line of a session .env in place (atomic); "" removes the line.
+_env_set_line() { # $1 file, $2 key, $3 value
+  python3 - "$1" "$2" "$3" <<'PYEOF' || die "failed to update $1"
+import os, re, sys, tempfile
+envf, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+out, seen = [], False
+for line in open(envf):
+    line = line.rstrip("\n")
+    if re.match(r'^%s=' % re.escape(key), line):
+        if not seen and val:
+            out.append('%s="%s"' % (key, val))
+        seen = True
+        continue
+    out.append(line)
+if not seen and val:
+    out.append('%s="%s"' % (key, val))
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(envf) or ".", prefix=".env.")
+with os.fdopen(fd, "w") as f:
+    f.write("\n".join(out) + "\n"); f.flush(); os.fsync(f.fileno())
+os.replace(tmp, envf)
+PYEOF
+}
+
+# amux pin <name> [on|off] — show or set the dashboard pin (2026-11-27). A pinned session
+# is one somebody marked to keep: rm refuses it without --force, here and on the box.
+cmd_pin() {
+  [[ -n "${1:-}" && "${1:-}" != -* ]] || usage_die "amux pin <name> [on|off]"
+  [[ $# -le 2 ]] || bad_arg "amux pin" "$3" "usage: amux pin <name> [on|off]"
+  local name file cur
+  name=$(resolve_session "$1")
+  file="$CC_SESSIONS/$name.env"
+  cur=$( (unset CC_PINNED; load_session "$name" >/dev/null 2>&1; [[ "${CC_PINNED:-}" == 1 ]] && echo on || echo off) )
+  if [[ $# -lt 2 ]]; then echo "$cur"; return 0; fi
+  local want
+  case "$2" in
+    on|yes|true|1)  want=on ;;
+    off|no|false|0) want=off ;;
+    *) usage_die "amux pin <name> [on|off]   (got '$2')" ;;
+  esac
+  if [[ "$want" == "$cur" ]]; then echo "$name: already pinned $want"; return 0; fi
+  if [[ "$want" == on ]]; then _env_set_line "$file" CC_PINNED 1; else _env_set_line "$file" CC_PINNED ""; fi
+  echo "${GREEN}pin${RESET} $name: ${BOLD}$want${RESET}"
+}
+
+# amux model <name> [<model>] — show or change ONE session's model (2026-11-27), as
+# `amux -H <box> model` does. Only the --model in its flags changes. The models each
+# agent accepts: amux models [provider] (also `amux model` with no session, or with a
+# provider name that is not a session, as before). Like provider and account, a
+# running session must be stopped first here; the box's server restarts it instead.
+cmd_model() {
+  if [[ -z "${1:-}" ]] || { [[ ! -f "$CC_SESSIONS/$1.env" ]] && [[ " all claude codex opencode gemini agy iterm2 cc cx oc ag antigravity gm -h --help " == *" $1 "* ]]; }; then
+    cmd_models "$@"; return
+  fi
+  [[ $# -le 2 ]] || bad_arg "amux model" "$3" "usage: amux model <name> [<model>]"
+  local name file flags cur _was_running=0
+  name=$(resolve_session "$1")
+  file="$CC_SESSIONS/$name.env"
+  flags=$(sed -n 's/^CC_FLAGS="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$file" | head -1)
+  cur=$(python3 -c 'import shlex,sys
+try: f = shlex.split(sys.argv[1])
+except ValueError: f = sys.argv[1].split()
+m = ""
+for i, t in enumerate(f):
+    if t in ("--model", "-m") and i + 1 < len(f): m = f[i + 1]
+    elif t.startswith("--model="): m = t.split("=", 1)[1]
+print(m)' "$flags")
+  if [[ $# -lt 2 ]]; then
+    if [[ -n "$cur" ]]; then echo "$cur"; else echo "(the agent's default)"; fi
+    return 0
+  fi
+  [[ -n "$2" && "$2" != -* ]] || usage_die "amux model <name> [<model>]"
+  check_env_value "the model" "$2"
+  local _mre='^[A-Za-z0-9][]A-Za-z0-9._:/@[-]*$'   # claude-opus-4-6[1m], ollama/qwen3:8b, deepinfra/org/Model-70B
+  [[ "$2" =~ $_mre ]] || die "invalid model name '$2'"
+  if [[ "$2" == "$cur" ]]; then echo "$name: model already $2"; return 0; fi
+  if is_running "$name" 2>/dev/null; then
+    _was_running=1
+  fi
+  local newflags
+  newflags=$(python3 -c 'import shlex,sys
+try: f = shlex.split(sys.argv[1])
+except ValueError: f = sys.argv[1].split()
+out, i = [], 0
+while i < len(f):
+    if f[i] in ("--model", "-m") and i + 1 < len(f): i += 2; continue
+    if f[i].startswith("--model="): i += 1; continue
+    out.append(f[i]); i += 1
+print(" ".join(shlex.quote(t) for t in ["--model", sys.argv[2]] + out))' "$flags" "$2")
+  check_env_value "CC_FLAGS" "$newflags"
+  _env_set_line "$file" CC_FLAGS "$newflags"
+  local was="$cur"; [[ -n "$was" ]] || was="(default)"
+  if (( _was_running )); then
+    echo "${GREEN}model${RESET} $name: $was -> ${BOLD}$2${RESET}"
+    _restart_for_change "$name" model
+  else
+    echo "${GREEN}model${RESET} $name: $was -> ${BOLD}$2${RESET} ${DIM}(takes effect on next start)${RESET}"
+  fi
 }
 
 # Launch (or reveal) an iTerm2-provider session (2026-08-12): a new tab in the
@@ -1540,7 +1763,8 @@ _resume_suspended() {
 
 cmd_start() {
   local name
-  name=$(resolve_session "${1:-}")
+  [[ -n "${1:-}" && "${1:-}" != -* ]] || usage_die "amux start <name> [--fresh] [--no-attach] [--provider <p>] [--account <a>] [--full-access | --net-sandbox | --full-sandbox] [--color <c>] [agent flags...]"
+  name=$(resolve_session "$1")
   shift 2>/dev/null || true
   load_defaults
   load_session "$name"
@@ -1661,6 +1885,9 @@ cmd_start() {
   # iTerm2 provider (2026-08-12): the session lives in a REAL iTerm2 tab, not
   # tmux — spawn/reveal it and return before any tmux logic runs.
   if [[ "${CC_PROVIDER:-}" == "iterm2" ]]; then
+    # The sandbox is applied by the tmux launch below; an iTerm2 tab would run
+    # unconfined (until 2026-11-27 it did). Refused, as help access promises.
+    [[ -z "$_sbx" ]] || die "--net-sandbox / --full-sandbox are not available for iterm2 sessions (use a tmux provider); nothing was started"
     _start_iterm2_session "$name" "$_fresh" "$_oneshot_full_access" "$account"
     return
   fi
@@ -1672,8 +1899,10 @@ cmd_start() {
   local _oneshot_model=0 _t
   for _t in "$@"; do
     case "${_t%%=*}" in
-      --dir)
-        die "--dir is an exec/register option; session '$name' already runs in ${CC_DIR:-?} (change it with: amux register $name --dir <path>)" ;;
+      # --pwd too (2026-11-27): it used to reach the agent's argv. The way to move a
+      # session is amux dir, which keeps its flags (a re-register replaces them).
+      --dir|--pwd)
+        die "${_t%%=*} is an exec/register option; session '$name' already runs in ${CC_DIR:-?} (move it: amux dir $name <path>)" ;;
       --worktree|--desc)
         die "${_t%%=*} is an exec/register option, not a start flag (use: amux register/exec)" ;;
       --model|-m)
@@ -2383,7 +2612,7 @@ PYEOF
 cmd_exec() {
   # Register + start in one step
   local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: amux exec <name> --provider claude|codex|gemini|opencode|iterm2|agy [--model opus] [--full-access] [--dir /path | --pwd] [--autoprompt] [--partners] [agent flags...] (--provider required for a new session)"
+  [[ -n "$name" && "$name" != -* ]] || usage_die "amux exec <name> --provider claude|codex|gemini|opencode|iterm2|agy [--model opus] [--full-access] [--dir /path | --pwd] [--autoprompt] [--partners] [agent flags...] (--provider required for a new session)"
   validate_name "$name"
   shift
 
@@ -2447,8 +2676,8 @@ cmd_origin() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --host) want=host ;;
-      -*)     die "unknown origin option: $1 (try --host)" ;;
-      *)      [[ -n "$name" ]] && die "unexpected argument: $1"; name="$1" ;;
+      -*)     bad_opt "amux origin" "$1" ;;
+      *)      [[ -z "$name" ]] || bad_arg "amux origin" "$1" "it takes one session"; name="$1" ;;
     esac
     shift
   done
@@ -2461,7 +2690,7 @@ cmd_origin() {
       name="${name#amux-}"
     fi
   fi
-  [[ -n "$name" ]] || die "usage: amux origin [<name>] [--host]   (inside a session <name> defaults to this one)"
+  [[ -n "$name" ]] || usage_die "amux origin [<name>] [--host]   (inside a session <name> defaults to this one)"
   name=$(resolve_session "$name")
   local f="$CC_HOME/origins/$name" host="" user="" lane="" term="" at="" k v
   if [[ ! -f "$f" ]]; then
@@ -2509,11 +2738,20 @@ cmd_attach() {
     -t|--target) shift ;;
     -t?*)        set -- "${1#-t}" "${@:2}" ;;
   esac
-  name=$(resolve_session "${1:-}")
-  case "${2:-}" in
-    --color)   [[ -n "${3:-}" ]] || die "--color needs a value (see: amux color palette)"; AMUX_COLOR_ONESHOT="$3" ;;
-    --color=*) AMUX_COLOR_ONESHOT="${2#--color=}" ;;
-  esac
+  [[ -n "${1:-}" ]] || usage_die "amux attach <name> [--color <c>]"
+  name=$(resolve_session "$1")
+  shift
+  # After the name: --color only (anything else used to be ignored without a word).
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --color)   [[ -n "${2:-}" ]] || die "--color needs a value (see: amux color palette)"; AMUX_COLOR_ONESHOT="$2"; shift ;;
+      --color=*) AMUX_COLOR_ONESHOT="${1#--color=}" ;;
+      --mosh|--cc|--plain) echo "amux attach: $1 is for a session on another box; '$name' is on this one — attaching here" >&2 ;;
+      -*) bad_opt "amux attach" "$1" ;;
+      *)  bad_arg "amux attach" "$1" "it takes one session" ;;
+    esac
+    shift
+  done
   if [[ -n "${AMUX_COLOR_ONESHOT:-}" ]]; then
     [[ "$AMUX_COLOR_ONESHOT" =~ ^#?[A-Za-z0-9]+$ ]] || die "invalid --color '$AMUX_COLOR_ONESHOT' (see: amux color palette)"
   fi
@@ -2521,7 +2759,7 @@ cmd_attach() {
   local _sid
   _sid=$(_iterm2_id "$name")
   if [[ -n "$_sid" ]]; then
-    is_running "$name" || die "session '$name' is not running. Start with: amux start $name"
+    is_running "$name" || not_running "$name"
     _iterm2_select "$_sid" >/dev/null || true
     echo "${GREEN}revealed${RESET} ${BOLD}$name${RESET}'s iTerm2 tab"
     return
@@ -2529,13 +2767,14 @@ cmd_attach() {
   need_tmux
   local tname
   tname=$(tmux_name "$name")
-  is_running "$name" || die "session '$name' is not running. Start with: amux start $name"
+  is_running "$name" || not_running "$name"
   _attach_probed "$tname" "$name"
 }
 
 cmd_peek() {
   local name
-  name=$(resolve_session "${1:-}")
+  [[ -n "${1:-}" ]] || usage_die "amux peek <name> [lines]"
+  name=$(resolve_session "$1")
   shift 2>/dev/null || true
   # [lines] defaults to 30 here and through `amux -H <box> peek`. --raw is the
   # remote peek's "keep every escape" switch: a local capture is plain text
@@ -2544,8 +2783,9 @@ cmd_peek() {
   for _a in "$@"; do
     case "$_a" in
       --raw) ;;
+      -*) bad_opt "amux peek" "$_a" ;;
       *) [[ -z "$lines" && "$_a" =~ ^[0-9]+$ ]] \
-           || die "usage: amux peek <name> [lines]   (lines is a number, default 30; got '$_a')"
+           || usage_die "amux peek <name> [lines]   (lines is a number, default 30; got '$_a')"
          lines="$_a" ;;
     esac
   done
@@ -2555,7 +2795,7 @@ cmd_peek() {
   local _sid
   _sid=$(_iterm2_id "$name")
   if [[ -n "$_sid" ]]; then
-    is_running "$name" || die "session '$name' is not running"
+    is_running "$name" || not_running "$name"
     echo "${BOLD}── $name ──${RESET}"
     _iterm2_capture "$_sid" | tail -n "$lines"
     echo "${BOLD}── end ──${RESET}"
@@ -2565,7 +2805,7 @@ cmd_peek() {
 
   local tname
   tname=$(tmux_name "$name")
-  is_running "$name" || die "session '$name' is not running"
+  is_running "$name" || not_running "$name"
 
   echo "${BOLD}── $name ──${RESET}"
   # Claude/codex TUIs run on the ALTERNATE screen (history_size=0), so `-S -N`
@@ -2583,7 +2823,8 @@ cmd_peek() {
 
 cmd_send() {
   local name
-  name=$(resolve_session "${1:-}")
+  [[ -n "${1:-}" ]] || usage_die "amux send <name> <text>   or   amux send <name> --keys <key>..."
+  name=$(resolve_session "$1")
   shift
 
   # iTerm2-provider session: `write text` types the text + Enter in one call.
@@ -2591,10 +2832,10 @@ cmd_send() {
   local _sid
   _sid=$(_iterm2_id "$name")
   if [[ -n "$_sid" ]]; then
-    is_running "$name" || die "session '$name' is not running"
+    is_running "$name" || not_running "$name"
     [[ "${1:-}" != "--keys" ]] || die "--keys is not supported for iTerm2 sessions (no tmux); plain text only"
     local text="$*"
-    [[ -n "$text" ]] || die "usage: amux send <name> <text>"
+    [[ -n "$text" ]] || usage_die "amux send <name> <text>"
     [[ -n "$(_iterm2_send "$_sid" "$text")" ]] || die "could not reach $name's iTerm2 pane"
     echo "${GREEN}sent${RESET} to $name: $text"
     return
@@ -2603,7 +2844,7 @@ cmd_send() {
 
   local tname
   tname=$(tmux_name "$name")
-  is_running "$name" || die "session '$name' is not running"
+  is_running "$name" || not_running "$name"
 
   # Check for --keys flag
   if [[ "${1:-}" == "--keys" ]]; then
@@ -2612,7 +2853,7 @@ cmd_send() {
     echo "${GREEN}sent keys${RESET} to $name"
   else
     local text="$*"
-    [[ -n "$text" ]] || die "usage: amux send <name> <text>  or  amux send <name> --keys 'C-c'"
+    [[ -n "$text" ]] || usage_die "amux send <name> <text>   or   amux send <name> --keys <key>..."
     # Send text literally (-l), then Enter as a separate key after a short
     # delay. Claude Code's TUI buffers/debounces input; sending text and Enter
     # in one send-keys call lets Enter arrive before the text is processed.
@@ -2635,12 +2876,13 @@ cmd_stop() {
   for a in "$@"; do
     case "$a" in
       --now|--force|-f) now=1 ;;
-      -*) die "amux stop: unknown option '$a' — usage: amux stop [--now] <name>" ;;
+      -*) bad_opt "amux stop" "$a" ;;
       *) rest+=("$a") ;;
     esac
   done
-  (( ${#rest[@]} <= 1 )) || die "amux stop takes one session — every session: amux stop-all"
-  name=$(resolve_session "${rest[0]:-}")
+  (( ${#rest[@]} <= 1 )) || bad_arg "amux stop" "${rest[1]}" "it takes one session; every session: amux stop-all"
+  (( ${#rest[@]} == 1 )) || usage_die "amux stop [--now] <name>"
+  name=$(resolve_session "${rest[0]}")
 
   # iTerm2-provider session: there is no tmux to kill. Ask the agent in the
   # tab to exit gracefully (/exit); the tab itself stays open (it's the
@@ -2652,7 +2894,7 @@ cmd_stop() {
       _iterm2_send "$_sid" "/exit" >/dev/null || true
       echo "${RED}stop requested${RESET} $name ${DIM}(sent /exit to its iTerm2 tab; close the tab to fully remove it)${RESET}"
     else
-      echo "${DIM}$name is not running${RESET}"
+      echo "${DIM}session '$name' is not running${RESET}"
     fi
     return
   fi
@@ -2661,7 +2903,7 @@ cmd_stop() {
   local tname
   tname=$(tmux_name "$name")
   if ! is_running "$name"; then
-    echo "${DIM}$name is not running${RESET}"
+    echo "${DIM}session '$name' is not running${RESET}"
     return
   fi
   local how=""
@@ -2688,17 +2930,18 @@ cmd_rm() {
   for a in "$@"; do
     case "$a" in
       -f|--force) force=1 ;;
-      -*) die "amux rm: unknown option '$a' — usage: amux rm [--force] <name>" ;;
+      -*) bad_opt "amux rm" "$a" ;;
       *) rest+=("$a") ;;
     esac
   done
-  (( ${#rest[@]} <= 1 )) || die "amux rm takes one session — to remove several: amux rmnum <n>,<n>"
-  name=$(resolve_session "${rest[0]:-}")
+  (( ${#rest[@]} <= 1 )) || bad_arg "amux rm" "${rest[1]}" "it takes one session; several: amux rmnum <n>,<n>"
+  (( ${#rest[@]} == 1 )) || usage_die "amux rm [--force] <name>"
+  name=$(resolve_session "${rest[0]}")
 
   # A session pinned in the dashboard is one somebody marked to keep. The dashboard
   # and `amux -H <box> rm` refuse to remove it; so does this, unless --force.
   if (( ! force )) && ( unset CC_PINNED; load_session "$name" >/dev/null 2>&1; [[ "${CC_PINNED:-}" == "1" ]] ); then
-    die "'$name' is pinned in the dashboard — unpin it there first, or: amux rm --force $name"
+    die "session '$name' is pinned in the dashboard — unpin it first (amux pin $name off), or: amux rm --force $name"
   fi
 
   # Stop if running
@@ -2729,10 +2972,11 @@ cmd_rmnum() {
     case "$a" in
       -y|--yes) yes=1 ;;
       -f|--force) force=1 ;;
+      -*) bad_opt "amux rmnum" "$a" ;;
       *) specs+=("$a") ;;
     esac
   done
-  (( ${#specs[@]} )) || die "usage: amux rmnum <n>[,<n>|<a>-<b>...] [-y] [--force]   (numbers from amux ls; --force also removes pinned ones)"
+  (( ${#specs[@]} )) || usage_die "amux rmnum <n>[,<n>|<a>-<b>...] [-y] [--force]   (numbers from amux ls; --force also removes pinned ones)"
 
   local all=() f
   _session_files
@@ -2804,29 +3048,33 @@ cmd_rename() {
       *)            names+=("$a") ;;
     esac
   done
-  [[ ${#names[@]} -eq 2 ]] || die "usage: amux rename [-n] <old> <new>   (-n = show the plan, change nothing)"
+  [[ ${#names[@]} -eq 2 ]] || usage_die "amux rename [-n] <old> <new>   (-n = show the plan, change nothing)"
   # `--` so an old name that starts with a dash (the fat-fingered `--model`) still works
   exec amux-rename ${dry[@]+"${dry[@]}"} -- "${names[0]}" "${names[1]}"
 }
 
 cmd_info() {
-  # amux info <name> | amux info --dir <folder>   [--porcelain]
+  # amux info <name> | amux info --dir <folder>   [--porcelain | --json]
   # --dir lists every session registered for that folder. --porcelain prints one
   # line per session for scripts (the offload tool reads it), tab-separated:
   #   name  state(agent|shell|stopped)  provider  account  folder  flags
+  # --json (2026-11-27) prints what `amux -H <box> info --json` prints: the box's
+  # info object (a list of them with --dir). Through -H the default is this text too.
   local _porc=0 _dir="" _has_dir=0 _rest=()
   while (( $# )); do
     case "$1" in
       --porcelain) _porc=1 ;;
+      --json)      _porc=2 ;;
       --dir)   shift; _has_dir=1; _dir="${1:-}" ;;
       --dir=*) _has_dir=1; _dir="${1#--dir=}" ;;
+      -*) bad_opt "amux info" "$1" ;;
       *) _rest+=("$1") ;;
     esac
     shift || true
   done
   if (( _has_dir )); then
-    [[ -n "$_dir" ]] || die "--dir needs a folder: amux info --dir <path>"
-    local _want _f _n _d _hit=0
+    [[ -n "$_dir" ]] || usage_die "amux info --dir <folder> [--porcelain | --json]"
+    local _want _f _n _d _hit=0 _js=""
     _want=$(cd "$_dir" 2>/dev/null && pwd -P) || die "no such folder: $_dir"
     _session_files
     for _f in ${_SESSION_FILES[@]+"${_SESSION_FILES[@]}"}; do
@@ -2837,8 +3085,9 @@ cmd_info() {
       _d=$(cd "$_E_DIR" 2>/dev/null && pwd -P) || continue
       [[ "$_d" == "$_want" ]] || continue
       _hit=1
-      _info_one "$_n" "$_porc"
+      if (( _porc == 2 )); then _js+="${_js:+,}$(_info_json "$_n" compact)"; else _info_one "$_n" "$_porc"; fi
     done
+    (( _porc == 2 )) && printf '[%s]\n' "$_js"
     if (( ! _hit )); then
       (( _porc )) || echo "no session is registered for $_want"
       return 1
@@ -2846,11 +3095,36 @@ cmd_info() {
     return 0
   fi
   local name
-  name=$(resolve_session "${_rest[0]:-}")
+  (( ${#_rest[@]} == 1 )) || usage_die "amux info <name>   or   amux info --dir <folder>   [--porcelain | --json]"
+  name=$(resolve_session "${_rest[0]}")
   _info_one "$name" "$_porc"
 }
-_info_one() {  # $1 name, $2 1 = one tab-separated line
+# One session as the JSON object the box's server answers for info (2026-11-27).
+_info_json() { # $1 name, $2 compact = one line
+  local st
+  st=$(session_state "$1" 2>/dev/null) || st=stopped
+  python3 - "$CC_SESSIONS/$1.env" "$1" "$st" "${2:-}" <<'PYEOF'
+import json, os, re, sys
+envf, name, st, compact = sys.argv[1:5]
+cfg = {}
+for line in open(envf):
+    m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)="?(.*?)"?$', line.rstrip("\n"))
+    if m:
+        cfg[m.group(1)] = m.group(2)
+raw_dir = cfg.get("CC_DIR", "")
+prov = cfg.get("CC_PROVIDER") or "claude"
+acct = (cfg.get("CC_ACCOUNT") or "personal") if prov in ("claude", "iterm2") else ""
+obj = {"name": name, "dir": os.path.realpath(os.path.expanduser(raw_dir)) if raw_dir else "",
+       "desc": cfg.get("CC_DESC", ""), "pinned": cfg.get("CC_PINNED", "") == "1",
+       "tags": [t.strip() for t in cfg.get("CC_TAGS", "").split(",") if t.strip()],
+       "flags": cfg.get("CC_FLAGS", ""), "provider": prov, "account": acct,
+       "running": st != "stopped", "state": st}
+print(json.dumps(obj) if compact else json.dumps(obj, indent=4))
+PYEOF
+}
+_info_one() {  # $1 name, $2 1 = one tab-separated line, 2 = JSON
   local name="$1"
+  if [[ "$2" == 2 ]]; then _info_json "$name"; return 0; fi
   if [[ "$2" == 1 ]]; then
     local _st _an=""
     _ls_read_env "$CC_SESSIONS/$name.env"
@@ -2859,6 +3133,8 @@ _info_one() {  # $1 name, $2 1 = one tab-separated line
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${_st:-stopped}" "$_E_PROVIDER" "$_an" "$_E_DIR" "$_E_FLAGS"
     return 0
   fi
+  # a field this file does not set must not come from the previous one (info --dir)
+  CC_DIR="" CC_FLAGS="" CC_PROVIDER="" CC_ACCOUNT="" CC_DESC="" CC_PINNED=""
   load_session "$name"
 
   echo "${BOLD}$name${RESET}"
@@ -2877,6 +3153,9 @@ _info_one() {  # $1 name, $2 1 = one tab-separated line
     shell) echo "  status: ${YELLOW}no agent${RESET} ${DIM}(its tmux session is open at a shell; amux start $name starts the agent again)${RESET}" ;;
     *)     echo "  status: ${DIM}stopped${RESET}" ;;
   esac
+  # the dashboard's description and pin, as amux -H <box> info shows them (2026-11-27)
+  [[ -z "${CC_DESC:-}" ]] || echo "  desc:   $CC_DESC"
+  [[ "${CC_PINNED:-}" != 1 ]] || echo "  pinned: yes"
 }
 
 # amux offload <args...> — the offload tool (bin/offload) under the amux name. `amux offload
@@ -2902,8 +3181,8 @@ cmd_ls() {
     case "$_a" in
       -c|--compact)       _compact=1 ;;
       --bare|--no-header) _bare=1 ;;   # no banner over the grid, as for `amux -H <box> ls --bare`
-      -*) die "unknown ls option: $_a (amux ls [-c] [--bare])" ;;
-      *)  die "amux ls takes no name ('$_a'). Sessions whose name contains a text: amux search --sessions $_a" ;;
+      -*) bad_opt "amux ls" "$_a" ;;
+      *)  bad_arg "amux ls" "$_a" "it takes no name; sessions whose name contains a text: amux search --sessions $_a" ;;
     esac
   done
   if (( _compact )); then
@@ -2930,7 +3209,7 @@ cmd_ls() {
     # Build flag summary
     flag_summary=""
     [[ "$_E_FLAGS" == *"--dangerously-skip-permissions"* ]] && flag_summary+=" ${YELLOW}YOLO${RESET}"
-    [[ "$_E_FLAGS" =~ --model\ ([^\ ]+) ]] && flag_summary+=" ${CYAN}${BASH_REMATCH[1]}${RESET}"
+    [[ "$_E_FLAGS" =~ --model\ ([^\ ]+) ]] && flag_summary+=" ${CYAN}${BASH_REMATCH[1]//\'/}${RESET}"   # stored flags are shell-quoted
 
     # Preview last output line if running (iTerm2 sessions: capture the pane)
     preview=""
@@ -2953,7 +3232,7 @@ cmd_ls() {
   done
 
   if ! $has_any; then
-    echo "${DIM}No sessions registered. Run: amux register <name>${RESET}"
+    echo "${DIM}No sessions registered. Make one: amux exec <name> --provider <p> --dir <path>   (amux register … stores it without starting)${RESET}"
   fi
 }
 
@@ -3045,7 +3324,7 @@ cmd_ls_compact() {   # $1 = 1: no banner line (--bare)
 
   local total=${#names[@]}
   if (( total == 0 )); then
-    echo "${DIM}No sessions registered. Run: amux register <name>${RESET}"
+    echo "${DIM}No sessions registered. Make one: amux exec <name> --provider <p> --dir <path>   (amux register … stores it without starting)${RESET}"
     return
   fi
 
@@ -3173,7 +3452,7 @@ cmd_defaults() {
       echo "${GREEN}defaults reset${RESET}"
       ;;
     *)
-      die "usage: amux defaults [show|edit|reset]"
+      usage_die "amux defaults [show|edit|reset]"
       ;;
   esac
 }
@@ -3185,7 +3464,8 @@ cmd_stop_all() {
   for a in "$@"; do
     case "$a" in
       --now|--force|-f) now=--now ;;
-      *) die "amux stop-all: unknown argument '$a' — usage: amux stop-all [--now]" ;;
+      -*) bad_opt "amux stop-all" "$a" ;;
+      *)  bad_arg "amux stop-all" "$a" "it stops every session; one session: amux stop $a" ;;
     esac
   done
   for f in "$CC_SESSIONS"/*.env; do
@@ -3199,11 +3479,22 @@ cmd_stop_all() {
 }
 
 cmd_start_all() {
+  # amux start-all [-n|--dry-run]. Until 2026-11-27 every argument was ignored, so
+  # `amux start-all --dry-run` started every session.
+  local dry=0 a
+  for a in "$@"; do
+    case "$a" in
+      -n|--dry-run) dry=1 ;;
+      -*) bad_opt "amux start-all" "$a" ;;
+      *)  bad_arg "amux start-all" "$a" "it starts every session; one session: amux start $a" ;;
+    esac
+  done
   for f in "$CC_SESSIONS"/*.env; do
     [[ -f "$f" ]] || continue
     local name
     name=$(basename "$f" .env)
     if [[ "$(session_state "$name" 2>/dev/null)" != agent ]]; then
+      if (( dry )); then echo "would start: $name"; continue; fi
       # --no-attach: an attaching start parked the loop inside the first session
       # (and ended it outright when there was no terminal). A subshell per
       # session, so one that cannot start (folder gone, agent missing) is
@@ -3211,6 +3502,7 @@ cmd_start_all() {
       ( cmd_start "$name" --no-attach ) || echo "${YELLOW}start-all:${RESET} $name did not start" >&2
     fi
   done
+  (( dry )) && { echo "${DIM}(dry run — nothing was started)${RESET}"; return 0; }
   echo "${DIM}attach with: amux <name>   ·   see them: amux ls -c${RESET}"
 }
 
@@ -3221,7 +3513,7 @@ cmd_board() {
   case "$subcmd" in
     done|doing|todo|backlog|discarded|review)
       local status="$subcmd"
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID>"
+      local id="${1:-}"; [[ -n "$id" ]] || usage_die "amux board $status <ISSUE-ID>"
       local result
       result=$(curl -sk -X PATCH \
         -H 'Content-Type: application/json' \
@@ -3235,14 +3527,14 @@ cmd_board() {
       ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
-      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status>"
+      [[ -n "$id" && -n "$new_status" ]] || usage_die "amux board status <ISSUE-ID> <status>"
       local result
       result=$(python3 -c 'import json, sys; print(json.dumps({"status": sys.argv[1]}))' "$new_status" \
         | curl -sk -X PATCH -H 'Content-Type: application/json' --data-binary @- "$AMUX_API/api/board/$id")
       echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'→',d['status'])" 2>/dev/null || echo "$result"
       ;;
     add|create)
-      local title="$*"; [[ -n "$title" ]] || die "Usage: amux board add <title>"
+      local title="$*"; [[ -n "$title" ]] || usage_die "amux board add <title>"
       local result
       # The body is built by a JSON encoder: a title with a quote or a backslash in it
       # used to produce a broken request.
@@ -3252,7 +3544,7 @@ cmd_board() {
       ;;
     import)
       # amux board import gh:owner/repo#N [--workspace W] [--project P]
-      local gh_ref="${1:-}"; [[ -n "$gh_ref" ]] || die "Usage: amux board import gh:<owner>/<repo>#<number> [--workspace W] [--project P]"
+      local gh_ref="${1:-}"; [[ -n "$gh_ref" ]] || usage_die "amux board import gh:<owner>/<repo>#<number> [--workspace W] [--project P]"
       shift
       local workspace="" project=""
       while [[ $# -gt 0 ]]; do
@@ -3420,7 +3712,7 @@ print(f'Imported {created} task(s) from {repo}#{issue_num}')
       # amux board progress <ID> "message" — append progress note + post GH comment if gh-linked
       local id="${1:-}"; shift 2>/dev/null || true
       local msg="$*"
-      [[ -n "$id" && -n "$msg" ]] || die "Usage: amux board progress <ISSUE-ID> <message>"
+      [[ -n "$id" && -n "$msg" ]] || usage_die "amux board progress <ISSUE-ID> <message>"
       # Update board task description
       curl -sk -X PATCH \
         -H 'Content-Type: application/json' \
@@ -3569,7 +3861,7 @@ cmd_find() {
   local verb="$1"; shift
   case "$verb" in a) verb=attach ;; p) verb=peek ;; kill) verb=stop ;; esac
   local name="${1:-}"
-  [[ -n "$name" && "$name" != -* ]] || die "usage: amux $verb <name> [args] --find"
+  [[ -n "$name" && "$name" != -* ]] || usage_die "amux $verb <name> [args] --find"
   shift
 
   local err
@@ -3582,15 +3874,19 @@ cmd_find() {
     esac
     return
   fi
-  [[ "$err" == *ambiguous* ]] && die "${err#*error: }"
-  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "invalid session name '$name'"
+  [[ "$err" == *ambiguous* ]] && die "$(printf '%s' "$err" | sed -e $'s/\x1b\\[[0-9;]*m//g' -e 's/^error: //')"
+  # The lookup rule amux-remote applies to a name it is given (the register rule, plus
+  # a '.' for a session an older server made; never a leading '-' or '.').
+  [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || { echo "${RED}error:${RESET} invalid session name '$name' ($AMUX_NAME_RULE)" >&2; exit 2; }
   command -v amux-remote >/dev/null 2>&1 || die "--find needs amux-remote on PATH"
   command -v python3 >/dev/null 2>&1 || die "--find needs python3"
 
   local here; here=$(hostname -s 2>/dev/null || hostname)
   local work; work=$(mktemp -d "${TMPDIR:-/tmp}/amux-find.XXXXXX") || die "mktemp failed"
   # shellcheck disable=SC2064
-  trap "rm -rf '$work'" RETURN
+  # EXIT too: the not-found paths below end with die, which never returns, and left
+  # the folder behind in $TMPDIR every time.
+  trap "rm -rf '$work'" RETURN EXIT
   local f box n=0
   for f in "$HOME/.amux/remotes"/*.env; do
     [[ -e "$f" ]] || continue
@@ -3600,7 +3896,7 @@ cmd_find() {
     ( AMUX_API_CONNECT_TIMEOUT=4 AMUX_API_MAX_TIME=8 amux-remote "$box" curl /api/sessions \
         >"$work/$box.json" 2>/dev/null || rm -f "$work/$box.json" ) &
   done
-  [[ $n -gt 0 ]] || die "session '$name' not found here, and no other boxes are configured (add one: amux -H add <box>)"
+  [[ $n -gt 0 ]] || die "session '$name' not found on this box, and no other boxes are configured (add one: amux -H add <box>)"
   echo "${DIM}'$name' is not on this box — asking $n other boxes…${RESET}" >&2
   wait
 
@@ -3627,7 +3923,7 @@ PY
     [[ -s "$work/$box.json" ]] || silent+=" $box"
   done
   local note=""; [[ -n "$silent" ]] && note=" (no answer from:$silent)"
-  [[ -n "$found" ]] || die "session '$name' is not on this box or any box that answered$note"
+  [[ -n "$found" ]] || die "session '$name' not found on this box or on any box that answered$note"
 
   local -a mbox=() mrun=()
   local b r
@@ -3692,6 +3988,7 @@ cmd_subhelp() {
     reg) c=register ;; run) c=exec ;; a) c=attach ;; p) c=peek ;; kill) c=stop ;;
     remove|del) c=rm ;; mv) c=rename ;; acct) c=account ;; list) c=ls ;;
     choose) c=pick ;; config) c=defaults ;; web) c=serve ;; b) c=board ;;
+    colors|colour) c=color ;; find) c=search ;;
   esac
   [[ "$c" =~ ^[a-z][a-z-]*$ ]] || return 1
   out=$(NO_COLOR=1 cmd_help_all | sed $'s/\x1b\\[[0-9;]*m//g' | awk -v c="$c" '
@@ -3721,7 +4018,7 @@ cmd_models() {
     antigravity|ag) want=agy ;;
     gm) want=gemini ;;
     -h|--help) cmd_subhelp models; return 0 ;;
-    *) die "usage: amux models [claude|codex|opencode|gemini|agy]" ;;
+    *) usage_die "amux models [claude|codex|opencode|gemini|agy]" ;;
   esac
   command -v python3 >/dev/null 2>&1 || die "amux models needs python3"
   local cdef="sonnet" m
@@ -3900,7 +4197,9 @@ ${BOLD}Key commands:${RESET}
   amux stop [--now] <name>       Stop a session: the agent is asked to exit, and the tmux session ends
                                  once it has left, or after 15 s. --now ends it at once
   amux pick [<box>|-A|-R]        fzf picker, live preview (no arg = this box; -A = every box)
-  amux -H <box> <args...>        Run any command on another box (-H FIRST); e.g. amux -H myhost ls -c
+  amux -H <box> <cmd> [args]     A session command on another box (-H FIRST): ls, attach, peek, send, exec,
+                                 start, stop, … (the list: amux -H help); e.g. amux -H myhost ls -c
+  amux -H add <box>              Configure another box: reads its address and dashboard token over ssh
   amux -A [-v|-p]                Every box at once (busiest first); -v verbose, -p pick
 
 ${BOLD}Sessions:${RESET}
@@ -3923,13 +4222,17 @@ ${BOLD}Sessions:${RESET}
                                  together and the agent keeps running (== amux-rename; -n = show the plan)
   amux provider <name> [<p>]     Show or change which agent a session runs
   amux account <name> [P|T|X]    Show or change which Claude subscription it bills to
+  amux dir <name> [<path>]       Show or change the folder it runs in (a running session restarts; its flags are kept)
+  amux model <name> [<model>]    Show or change its model (a running session restarts); every model an agent accepts: amux models
+  amux pin <name> [on|off]       Show or set the dashboard pin (rm refuses a pinned session without --force)
   amux color [<name> [<color>|next|auto|none|--reroll]]
                                  Tab + status-line color per session: list, show, or pin one (20 named
-                                 colors, #rrggbb); --color <c> on start/attach/exec = this launch only;
-                                 amux color palette | --mode hash|distinct|row|random; amux recolor repaints
-                                 open tabs; all options: amux-color -h
-  amux start-all | stop-all      Start every registered session (without attaching) / stop every running one
-                                 (stop-all asks them all at the same time; stop-all --now ends them at once)
+                                 colors, #rrggbb); --color <c> on start/attach = this launch only, on
+                                 register/exec = pinned (amux -H <box> exec: that attach only);
+                                 amux color palette | --mode hash|distinct|row|random; all options: amux color -h
+  amux recolor [<name>...]       Repaint the open tabs of running sessions (default: all of them)
+  amux start-all [-n]            Start every registered session, without attaching (-n: only list them)
+  amux stop-all [--now]          Stop every running session, all asked at the same time (--now: at once)
   amux start|attach|peek|stop <name> --find
                                  Not on this box? Look on the other boxes and act there after a yes
   amux offload <session|folder> [-b <box>]
@@ -3939,7 +4242,7 @@ ${BOLD}Sessions:${RESET}
                                  (run, put, get, fetch, redirect, box): amux offload -h
 
 ${BOLD}Info:${RESET}
-  amux info <name>               Session config details
+  amux info <name> [--porcelain | --json]   Session config details (one line / the box's JSON object)
   amux info --dir <folder>       The sessions registered for a folder (--porcelain: one line each, for scripts)
   amux origin [<name>] [--host]  Box/user/lane you last attached FROM (key=value; inside a session = this one)
   amux models [provider]         Models each agent accepts for --model (default marked *)
@@ -3954,7 +4257,7 @@ ${BOLD}Board:${RESET}
 ${BOLD}Companion utilities${RESET} (separate commands; each has -h):
   amux-up <name>                 Same as amux up
   amux-all                       One session view across every machine (== amux -A)
-  amux-remote <box> [args]       Drive another box's amux over its REST API (== amux -H)
+  amux-remote <box> [args]       Drive another box's amux over its REST API (== amux -H; add a box: amux -H add <box>)
   amux-convos <name>             List a session's past conversations; --resume N picks one
   amux-reauth <name|--all>       Fix a session stuck at 401/login (no browser)
   check-claude-auth              Is auth healthy on this box?
@@ -3982,8 +4285,11 @@ cmd_help_topic() {
   case "$1" in
     remote) cat <<EOF
 ${BOLD}Another box (remote):${RESET}
-  amux -H <box> <cmd> [args]     Run a command on <box>: ls, attach, peek, send, exec, start, stop,
-                                 rm, info, provider, account, model, full-access (amux -H <box> help)
+  amux -H add <box>              Configure a box: its user, address and dashboard token are read over
+                                 ssh into ~/.amux/remotes/<box>.env (mode 600; the token is never shown)
+  amux -H <box> <cmd> [args]     Run a session command on <box>: ls, pick, attach, peek, send, exec,
+                                 register, start, stop, rm, pin, rename, dir, info, provider, account,
+                                 model, full-access (and url, curl, box) — amux -H <box> help
                                  e.g. amux -H myhost ls -c · amux -H myhost start api
                                  -H must come FIRST; everything after the box is passed through untouched.
                                  Only --mosh / --cc / --plain may lead it: amux --mosh -H myhost exec …
@@ -3993,15 +4299,29 @@ ${BOLD}Another box (remote):${RESET}
   amux -A --showall              ...and give every empty/offline box its own block too
   amux -A -v | -p | -h           verbose rows · pick a session from any box · full -A help
 
-  ${BOLD}The same verb here and there:${RESET} on another box its server does the work, by the
-  same rules as here. ${BOLD}stop${RESET} asks the agent to exit and ends the tmux session once it has
-  left, or after 15 s (--now: at once). ${BOLD}ls${RESET} marks a session * while something runs in
-  its pane, ~ when its tmux session is open but the agent has left (amux start brings
-  the agent back in that pane), and leaves it blank when it is stopped; in the compact
-  grid these are ● ◐ ○. peek shows 30 lines. rm removes the registration and its state
-  file; the server also deletes the session's memory file and log. A session pinned in
-  the dashboard is refused by rm on both sides (here: amux rm --force). A codex session
-  resumes the same conversation whoever starts it. Row numbers are that box's own.
+  ${BOLD}The same verb here and there:${RESET} on another box its server does the work, and these
+  match: ${BOLD}stop${RESET} asks the agent to exit and ends the tmux session once it has left, or
+  after 15 s (--now: at once). ${BOLD}ls${RESET} marks a session * while something runs in its pane,
+  ~ when its tmux session is open but the agent has left (amux start brings the agent
+  back in that pane), and leaves it blank when it is stopped; in the compact grid these
+  are ● ◐ ○. peek shows 30 lines. exec and register store the same agent flags (the rest
+  is for that launch) and register a session again the same way. A pinned session is
+  refused by rm on both sides (rm --force removes it). A codex session resumes the same
+  conversation whoever starts it. Changing a RUNNING session's provider, account, model,
+  folder or full access stores the change and restarts it (its conversation resumes). A
+  new claude session without --account runs on this terminal's account; a box without
+  that account uses personal. Row numbers are that box's own. Errors read the same
+  and exit 1 (2 for a command typed wrong).
+  ${BOLD}What differs on another box:${RESET}
+    names         give the exact name (here a unique prefix or the row number works too;
+                  a row there: amux pick <box> --sessionid N)
+    send          a stopped session is started first, then sent the text (here: not running)
+    peek          a stopped session shows its saved output, with a line saying so (here: not running)
+    send --keys   named keys only (C-c, Enter, Escape, Tab, arrows, F1-F12, y, n, q)
+    exec --color  that attach's color (here exec pins it); --worktree only there; --pwd only here
+    rm            also deletes the session's memory file and log
+    models        not served by the API: amux -H <box> --ssh models
+    archived or blocked sessions (dashboard features) are refused there
 EOF
     ;;
     pick) cat <<EOF
@@ -4015,7 +4335,8 @@ ${BOLD}Picker:${RESET}
                                  (alt-a / alt-h / alt-m / alt-n too) · ↵ on a ━━ header opens that machine
   amux pick [<box>] --sessionid N  Go straight to row N of that box's 'ls -c': attach if running,
                                  else start + attach   (e.g. amux pick myhost --sessionid 19; also -s N)
-  Session names fuzzy-match everywhere:  amux peek api  matches 'api', 'api-server', …
+  On this box a session name may be a unique prefix or its amux ls row number:  amux peek api
+  matches 'api-server' when nothing else starts with api. Through -H give the exact name.
   amux 3                         Attach to session #3 from amux ls
 EOF
     ;;
@@ -4162,11 +4483,13 @@ ${BOLD}Agent flags (on register/exec):${RESET}
   --mcp-config <path>          MCP server config file
   --allowedTools <tools>       Allowed tools list
   --disallowedTools <tools>    Disallowed tools list
-  --effort <level>             low, medium, high — codex only, and codex has NO
-                               such flag: amux rewrites it to
-                               -c model_reasoning_effort=<level> at launch
-                               (codex defaults to medium if you omit it)
-  --dir <path>                 Working directory (default: cwd)
+  --effort <level>             Reasoning effort: low, medium, high, xhigh, max (claude takes
+                               it as is; codex has no such flag, so amux rewrites it to
+                               -c model_reasoning_effort=<level>, medium when omitted)
+  --dir <path>                 Working directory: a new session uses the current one when
+                               --dir is left out; an existing session keeps its folder
+                               (amux dir <name> <path> moves it, flags kept)
+  --desc <text>                A description, as the dashboard shows it
   --pwd                        Use the current directory, explicitly (local only;
                                amux-remote / -H refuse it — your cwd is not on the box)
   --autoprompt                 Claude prompt suggestions ON for this session (they are
@@ -4181,7 +4504,9 @@ ${BOLD}Agent flags (on register/exec):${RESET}
                                Leave it out once: amux start <name> --no-partners
   --verbose                    Verbose mode
   --chrome / --no-chrome       Browser automation toggle
-  ... and all other claude CLI flags pass through
+  The flags above are STORED by register/exec (--opt=value works too). Any other option
+  or word on exec goes to that one launch (register refuses it). Through -H the box
+  stores the same ones.
 EOF
     ;;
     examples) cat <<EOF
@@ -4242,28 +4567,146 @@ cmd_help_all() {
   for t in $HELP_TOPICS; do echo; cmd_help_topic "$t"; done
 }
 
-# ── Shell completion (2026-10-07) ────────────────────────────────────────────
+# ── Shell completion (2026-10-07; one table since 2026-11-27) ─────────────────
 # `amux completion zsh|bash` prints a completion script. install.sh writes both
 # to ~/.amux/completion.{zsh,bash} and sources the right one from ~/.zshrc /
 # ~/.bashrc, so a new shell never forks amux just to load completion.
-# The scripts read session names from ~/.amux/sessions/*.env and box names from
-# ~/.amux/remotes/*.env directly, so those TABs are instant. Another box's sessions
-# (`amux -H <box> start <TAB>`) come from `amux-remote <box> ls --names`, capped at ~3 s and cached 60 s in ~/.amux/cache/.
-# Keep the command and flag lists here in step with the dispatch below and with
-# cmd_help — they are the third copy, deliberately static.
+# ONE table feeds both scripts (_completion_spec): every verb with its aliases, what
+# its first argument is, its options and a one-line description — for this box and
+# for `-H <box>` (amux-remote's verbs and options, which differ) — and the values an
+# option takes. The agent flags come from AMUX_AGENT_*_FLAGS, the list register/exec
+# store. Until 2026-11-27 the two scripts were hand-written copies that had drifted,
+# offered this box's verbs and --find after -H, and missed options that exist.
+# Keep the table in step with the dispatch below, amux-remote's dispatch and cmd_help.
+# Session names come from ~/.amux/sessions/*.env and box names from ~/.amux/remotes/*.env
+# directly, so those TABs are instant. Another box's sessions (`amux -H <box> start <TAB>`)
+# come from `amux-remote <box> ls --names`, capped at ~3 s and cached 60 s in ~/.amux/cache/.
 cmd_completion() {
   case "${1:-}" in
     zsh)  _completion_zsh ;;
     bash) _completion_bash ;;
-    *)    die "usage: amux completion zsh|bash" ;;
+    spec) _completion_spec "${2:-local}" ;;   # the table itself (for tests and amux-remote)
+    *)    usage_die "amux completion zsh|bash" ;;
   esac
 }
 
+# <verbs (first = the name)>|<first argument>|<options>|<description>
+#   first argument: session = a session name (this box's or the -H box's); sessions = every
+#   word is one; session:<words> = a session name, then one of <words> (@dir = a folder,
+#   @palette = a color); sessions-or:<words> = a session name or one of <words>; up = a
+#   session, or a box and then its session; box = box names; words:<words> = one of
+#   <words> (@topics = help topics, @cmds = this box's commands); - = nothing to offer.
+_completion_spec() {
+  local agent="$AMUX_AGENT_VALUE_FLAGS $AMUX_AGENT_BOOL_FLAGS"
+  local startopts="--fresh --no-attach --detach --provider --account --full-access --net-sandbox --full-sandbox --autoprompt --partners --no-partners --color"
+  local regopts="--provider --account --dir --desc --full-access --yolo --net-sandbox --full-sandbox --autoprompt --partners"
+  case "$1" in
+    local) cat <<EOF
+start|session|$startopts --find|start a registered session and attach
+attach a|session|--color --find|attach to a running session
+up|up|$startopts --mosh --cc --plain|start if needed, then attach (a box first for another box)
+peek p|session|--find|show the last lines of a session
+send|session|--keys|send text + Enter (or named keys) to a session
+stop kill|session|--now --find|stop a session
+ls list|-|-c --compact --bare|list sessions
+pick choose|box|-A -R --machines --sessionid --list|pick a session interactively
+register reg|session|$regopts --pwd --color $agent|register a session without starting it
+exec run|session|$regopts --pwd --color --no-attach --detach $agent|register and start in one step
+rm remove del|session|--force|remove a session
+rmnum|-|-y --yes --force|remove sessions by amux ls row number
+search find|-|--corefleet --mainfleet --fleetall --fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t -e --and --since --show -n --agentic --local --continue --provider --model --effort --account --raw --sessions -c --compact --regex --matchstring|find sessions by conversation, files or name
+rename mv|session|-n --dry-run|rename a session in place
+provider|session:claude codex gemini opencode iterm2 agy|--provider|show or change the agent a session runs
+account acct|session:P T X personal team team2|--account|show or change the subscription a session bills to
+dir|session:@dir||show or change the folder a session runs in
+model|sessions-or:claude codex opencode gemini agy||show or change one session model (a provider: the models list)
+models|words:claude codex opencode gemini agy||the models each agent accepts
+pin|session:on off||show or set the dashboard pin
+color colors colour|session:@palette|--reroll --mode|show or pin a session tab and status-line color
+recolor|sessions||repaint the open tabs of running sessions
+info|session|--dir --porcelain --json|session details
+origin|session|--host|where the session was last attached from
+offload|words:session run put get fetch box redirect version|-H -b -y --no-handoff --handoff-wait --name --no-attach|move (transfer) work to another machine (the offload tool)
+defaults config|words:show edit reset||show or set defaults
+start-all|-|-n --dry-run|start every registered session
+stop-all|-|--now|stop every running session
+serve web|-|--bind --no-tls|run the web dashboard
+board b|words:ls add done doing todo backlog review discarded status import progress||task board
+completion|words:zsh bash||print a shell completion script
+help|words:@topics @cmds||help (amux help <topic>)
+version|-||print the version
+EOF
+    ;;
+    remote) cat <<EOF
+ls list|-|-c --compact --bare --names|list the box sessions
+pick choose|-|--sessionid|pick one of the box sessions and attach
+attach a|session|--cc --plain --mosh --color|attach over ssh or mosh
+peek|session|--raw|show the last lines of a session
+send|session|--keys|send text + Enter (or named keys) to a session
+exec run|session|$regopts --worktree --no-attach --detach --cc --plain --mosh --color $agent|register and start in one step
+register reg|session|$regopts --worktree $agent|register a session without starting it
+start|session|$startopts --cc --plain --mosh|start a registered session and attach
+up|session|$startopts --cc --plain --mosh|start if needed, then attach
+stop|session|--now|stop a session
+rm remove del|session|--force|remove a session (and its memory file and log)
+pin|session:on off||show or set the dashboard pin
+rename mv|session|-n --dry-run|rename a session in place
+dir|session||show or change the folder a session runs in
+info meta|session|--dir --porcelain --json|session details
+provider|session:claude codex gemini opencode iterm2 agy|--provider|show or change the agent (restarts a running session)
+account acct|session:P T X personal team team2|--account|show or change the subscription a session bills to
+model|session||show or change a session model (restarts a running session)
+full-access|session:on off||show or set full access (restarts a running session)
+url|-||print the box server URL
+curl|-||raw authenticated GET against the box API
+box resolve|-||the configured box name this spelling resolves to
+help|-||the -H commands
+EOF
+    ;;
+    values) cat <<EOF
+--account|P T X personal team team2
+--provider|claude codex gemini opencode iterm2 agy
+--providers|claude codex gemini opencode agy
+--effort|low medium high xhigh max
+--permission-mode|acceptEdits bypassPermissions default plan auto
+--matchstring|start anywhere end
+--color|red blue yellow green magenta orange cyan purple lime pink teal brown indigo olive crimson forest sky salmon lavender silver next auto none
+--mode|hash distinct row random
+--in|chat files name
+--dir|@dir
+--add-dir|@dir
+--plugin-dir|@dir
+--mcp-config|@file
+--settings|@file
+--debug-file|@file
+--file|@file
+--json-schema|@file
+EOF
+      # every other value-taking option: a value, nothing to offer
+      local f
+      # (not -n: it is a dry run for rename and start-all, a count only for search)
+      for f in $AMUX_AGENT_VALUE_FLAGS --desc --keys --sessionid --regex --bind --show --since -e -b -H --name --handoff-wait --agentic; do
+        case " --effort --permission-mode --add-dir --plugin-dir --mcp-config --settings --debug-file --file --json-schema " in *" $f "*) continue ;; esac
+        printf '%s|\n' "$f"
+      done
+    ;;
+  esac
+}
+
+# The help topics, for `amux help <TAB>`.
+_completion_topics() { printf '%s all' "$HELP_TOPICS"; }
+
 _completion_zsh() {
-  cat <<'ZSH'
+  cat <<ZSHDATA
 #compdef amux amux-remote amux-up ccjump amux-tabs amux-convos amux-rename amux-reauth amux-all
-# amux tab-completion for zsh — generated by `amux completion zsh`.
-(( $+functions[compdef] )) || { autoload -Uz compinit && compinit -i; }
+# amux tab-completion for zsh — generated by \`amux completion zsh\` from the table in amux.
+(( \$+functions[compdef] )) || { autoload -Uz compinit && compinit -i; }
+_AMUX_SPEC_LOCAL='$(_completion_spec local)'
+_AMUX_SPEC_REMOTE='$(_completion_spec remote)'
+_AMUX_SPEC_VALUES='$(_completion_spec values)'
+_AMUX_TOPICS='$(_completion_topics)'
+ZSHDATA
+  cat <<'ZSH'
 
 _amux_sessions() {
   local -a expl s
@@ -4295,155 +4738,144 @@ _amux_boxes() {
   _wanted boxes expl 'box' compadd -a b
 }
 _amux_opts() { local -a expl; _wanted options expl 'option' compadd -- "$@"; }
+_amux_words() { local -a expl; _wanted values expl 'value' compadd -- "$@"; }
+
+# "<first argument>|<options>" of a verb in a table, or nothing (status 1).
+_amux_spec_row() {
+  local line vs v
+  for line in ${(f)1}; do
+    vs=${line%%|*}
+    for v in ${=vs}; do
+      [[ $v == $2 ]] && { print -r -- "${${line#*|}%|*}"; return 0; }
+    done
+  done
+  return 1
+}
+# The values an option takes ("" = a value with nothing to offer); status 1 = no value.
+_amux_value_words() {
+  local line
+  for line in ${(f)_AMUX_SPEC_VALUES}; do
+    [[ ${line%%|*} == $1 ]] && { print -r -- "${line#*|}"; return 0; }
+  done
+  return 1
+}
+_amux_spec_names() { local line vs; for line in ${(f)1}; do vs=${line%%|*}; print -r -- ${${=vs}[1]}; done; }
 
 # Companion commands (amux-up, ccjump, ...) — small, so one function.
 _amux_companion() {
-  local pos=$(( CURRENT - 1 ))
+  local pos=$(( CURRENT - 1 )) row
   case $service in
     amux-up)
       if (( pos == 1 )); then _amux_sessions; _amux_boxes
-      elif (( pos == 2 )) && [[ ! -f ${CC_HOME:-$HOME/.amux}/sessions/${words[2]}.env ]]; then
+      elif (( pos == 2 )) && [[ $PREFIX != -* && ! -f ${CC_HOME:-$HOME/.amux}/sessions/${words[2]}.env ]]; then
         _amux_remote_sessions ${words[2]}    # box name or any alias amux-remote resolves (box1-alt)
+      else
+        row=$(_amux_spec_row "$_AMUX_SPEC_LOCAL" up); _amux_opts ${=row#*|}
       fi ;;
-    ccjump)      _amux_boxes; _amux_opts local -A -R ;;
-    amux-tabs)   [[ $PREFIX == -* ]] && _amux_opts -w --all --dry-run || _amux_sessions ;;
-    amux-convos) (( pos == 1 )) && _amux_sessions || _amux_opts -n --top --less --full ;;
-    amux-rename) [[ $PREFIX == -* ]] && _amux_opts -n || { (( pos == 1 || pos == 2 && ${words[2]} == -n )) && _amux_sessions; } ;;
+    ccjump)      _amux_boxes; _amux_opts local -A -R --machines --sessionid --list ;;
+    amux-tabs)   [[ $PREFIX == -* ]] && _amux_opts -w --window -H --host --all --dry-run || _amux_sessions ;;
+    amux-convos) (( pos == 1 )) && _amux_sessions || _amux_opts -n --top --less --full --resume --cmd ;;
+    amux-rename) [[ $PREFIX == -* ]] && _amux_opts -n --dry-run || { (( pos == 1 || pos == 2 && ${words[2]} == -n )) && _amux_sessions; } ;;
     amux-reauth) [[ $PREFIX == -* ]] && _amux_opts --all --force-all -d --detached || _amux_sessions ;;
-    amux-all)    _amux_opts -v -p -h --showall ;;
+    amux-all)    _amux_opts -v --verbose -p --pick -h --showall --show-all -c --compact ;;
   esac
 }
 
 _amux() {
-  local -a expl cmds
-  local i=2 remote=0 rbox="" cmd pos prev
+  local i=2 remote=0 rbox="" cmd pos prev spec row kind opts w line vs
+  local -a cmds
   if [[ $service != amux && $service != amux-remote ]]; then _amux_companion; return; fi
-  cmds=(
-    'start:start a registered session and attach'
-    'stop:stop a running session'
-    'attach:attach to a running session'
-    'up:start if needed, then attach'
-    'peek:show the last lines of a session'
-    'send:send text + Enter to a session'
-    'ls:list sessions'
-    'pick:pick a session interactively'
-    'register:register a session'
-    'exec:register + start in one step'
-    'rm:remove a session'
-    'rmnum:remove sessions by row number'
-    'search:find sessions by conversation, files or name'
-    'rename:rename a session'
-    'provider:show or change the agent a session runs'
-    'account:show or change the subscription a session bills to'
-    'color:show or pin a session tab + status-line color'
-    'recolor:repaint the open tabs of running sessions'
-    'info:session details'
-    'offload:move (transfer) work to another machine (the offload tool)'
-    'origin:where the session was last attached from'
-    'models:models each agent accepts'
-    'defaults:show or set defaults'
-    'start-all:start every registered session'
-    'stop-all:stop every running session'
-    'serve:run the web dashboard'
-    'board:task board'
-    'help:help (amux help <topic>)'
-    'version:print the version'
-    'completion:print a shell completion script'
-  )
 
   if [[ $service == amux-remote ]]; then
-    (( CURRENT == 2 )) && { _amux_boxes; return; }
+    (( CURRENT == 2 )) && { _amux_boxes; _amux_opts add --ssh; return; }
     remote=1; rbox=${words[2]}; i=3
   else
     while (( i < CURRENT )) && [[ ${words[i]} == (--mosh|--cc|--plain) ]]; do (( i++ )); done
     if (( i < CURRENT )) && [[ ${words[i]} == (-H|--host) ]]; then
-      (( CURRENT == i + 1 )) && { _amux_boxes; return; }
+      (( CURRENT == i + 1 )) && { _amux_boxes; _amux_opts add; return; }
       remote=1; rbox=${words[i+1]}; (( i += 2 ))
     elif (( i < CURRENT )) && [[ ${words[i]} == (-A|-ALL|--all|--all-boxes) ]]; then
-      _amux_opts -v -p -h --showall; return
+      _amux_opts -v --verbose -p --pick -h --showall --show-all -c --compact; return
     fi
   fi
+  [[ $rbox == add ]] && return 1     # amux -H add <new box>: nothing to offer
+  if (( remote )); then spec=$_AMUX_SPEC_REMOTE; else spec=$_AMUX_SPEC_LOCAL; fi
 
   if (( CURRENT == i )); then
     if [[ $PREFIX == -* ]]; then
-      if (( remote )); then _amux_opts -h; else _amux_opts -H -A --mosh --cc --plain -h -v; fi
+      if (( remote )); then _amux_opts -h --ssh; else _amux_opts -H -A --mosh --cc --plain -h -v; fi
       return
     fi
+    for line in ${(f)spec}; do
+      vs=${line%%|*}
+      [[ $service == amux-remote && ${${=vs}[1]} == up ]] && continue   # `up` is amux's (-H <box> up)
+      cmds+=( "${${=vs}[1]}:${line##*|}" )
+    done
     _describe -t commands 'amux command' cmds
     (( remote )) || _amux_sessions    # `amux <name>` attaches
     return
   fi
 
   cmd=${words[i]}
-  pos=$(( CURRENT - i ))              # 1 = first word after the command
   prev=${words[CURRENT-1]}
-  case $prev in
-    --account)         _amux_opts P T X personal team team2; return ;;
-    --provider)        _amux_opts claude codex gemini opencode iterm2 agy; return ;;
-    --effort)          _amux_opts low medium high; return ;;
-    --permission-mode) _amux_opts acceptEdits bypassPermissions default plan; return ;;
-    --dir|--add-dir)   _files -/; return ;;
-    --mcp-config)      _files; return ;;
-    --matchstring)     _amux_opts start anywhere end; return ;;
-    --model|--system-prompt|--append-system-prompt|--allowedTools|--disallowedTools|--keys|--sessionid|--desc|--regex) return 1 ;;
-  esac
-
-  # Options that only mean something when another box is involved — after -H <box>,
-  # or once --find is on the line (it may hand the verb to a box): the attach lanes
-  # and peek's --raw. Offered here for a plain local command, they were passed to
-  # the agent or broke the command.
-  local -a lane
-  local rawopt=""
-  if (( remote )) || (( ${words[(I)--find]} )); then lane=(--mosh --cc --plain); rawopt=--raw; fi
-
-  # first arg is a session name (this box's, or the -H box's), anything after it is a flag
-  _amux_name_then() {
-    if (( pos == 1 )) && [[ $PREFIX != -* ]]; then
-      if (( remote )); then _amux_remote_sessions $rbox; else _amux_sessions; fi
-    else
-      (( $# )) && _amux_opts "$@"
-    fi
-  }
-  case $cmd in
-    start)             _amux_name_then --fresh --full-access --net-sandbox --full-sandbox --account --no-attach --partners --no-partners --color --find $lane ;;
-    attach|a)          _amux_name_then --color --find $lane ;;
-    color|recolor)     _amux_name_then --reroll ;;
-    up)                _amux_name_then --fresh --full-access --net-sandbox --full-sandbox --account --mosh --cc --plain ;;
-    peek|p)            _amux_name_then --find $rawopt ;;
-    stop|kill)         _amux_name_then --now --find ;;
-    send)              _amux_name_then --keys ;;
-    rm|remove|del)     _amux_name_then ;;
-    info)              _amux_name_then --dir --porcelain ;;
-    offload)           _amux_opts session run put get fetch box redirect version -b -y --no-handoff --handoff-wait --name --no-attach ;;
-    rename|mv)         _amux_name_then -n ;;
-    rmnum)             _amux_opts -y ;;
-    search|find)       _amux_opts --corefleet --mainfleet --fleetall --fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t -e --and --since --show -n --agentic --local --continue --provider --model --effort --account --raw --sessions -c --compact --regex --matchstring ;;
-    provider)          (( pos == 2 )) && _amux_opts claude codex gemini opencode iterm2 agy || _amux_name_then ;;
-    account|acct)      (( pos == 2 )) && _amux_opts P T X personal team team2 || _amux_name_then ;;
-    register|reg|exec|run)
-      # -H <box> exec is the server's exec: its own, shorter option list (with --desc
-      # and --worktree, which do not exist locally). register does not launch.
-      if (( remote )); then
-        _amux_name_then --provider --account --model --dir --full-access --yolo --net-sandbox --full-sandbox --autoprompt --partners \
-          --desc --worktree --no-attach --mosh --cc --plain
-      elif [[ $cmd == (exec|run) ]]; then
-        _amux_name_then --provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --partners --effort \
-          --permission-mode --system-prompt --append-system-prompt --mcp-config \
-          --allowedTools --disallowedTools --verbose --chrome --no-chrome --color --no-attach
-      else
-        _amux_name_then --provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --partners --effort \
-          --permission-mode --system-prompt --append-system-prompt --mcp-config \
-          --allowedTools --disallowedTools --verbose --chrome --no-chrome --color
-      fi ;;
-    ls|list)           if (( remote )); then _amux_opts -c --bare --names; else _amux_opts -c --bare; fi ;;
-    pick|choose)
-      [[ $PREFIX == -* ]] && _amux_opts -A -R --machines --sessionid --list \
-        || _amux_boxes ;;
-    models|model)      (( pos == 1 )) && _amux_opts claude codex gemini opencode iterm2 agy ;;
-    help)              (( pos == 1 )) && { _amux_opts providers accounts access flags pick remote examples all; _describe -t commands 'command' cmds; } ;;
-    completion)        (( pos == 1 )) && _amux_opts zsh bash ;;
-    *)                 return 1 ;;
-  esac
+  # the word's place among the positional words after the command (options and the
+  # values they take are skipped: amux rename -n <TAB> is the session again)
+  local j=$(( i + 1 )) wd
+  pos=1
+  while (( j < CURRENT )); do
+    wd=${words[j]}
+    if [[ $wd == -* ]]; then _amux_value_words "$wd" >/dev/null && j=$(( j + 1 )); else pos=$(( pos + 1 )); fi
+    j=$(( j + 1 ))
+  done
+  row=$(_amux_spec_row "$spec" "$cmd") || return 1
+  kind=${row%%|*}; opts=${row#*|}
+  if [[ $prev == -* ]] && w=$(_amux_value_words "$prev"); then
+    # a folder or file after -H is a path on the box: nothing to offer from here
+    (( remote )) && [[ $w == (@dir|@file) ]] && return 1
+    case $w in
+      @dir)  _files -/ ;;
+      @file) _files ;;
+      "")    return 1 ;;
+      *)     _amux_words ${=w} ;;
+    esac
+    return
+  fi
+  # Once --find is on a local line it may hand the verb to another box: the attach
+  # lanes (and peek's --raw) mean something then.
+  if (( ! remote )) && (( ${words[(I)--find]} )); then
+    opts="$opts --mosh --cc --plain"; [[ $cmd == (peek|p) ]] && opts="$opts --raw"
+  fi
+  if [[ $PREFIX != -* ]]; then
+    case $kind in
+      session|sessions|session:*|sessions-or:*)
+        if (( pos == 1 )) || [[ $kind == sessions ]]; then
+          if (( remote )); then _amux_remote_sessions $rbox; else _amux_sessions; fi
+          [[ $kind == sessions-or:* ]] && _amux_words ${=kind#sessions-or:}
+          return
+        elif (( pos == 2 )) && [[ $kind == session:* ]]; then
+          w=${kind#session:}
+          case $w in
+            @dir)     _files -/ ;;
+            @palette) _amux_words ${=$(_amux_value_words --color)} ;;
+            *)        _amux_words ${=w} ;;
+          esac
+          return
+        fi ;;
+      up)
+        if (( pos == 1 )); then _amux_sessions; _amux_boxes; return
+        elif (( pos == 2 )) && [[ -f $HOME/.amux/remotes/${words[i+1]}.env ]]; then _amux_remote_sessions ${words[i+1]}; return
+        fi ;;
+      box)     _amux_boxes ;;
+      words:*)
+        if (( pos == 1 )); then
+          w=${kind#words:}
+          w=${w//@topics/$_AMUX_TOPICS}
+          [[ $w == *@cmds* ]] && w="${w//@cmds/} $(_amux_spec_names "$_AMUX_SPEC_LOCAL")"
+          _amux_words ${=w}; return
+        fi ;;
+    esac
+  fi
+  [[ -n ${opts// } ]] && _amux_opts ${=opts}
 }
 
 compdef _amux amux amux-remote amux-up ccjump amux-tabs amux-convos amux-rename amux-reauth amux-all
@@ -4453,8 +4885,14 @@ ZSH
 }
 
 _completion_bash() {
+  cat <<BASHDATA
+# amux tab-completion for bash — generated by \`amux completion bash\` from the table in amux.
+_AMUX_SPEC_LOCAL='$(_completion_spec local)'
+_AMUX_SPEC_REMOTE='$(_completion_spec remote)'
+_AMUX_SPEC_VALUES='$(_completion_spec values)'
+_AMUX_TOPICS='$(_completion_topics)'
+BASHDATA
   cat <<'BASH'
-# amux tab-completion for bash — generated by `amux completion bash`.
 _amux_local_sessions() {
   local f out=""
   for f in "${CC_HOME:-$HOME/.amux}"/sessions/*.env; do [[ -f $f ]] && f=${f##*/} && out+=" ${f%.env}"; done
@@ -4480,116 +4918,136 @@ _amux_remote_session_names() {
   fi
   [[ -r $c ]] && tr '\n' ' ' < "$c"
 }
+# "<first argument>|<options>" of a verb in a table, or nothing (status 1).
+_amux_spec_row() {
+  local line verbs v rest
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    verbs=${line%%|*}; rest=${line#*|}
+    for v in $verbs; do [[ $v == "$2" ]] && { printf '%s' "${rest%|*}"; return 0; }; done
+  done <<< "$1"
+  return 1
+}
+# The values an option takes ("" = a value with nothing to offer); status 1 = no value.
+_amux_value_words() {
+  local line
+  while IFS= read -r line; do
+    [[ ${line%%|*} == "$1" ]] && { printf '%s' "${line#*|}"; return 0; }
+  done <<< "$_AMUX_SPEC_VALUES"
+  return 1
+}
+_amux_spec_names() { local line v; while IFS= read -r line; do [[ -n $line ]] || continue; v=${line%%|*}; printf '%s ' "${v%% *}"; done <<< "$1"; }
 
 _amux_companion_complete() {
-  local cur=${COMP_WORDS[COMP_CWORD]} pos=$COMP_CWORD w=""
+  local cur=${COMP_WORDS[COMP_CWORD]} pos=$COMP_CWORD w="" row
   case ${COMP_WORDS[0]##*/} in
     amux-up)
       if (( pos == 1 )); then w="$(_amux_local_sessions) $(_amux_box_names)"
-      elif (( pos == 2 )) && [[ ! -f ${CC_HOME:-$HOME/.amux}/sessions/${COMP_WORDS[1]}.env ]]; then
+      elif (( pos == 2 )) && [[ $cur != -* && ! -f ${CC_HOME:-$HOME/.amux}/sessions/${COMP_WORDS[1]}.env ]]; then
         w=$(_amux_remote_session_names "${COMP_WORDS[1]}")
+      else
+        row=$(_amux_spec_row "$_AMUX_SPEC_LOCAL" up); w=${row#*|}
       fi ;;
-    ccjump)      w="$(_amux_box_names) local -A -R" ;;
-    amux-tabs)   [[ $cur == -* ]] && w="-w --all --dry-run" || w=$(_amux_local_sessions) ;;
-    amux-convos) (( pos == 1 )) && w=$(_amux_local_sessions) || w="-n --top --less --full" ;;
-    amux-rename) [[ $cur == -* ]] && w="-n" || w=$(_amux_local_sessions) ;;
+    ccjump)      w="$(_amux_box_names) local -A -R --machines --sessionid --list" ;;
+    amux-tabs)   [[ $cur == -* ]] && w="-w --window -H --host --all --dry-run" || w=$(_amux_local_sessions) ;;
+    amux-convos) (( pos == 1 )) && w=$(_amux_local_sessions) || w="-n --top --less --full --resume --cmd" ;;
+    amux-rename) [[ $cur == -* ]] && w="-n --dry-run" || w=$(_amux_local_sessions) ;;
     amux-reauth) [[ $cur == -* ]] && w="--all --force-all -d --detached" || w=$(_amux_local_sessions) ;;
-    amux-all)    w="-v -p -h --showall" ;;
+    amux-all)    w="-v --verbose -p --pick -h --showall --show-all -c --compact" ;;
   esac
   COMPREPLY=( $(compgen -W "$w" -- "$cur") )
 }
 
 _amux_complete() {
   local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
-  local i=1 remote=0 rbox="" cmd pos
-  local cmds="start stop attach up peek send ls pick register exec rm rmnum search rename provider account color recolor info offload origin models defaults start-all stop-all serve board help version completion"
-  local providers="claude codex gemini opencode iterm2 agy" accounts="P T X personal team team2"
+  local i=1 remote=0 rbox="" cmd pos spec row kind opts w="" x
   COMPREPLY=()
 
   if [[ ${COMP_WORDS[0]##*/} == amux-remote ]]; then
-    (( COMP_CWORD == 1 )) && { COMPREPLY=( $(compgen -W "$(_amux_box_names)" -- "$cur") ); return; }
+    (( COMP_CWORD == 1 )) && { COMPREPLY=( $(compgen -W "$(_amux_box_names) add --ssh" -- "$cur") ); return; }
     remote=1; rbox=${COMP_WORDS[1]}; i=2
   else
     while (( i < COMP_CWORD )) && [[ ${COMP_WORDS[i]} == --mosh || ${COMP_WORDS[i]} == --cc || ${COMP_WORDS[i]} == --plain ]]; do (( i++ )); done
     if (( i < COMP_CWORD )) && [[ ${COMP_WORDS[i]} == -H || ${COMP_WORDS[i]} == --host ]]; then
-      (( COMP_CWORD == i + 1 )) && { COMPREPLY=( $(compgen -W "$(_amux_box_names)" -- "$cur") ); return; }
+      (( COMP_CWORD == i + 1 )) && { COMPREPLY=( $(compgen -W "$(_amux_box_names) add" -- "$cur") ); return; }
       remote=1; rbox=${COMP_WORDS[i+1]}; (( i += 2 ))
-    elif (( i < COMP_CWORD )) && [[ ${COMP_WORDS[i]} == -A || ${COMP_WORDS[i]} == -ALL || ${COMP_WORDS[i]} == --all ]]; then
-      COMPREPLY=( $(compgen -W "-v -p -h --showall" -- "$cur") ); return
+    elif (( i < COMP_CWORD )) && [[ ${COMP_WORDS[i]} == -A || ${COMP_WORDS[i]} == -ALL || ${COMP_WORDS[i]} == --all || ${COMP_WORDS[i]} == --all-boxes ]]; then
+      COMPREPLY=( $(compgen -W "-v --verbose -p --pick -h --showall --show-all -c --compact" -- "$cur") ); return
     fi
   fi
+  [[ $rbox == add ]] && return       # amux -H add <new box>: nothing to offer
+  if (( remote )); then spec=$_AMUX_SPEC_REMOTE; else spec=$_AMUX_SPEC_LOCAL; fi
 
   if (( COMP_CWORD == i )); then
     if [[ $cur == -* ]]; then
-      (( remote )) && COMPREPLY=( $(compgen -W "-h" -- "$cur") ) \
-        || COMPREPLY=( $(compgen -W "-H -A --mosh --cc --plain -h -v" -- "$cur") )
-    elif (( remote )); then
-      COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
+      if (( remote )); then w="-h --ssh"; else w="-H -A --mosh --cc --plain -h -v"; fi
     else
-      COMPREPLY=( $(compgen -W "$cmds $(_amux_local_sessions)" -- "$cur") )
+      w=$(_amux_spec_names "$spec"); (( remote )) || w="$w $(_amux_local_sessions)"
+      [[ ${COMP_WORDS[0]##*/} == amux-remote ]] && w=${w/up /}   # `up` is amux's (-H <box> up)
     fi
+    COMPREPLY=( $(compgen -W "$w" -- "$cur") )
     return
   fi
 
-  cmd=${COMP_WORDS[i]}; pos=$(( COMP_CWORD - i ))
-  case $prev in
-    --account)         COMPREPLY=( $(compgen -W "$accounts" -- "$cur") ); return ;;
-    --provider)        COMPREPLY=( $(compgen -W "$providers" -- "$cur") ); return ;;
-    --effort)          COMPREPLY=( $(compgen -W "low medium high" -- "$cur") ); return ;;
-    --permission-mode) COMPREPLY=( $(compgen -W "acceptEdits bypassPermissions default plan" -- "$cur") ); return ;;
-    --dir|--add-dir)   COMPREPLY=( $(compgen -d -- "$cur") ); return ;;
-    --mcp-config)      COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
-    --matchstring)     COMPREPLY=( $(compgen -W "start anywhere end" -- "$cur") ); return ;;
-    --model|--system-prompt|--append-system-prompt|--allowedTools|--disallowedTools|--keys|--sessionid|--desc|--regex) return ;;
-  esac
-
-  # The attach lanes and peek's --raw only mean something when another box is
-  # involved: after -H <box>, or once --find is on the line.
-  local words="" lane="" rawopt="" w
-  if (( remote )); then lane="--mosh --cc --plain"; rawopt="--raw"
-  else
-    for w in "${COMP_WORDS[@]}"; do [[ $w == --find ]] && { lane="--mosh --cc --plain"; rawopt="--raw"; }; done
+  cmd=${COMP_WORDS[i]}
+  # the word's place among the positional words after the command (options and the
+  # values they take are skipped: amux rename -n <TAB> is the session again)
+  local j=$(( i + 1 )) wd
+  pos=1
+  while (( j < COMP_CWORD )); do
+    wd=${COMP_WORDS[j]}
+    if [[ $wd == -* ]]; then _amux_value_words "$wd" >/dev/null && j=$(( j + 1 )); else pos=$(( pos + 1 )); fi
+    j=$(( j + 1 ))
+  done
+  row=$(_amux_spec_row "$spec" "$cmd") || return
+  kind=${row%%|*}; opts=${row#*|}
+  if [[ $prev == -* ]] && w=$(_amux_value_words "$prev"); then
+    # a folder or file after -H is a path on the box: nothing to offer from here
+    (( remote )) && [[ $w == @dir || $w == @file ]] && return
+    case $w in
+      @dir)  COMPREPLY=( $(compgen -d -- "$cur") ) ;;
+      @file) COMPREPLY=( $(compgen -f -- "$cur") ) ;;
+      "")    : ;;
+      *)     COMPREPLY=( $(compgen -W "$w" -- "$cur") ) ;;
+    esac
+    return
   fi
-  local reg_local="--provider --account --model --full-access --yolo --net-sandbox --full-sandbox --dir --pwd --autoprompt --partners --effort --permission-mode --system-prompt --append-system-prompt --mcp-config --allowedTools --disallowedTools --verbose --chrome --no-chrome --color"
-  case $cmd in
-    start)             words="--fresh --full-access --net-sandbox --full-sandbox --account --no-attach --partners --no-partners --color --find $lane" ;;
-    attach|a)          words="--color --find $lane" ;;
-    color|recolor)     words="--reroll" ;;
-    up)                words="--fresh --full-access --net-sandbox --full-sandbox --account --mosh --cc --plain" ;;
-    peek|p)            words="--find $rawopt" ;;
-    stop|kill)         words="--now --find" ;;
-    send)              words="--keys" ;;
-    rm|remove|del)     words="" ;;
-    info)              words="--dir --porcelain" ;;
-    offload)           words="session run put get fetch box redirect version -b -y --no-handoff --handoff-wait --name --no-attach" ;;
-    rename|mv)         words="-n" ;;
-    rmnum)             words="-y" ;;
-    search|find)       words="--corefleet --mainfleet --fleetall --fleet --providers --in --prompt -w --word -s --case-sensitive --no-orphans -t -e --and --since --show -n --agentic --local --continue --provider --model --effort --account --raw --sessions -c --compact --regex --matchstring" ;;
-    provider)          (( pos == 2 )) && { COMPREPLY=( $(compgen -W "$providers" -- "$cur") ); return; } ;;
-    account|acct)      (( pos == 2 )) && { COMPREPLY=( $(compgen -W "$accounts" -- "$cur") ); return; } ;;
-    register|reg|exec|run)
-      # -H <box> exec is the server's exec, with its own option list; register does not launch
-      if (( remote )); then
-        words="--provider --account --model --dir --full-access --yolo --net-sandbox --full-sandbox --autoprompt --partners --desc --worktree --no-attach --mosh --cc --plain"
-      elif [[ $cmd == exec || $cmd == run ]]; then words="$reg_local --no-attach"
-      else words="$reg_local"; fi ;;
-    ls|list)           if (( remote )); then w="-c --bare --names"; else w="-c --bare"; fi
-                       COMPREPLY=( $(compgen -W "$w" -- "$cur") ); return ;;
-    pick|choose)       COMPREPLY=( $(compgen -W "-A -R --machines --sessionid --list $(_amux_box_names)" -- "$cur") ); return ;;
-    models|model)      (( pos == 1 )) && COMPREPLY=( $(compgen -W "$providers" -- "$cur") ); return ;;
-    help)              (( pos == 1 )) && COMPREPLY=( $(compgen -W "providers accounts access flags pick remote examples all $cmds" -- "$cur") ); return ;;
-    completion)        (( pos == 1 )) && COMPREPLY=( $(compgen -W "zsh bash" -- "$cur") ); return ;;
-    *)                 return ;;
-  esac
-  if (( pos == 1 )) && [[ $cur != -* ]]; then
-    if (( remote )); then
-      COMPREPLY=( $(compgen -W "$(_amux_remote_session_names "$rbox")" -- "$cur") )
-    else
-      COMPREPLY=( $(compgen -W "$(_amux_local_sessions)" -- "$cur") )
-    fi
-  else
-    COMPREPLY=( $(compgen -W "$words" -- "$cur") )
+  # Once --find is on a local line it may hand the verb to another box: the attach
+  # lanes (and peek's --raw) mean something then.
+  if (( ! remote )); then
+    for x in "${COMP_WORDS[@]}"; do
+      [[ $x == --find ]] && { opts="$opts --mosh --cc --plain"; [[ $cmd == peek || $cmd == p ]] && opts="$opts --raw"; break; }
+    done
   fi
+  w=""
+  if [[ $cur != -* ]]; then
+    case $kind in
+      session|sessions|session:*|sessions-or:*)
+        if (( pos == 1 )) || [[ $kind == sessions ]]; then
+          if (( remote )); then w=$(_amux_remote_session_names "$rbox"); else w=$(_amux_local_sessions); fi
+          [[ $kind == sessions-or:* ]] && w="$w ${kind#sessions-or:}"
+        elif (( pos == 2 )) && [[ $kind == session:* ]]; then
+          w=${kind#session:}
+          case $w in
+            @dir)     COMPREPLY=( $(compgen -d -- "$cur") ); return ;;
+            @palette) w=$(_amux_value_words --color) ;;
+          esac
+        fi ;;
+      up)
+        if (( pos == 1 )); then w="$(_amux_local_sessions) $(_amux_box_names)"
+        elif (( pos == 2 )) && [[ -f $HOME/.amux/remotes/${COMP_WORDS[i+1]}.env ]]; then w=$(_amux_remote_session_names "${COMP_WORDS[i+1]}")
+        fi ;;
+      box)     w=$(_amux_box_names) ;;
+      words:*)
+        if (( pos == 1 )); then
+          w=${kind#words:}
+          w=${w//@topics/$_AMUX_TOPICS}
+          [[ $w == *@cmds* ]] && w="${w//@cmds/} $(_amux_spec_names "$_AMUX_SPEC_LOCAL")"
+        fi ;;
+    esac
+    [[ -n ${w// } ]] && { COMPREPLY=( $(compgen -W "$w" -- "$cur") ); return; }
+  fi
+  COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 complete -F _amux_complete amux amux-remote
 complete -F _amux_companion_complete amux-up ccjump amux-tabs amux-convos amux-rename amux-reauth amux-all
@@ -4656,7 +5114,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       shift
       command -v amux-up >/dev/null 2>&1 \
         || die "up needs amux-up, which is not on PATH on this box (install.sh links the companions into ~/.local/bin)"
-      [[ -n "${1:-}" && "${1:-}" != -* ]] || die "usage: amux -H $_rbox up <name> [flags]"
+      [[ -n "${1:-}" && "${1:-}" != -* ]] || usage_die "amux -H $_rbox up <name> [flags]"
       AMUX_PROG="amux up" exec amux-up "$_rbox" "$@"
     fi
     AMUX_PROG="amux -H" exec amux-remote "$_rbox" "$@"
@@ -4681,10 +5139,13 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       if [[ $_find -eq 1 ]]; then cmd_find "$1" ${_rest[@]+"${_rest[@]}"}; exit $?; fi ;;
   esac
 
-  # `amux peek --help` → just peek's entry. pick/serve parse -h themselves.
+  # `amux peek --help` → just peek's entry. pick/serve parse -h themselves. A command
+  # that is a companion gets the companion's own full help (amux's lines are a summary
+  # that points there): search, color, recolor, up, offload.
   if [[ $# -ge 2 && ( "$2" == "-h" || "$2" == "--help" ) ]]; then
     case "$1" in
       pick|choose|serve|web|help|-h|--help|offload) : ;;   # offload -h: the offload tool's own help
+      search|find|color|colors|colour|recolor|up) : ;;     # handed to the companion below, -h and all
       *) cmd_subhelp "$1" && exit 0 ;;
     esac
   fi
@@ -4710,6 +5171,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     rename|mv)        shift; cmd_rename "$@" ;;
     provider)         shift; cmd_provider "$@" ;;
     account|acct)     shift; cmd_account "$@" ;;
+    dir)              shift; cmd_dir "$@" ;;
     color|colors|colour)
                       shift
                       command -v amux-color >/dev/null 2>&1 \
@@ -4724,9 +5186,11 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     info)             shift; cmd_info "$@" ;;
     offload)          shift; cmd_offload "$@" ;;
     origin)           shift; cmd_origin "$@" ;;
-    models|model)     shift; cmd_models "$@" ;;
+    models)           shift; cmd_models "$@" ;;
+    model)            shift; cmd_model "$@" ;;
+    pin)              shift; cmd_pin "$@" ;;
     defaults|config)  shift; cmd_defaults "$@" ;;
-    start-all)        cmd_start_all ;;
+    start-all)        shift; cmd_start_all "$@" ;;
     stop-all)         shift; cmd_stop_all "$@" ;;
     serve|web)        shift; cmd_serve "$@" ;;
     board|b)          shift; cmd_board "$@" ;;
@@ -4735,18 +5199,29 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       case "${1:-}" in
         "")   cmd_help ;;
         all)  cmd_help_all ;;
-        *)    cmd_help_topic "$1" || cmd_subhelp "$1" || { echo "${RED}no help for:${RESET} $1 — topics: $HELP_TOPICS all"; cmd_help; exit 1; } ;;
+        *)    cmd_help_topic "$1" || cmd_subhelp "$1" || { echo "${RED}error:${RESET} no help for '$1' — topics: $HELP_TOPICS all; commands: amux help" >&2; exit 2; } ;;
       esac ;;
     version|--version|-v) echo "amux v${CC_VERSION}"
                           echo "amux-nui-public release ${CC_RELEASE}" ;;
+    # for amux-remote (exec/register through -H store the same agent flags): two lines
+    __agent-flags)    printf '%s\n%s\n' "$AMUX_AGENT_VALUE_FLAGS" "$AMUX_AGENT_BOOL_FLAGS" ;;
     "")               cmd_dashboard ;;
     *)
-      # Try as session name shortcut
-      name=$(resolve_session "$1" 2>/dev/null) && cmd_attach "$name" || {
-        echo "${RED}unknown command:${RESET} $1"
-        echo "Run ${BOLD}amux help${RESET} for usage"
-        exit 1
-      }
+      # `amux <name>` attaches (a unique prefix or an amux ls row number works too).
+      # Until 2026-11-27 any failure read "unknown command": an ambiguous name, and an
+      # attach that failed, both hid their own message.
+      if [[ "$1" == -* ]]; then
+        echo "${RED}error:${RESET} amux: unknown option '$1' (see amux help)" >&2; exit 2
+      fi
+      if _err=$( (resolve_session "$1") 2>&1 >/dev/null ); then
+        name=$(resolve_session "$1")
+        cmd_attach "$name" "${@:2}"; exit $?
+      fi
+      case "$_err" in
+        *ambiguous*) die "$(printf '%s' "$_err" | sed -e $'s/\x1b\\[[0-9;]*m//g' -e 's/^error: //')" ;;
+      esac
+      echo "${RED}error:${RESET} unknown command: $1 — and no session on this box is called that (amux help lists the commands, amux ls the sessions)" >&2
+      exit 2
       ;;
   esac
 fi

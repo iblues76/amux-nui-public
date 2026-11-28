@@ -30,16 +30,16 @@ while [ $# -gt 0 ]; do
     --resume)  shift; resume_idx=${1:-} ;;
     --cmd)     shift; cmd_idx=${1:-} ;;
     -h|--help) awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
-    -*)        die "unknown flag: $1 (see -h)" ;;
-    *)         [ -z "$name" ] && name="$1" || die "unexpected argument: $1" ;;
+    -*)        echo "amux-convos: unknown option '$1' (see amux-convos -h)" >&2; exit 2 ;;
+    *)         [ -z "$name" ] && name="$1" || { echo "amux-convos: unexpected argument '$1' — it takes one session" >&2; exit 2; } ;;
   esac
   shift
 done
-[ -n "$name" ] || die "usage: amux-convos <session> [-n N] [--less] [--resume N]  (-h for help)"
+[ -n "$name" ] || { echo "usage: amux-convos <session> [-n N] [--less] [--full] [--resume N | --cmd N]   (-h for help)" >&2; exit 2; }
 
 # resolve the session's working directory
 envf="${CC_HOME:-$HOME/.amux}/sessions/$name.env"
-[ -f "$envf" ] || die "no such amux session: '$name' (see 'amux ls')"
+[ -f "$envf" ] || die "session '$name' not found on this box (see: amux ls)"
 ccdir=$( . "$envf" >/dev/null 2>&1; printf %s "${CC_DIR:-}" )
 [ -n "$ccdir" ] || die "session '$name' has no working directory recorded"
 

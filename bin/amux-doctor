@@ -135,7 +135,7 @@ if amux_have amux; then
   fi
 fi
 if amux_have amux-remote; then
-  if amux-remote --help 2>&1 | head -3 | grep -q "another machine's amux server"; then
+  if amux-remote --help 2>&1 | head -3 | grep -qE "another machine's amux server|amux server over its REST API"; then
     good "amux-remote is this repo's version"
   else
     caveat "amux-remote on your PATH is not this repo's"

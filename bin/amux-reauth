@@ -134,7 +134,7 @@ while [ $# -gt 0 ]; do
     --all)         MODE=all ;;
     --force-all)   MODE=forceall ;;
     -h|--help)     awk 'NR==1&&/^#!/{next} /^[[:space:]]*#/{sub(/^[[:space:]]*#[[:space:]]?/,"");print;next} {exit}' "$0"; exit 0 ;;
-    -*)            die "unknown flag: $1 (see -h)" ;;
+    -*)            echo "amux-reauth: unknown option '$1' (see amux-reauth -h)" >&2; exit 2 ;;
     *)             NAMES+=("$1") ;;
   esac
   shift
@@ -159,7 +159,7 @@ case "$MODE" in
   forceall) NAMES=(); while IFS= read -r n; do [ -n "$n" ] && NAMES+=("$n"); done \
               < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^amux-' | sed 's/^amux-//') ;;
 esac
-[ ${#NAMES[@]} -gt 0 ] || die "no session given. Usage: amux-reauth <name> | --all | --force-all  (-h for help)"
+[ ${#NAMES[@]} -gt 0 ] || { echo "usage: amux-reauth <name>... | --all | --force-all [-d]   (amux-reauth -h for help)" >&2; exit 2; }
 
 attach=0; [ ${#NAMES[@]} -eq 1 ] && [ "$DETACHED" = 0 ] && attach=1
 rc=0

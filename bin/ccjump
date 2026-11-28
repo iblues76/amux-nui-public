@@ -255,8 +255,8 @@ ask(){ printf '%b' "$1" >/dev/tty; REPLY=""; IFS= read -r REPLY </dev/tty || REP
 yes_no(){ ask "$1 [y/N] "; case "$REPLY" in y|Y|yes|YES) return 0 ;; esac; return 1; }
 pause(){ printf '\n\033[2m  press any key to go back…\033[0m' >/dev/tty; IFS= read -rsn1 _k </dev/tty || true; }
 # info fields, tab-separated: running provider account model fullaccess dir
-sinfo(){
-  "$AMUXBOX" "$1" info "$2" 2>/dev/null | python3 -c '
+sinfo(){   # --json: `amux -H <box> info` prints text like the local amux info since 2026-11-27
+  "$AMUXBOX" "$1" info "$2" --json 2>/dev/null | python3 -c '
 import json,sys,shlex
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(1)
@@ -277,8 +277,8 @@ act(){ # act <verb> <fzf row>
   clear >/dev/tty 2>/dev/null
   if [ -z "${loc:-}" ]; then say "no row selected"; pause; return; fi
   if ! box="$(act_box "$loc")"; then
-    say "this machine has no amux-remote entry (~/.amux/remotes/<name>.env), so the picker"
-    say "cannot change its sessions — use the amux CLI here instead"; pause; return
+    say "this machine is not configured for amux -H (add it: amux -H add <name>), so the"
+    say "picker cannot change its sessions — use the amux CLI here instead"; pause; return
   fi
   if [ "$verb" = new ]; then act_new "$box"; return; fi
   case "$loc" in @*) say "that is a machine row — pick a session (F11 new works here)"; pause; return ;; esac

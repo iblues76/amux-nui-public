@@ -306,7 +306,7 @@ case "$url" in
   https://api.anthropic.com/*) printf '200' ;;
   */api/sessions/*/peek*)      printf '{"output":"peek-ok"}' ;;
   */api/sessions/*/send*)      printf '{"ok":true}' ;;
-  */api/sessions/*/info*)      printf '{"provider":"codex"}' ;;
+  */api/sessions/*/info*)      printf '{"provider":"codex","state":"agent","running":true}' ;;
   */api/sessions/*/config)     printf '{"ok":true,"message":"configuration updated"}' ;;
   */api/sessions/*/start)      printf '{"ok":true,"message":"started"}' ;;
   */api/sessions)
@@ -439,12 +439,12 @@ else
   bad "attach hint printed despite AMUX_NO_HINT" "$o"
 fi
 
-# stop takes no flags — unexpected extras must die loudly BEFORE any request,
-# not be silently ignored.
+# stop takes one session (and --now) — unexpected extras must die loudly BEFORE any
+# request, not be silently ignored.
 : > "$CURL_LOG"
 o=$(out_of amux-remote remotebox stop safe.name extra-arg)
 curl_args=$(out_of sed -n '1,20p' "$CURL_LOG")
-if has "unexpected extra arguments" "$o" && [ -z "$curl_args" ]; then
+if has "unexpected argument 'extra-arg'" "$o" && [ -z "$curl_args" ]; then
   ok "stop rejects unexpected extra args before any request"
 else
   bad "stop swallowed extra args" "$o"
@@ -777,7 +777,8 @@ has "--dir needs a path" "$o" && ok "--dir without a path is a message" || bad "
 o=$(A register e2 --provider claude opus)
 has "register does not know 'opus'" "$o" && ok "register refuses what it cannot store" || bad "register stray word" "$o"
 o=$(A register e2 --provider claude --desc hi)
-has "amux -H <box> exec" "$o" && ! has "e2" "$(A ls)" && ok "--desc is refused here (it belongs to -H exec); nothing written" || bad "--desc locally" "$o"
+isset e2 CC_DESC && ok "register stores --desc here too, as -H exec does" || bad "--desc locally" "$o"
+A rm e2 >/dev/null 2>&1
 
 # re-register keeps the session
 printf 'CC_DESC="from the dashboard"\nCC_PINNED="1"\n' >> "$S/e1.env"
@@ -793,7 +794,7 @@ isset e1 CC_ITERM2_SESSION_ID && bad "a stale iTerm2 pane id survived a change o
 A register e1 --provider claude --dir "$E/d1" >/dev/null
 
 # ls arguments, info, peek
-o=$(A ls --bogus);  has "unknown ls option: --bogus" "$o" && ok "amux ls refuses an unknown option" || bad "ls --bogus" "$o"
+o=$(A ls --bogus);  has "amux ls: unknown option '--bogus'" "$o" && ok "amux ls refuses an unknown option" || bad "ls --bogus" "$o"
 o=$(A ls zz);       has "amux search --sessions zz" "$o" && ok "amux ls <text> points to search --sessions" || bad "ls zz" "$o"
 o=$(A ls -c --bare); has "e1" "$o" && ! has " sessions " "$o" && ok "amux ls -c --bare drops the banner" || bad "ls -c --bare" "$o"
 printf 'CC_NAME="legacy"\nCC_DIR="%s"\n' "$E/d1" > "$S/legacy.env"
@@ -926,8 +927,8 @@ o=$(bash -c '. "$1" 2>/dev/null
   c amux start x --; c amux -H box start x --; c amux register x --; c amux -H box exec x --; c amux search --' _ "$E/comp.bash" 2>&1)
 l1=$(printf '%s\n' "$o" | sed -n 1p); l2=$(printf '%s\n' "$o" | sed -n 2p); l3=$(printf '%s\n' "$o" | sed -n 3p)
 l4=$(printf '%s\n' "$o" | sed -n 4p); l5=$(printf '%s\n' "$o" | sed -n 5p)
-! has "--mosh" "$l1" && has "--mosh" "$l2" && ! has "--desc" "$l3" && has "--worktree" "$l4" && has "--sessions" "$l5" && has "--continue" "$l5" \
-  && ok "completion: attach lanes and --desc only after -H; search offers --sessions and --continue" || bad "completion" "$o"
+! has "--mosh" "$l1" && has "--mosh" "$l2" && has "--desc" "$l3" && has "--worktree" "$l4" && has "--sessions" "$l5" && has "--continue" "$l5" \
+  && ok "completion: attach lanes only after -H, --desc on both sides; search offers --sessions and --continue" || bad "completion" "$o"
 
 for b in boxa boxb boxdown; do printf 'y\n' | run amux-config remove "$b"; done
 
@@ -1115,7 +1116,7 @@ o=$(AMUX_STOP_WAIT=1 A stop m-agent)
 has "/exit" "$(out_of sed -n '1,200p' "$TMUX_LOG")" && has "did not leave within 1s" "$o" && has "kill-session" "$(out_of sed -n '1,200p' "$TMUX_LOG")" \
   && ok "amux stop asks the agent to exit, waits, then ends the session" || bad "graceful stop" "$o"
 o=$(A stop --bogus m-agent); has "unknown option '--bogus'" "$o" && ok "amux stop refuses an option it does not know" || bad "stop --bogus" "$o"
-o=$(A stop-all x); has "unknown argument 'x'" "$o" && ok "amux stop-all refuses an argument it does not know" || bad "stop-all x" "$o"
+o=$(A stop-all x); has "unexpected argument 'x'" "$o" && ok "amux stop-all refuses an argument it does not know" || bad "stop-all x" "$o"
 rm -f "$E/mock/tmux" "$E/mock/codex" "$E/mock/pgrep"
 for n in m-agent m-shell m-dead m-off; do A rm $n >/dev/null; done
 
@@ -1251,7 +1252,7 @@ PYT
 has "[('--model x', True), ('--auto', True), ('', False), ('--model x', None), ('', None), ('', False), ('--partnersx', None)]" "$o" \
   && ok "the server strips the marker the same way (stored, one launch, --no-partners)" || bad "server _take_partners" "$o"
 n=$(grep -c 'shell_rc += _PARTNERS_ENV if _partners else _PARTNERS_OFF' bin/amux-server.py)
-m=$(grep -c 'if pt == "1": body\["partners"\] = True' bin/amux-remote)
+m=$(grep -cE 'if pt == "1": +body\["partners"\] += True' bin/amux-remote)
 [ "$n" = 1 ] && [ "$m" = 1 ] && ok "the server sets or unsets it after the login profile; amux -H <box> exec sends the flag" || bad "server/remote wiring" "$n $m"
 rm -f "$E/mock/tmux" "$E/mock/opencode" "$E/mock/codex" "$AMUX_T7I_LOG"; unset AMUX_T7I_LOG
 [ "$_ocfg_made" = 1 ] && rm -f "$_ocfg"

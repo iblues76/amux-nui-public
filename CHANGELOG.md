@@ -2,6 +2,20 @@
 
 What changed in each release of amux-nui-public, newest first. From 0.3.0 on, every release is a git tag (`v0.3.1`) and a tarball on the [download page](https://amux.nuilab.org/download/).
 
+## 0.7.8 — 2026-11-27
+
+This release bundles amux 0.9.24. It works through the consistency audit: the same command behaves and reads the same on this machine and through `amux -H <box>`. Update the server on every machine you drive.
+
+- **Exit codes mean one thing.** A command typed wrong (usage, unknown option, invalid name, unknown command) exits 2; a runtime failure (not found, not running, the box refused) exits 1. Every error goes to stderr, in one wording: "session 'x' not found on …", "… is not running", "CMD: unknown option 'X' (see CMD -h)". Some `amux -H` failures used to exit 0 or print on stdout.
+- **`amux serve` refuses what it does not know.** `--bind=HOST` now works, and a misspelled option or a stray word exits 2. Before, it was ignored and the server listened on every interface.
+- **A change to a running session restarts it, on both sides.** `amux provider`, `account`, `model` and `dir` store the change and restart the session; the agent is asked to exit first and the conversation resumes. Before, the command refused here and restarted (or refused, for the account) through `-H`.
+- **A new claude session through `amux -H` follows your terminal's account**, as `amux exec` does here. When that machine lacks the account, the session runs on personal and amux says so.
+- **More of amux works through `-H`:** `dir` (a new verb, also here), `register`, `pin`, `rm --force`, `info --dir`, text `info` (`--json` and `--porcelain` on both sides), `send --keys C-c` sends the named keys, and `exec` on an existing session registers it again and starts it.
+- **Names follow one rule.** The server refuses a name outside it instead of rewriting it (the dashboard shows the error).
+- **Options:** `--opt=value` works for every value option of register and exec; `register` stores `--desc`; `start-all` takes `-n`; stored agent flags keep words with spaces together (`--append-system-prompt "React + Tailwind"`).
+- **Help says what is true** (the `-H` verb list, `amux -H add`, what differs on another box), and every companion's `-h` shows its full help. Completion for bash and zsh is generated from one table, with the right options after `-H`.
+- **offload 0.1.4:** a moved session keeps its folder trust and its account; on a machine without that account it runs on personal.
+
 ## 0.7.7 — 2026-11-27
 
 This release bundles amux 0.9.23. Update the server on a machine you drive with `amux -H` to use API-key accounts or a DeepInfra start model there.
